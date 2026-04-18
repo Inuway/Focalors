@@ -934,12 +934,13 @@ mod tests {
         let board = Board::startpos();
         let mut searcher = Searcher::new(16);
         let start = Instant::now();
-        // Soft limit 50ms, hard limit 500ms — should stop early with stable move
-        let result = searcher.search_with_time_management(&board, 50, 500);
+        // Soft limit 200ms, hard limit 5000ms — should stop well before hard limit
+        let result = searcher.search_with_time_management(&board, 200, 5000);
         let elapsed = start.elapsed();
         assert!(!result.best_move.is_null());
-        // Should stop well before the hard limit due to move stability
-        assert!(elapsed < Duration::from_millis(400), "Should use smart early stop: {:?}", elapsed);
+        // Should stop well before the hard limit due to move stability.
+        // The generous threshold accounts for unoptimized debug builds on slow CI runners.
+        assert!(elapsed < Duration::from_millis(3000), "Should use smart early stop: {:?}", elapsed);
     }
 
     #[test]

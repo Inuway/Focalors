@@ -8,7 +8,36 @@ Focalors (formerly named Hydra/HydraProject during initial development) is an of
 - Track rating, openings, and long-term progress in a local SQLite database
 - Run the same engine through the desktop GUI, UCI, or a Lichess bot mode
 
+The project in its current state ships with most features available and usable, but it needs a lot of further polishment and work
+
 ![Focalors desktop GUI with local play and analysis](assets/screenshots/hero.png)
+
+## Current Priorities
+
+Right now I am prioritizing two things above everything else.
+
+- **GUI and UX cleanup**: the engine and learning features already exist, but the desktop app still needs visual polish, cleaner flows, and a more consistent user experience. A large part of the current work is making Focalors feel easier to use, easier to read, and more coherent as an actual product.
+- **Stronger NNUE training**: the engine currently runs on a much smaller amount of training data than I would like, mostly because I do not have much compute available locally. Improving the training pipeline and producing stronger future networks is one of the highest-impact ways to help the project.
+
+If you want to contribute on the engine side, the usual NNUE workflow is:
+
+```bash
+# 1. Generate self-play data (100000, as example, can be a much higher amount)
+cargo run --release -- selfplay 100000 nets/gen2v2-data.bin --nnue nets/gen1v2.nnue
+
+# 2. Train or continue a network on the generated data
+cargo run --release -- train nets/gen1v2-data.bin \
+	--data nets/gen2v2-data.bin \
+	--mix 0.3,0.7 \
+	--resume nets/gen1v2.nnue \
+	--epochs 30 \
+	--output nets/gen2v2.nnue
+
+# 3. Promote the trained network
+cargo run --release -- promote nets/gen2v2.nnue
+```
+
+In short: self-play generates fresh positions, training turns that data into a stronger network, and promotion installs the candidate net as the default. The full explanation and engine-development notes are in [docs/TECHNICAL.md](docs/TECHNICAL.md).
 
 ## Start Here
 
