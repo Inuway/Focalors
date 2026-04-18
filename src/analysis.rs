@@ -110,11 +110,12 @@ pub fn analyze_game(
     uci_moves: &[String],
     user_color: Color,
     depth: u32,
+    use_nnue: bool,
     progress_fn: &mut dyn FnMut(usize, usize),
 ) -> GameAnalysis {
     let total = uci_moves.len();
     let mut searcher = Searcher::new(64); // reuse TT across all positions
-    searcher.use_nnue = crate::nnue::network::get_network().is_some();
+    searcher.use_nnue = use_nnue;
     let mut board = Board::startpos();
     let mut analysis = Vec::with_capacity(total);
     let mut eval_history = Vec::with_capacity(total + 1);
@@ -351,7 +352,9 @@ mod tests {
         ];
 
         let mut progress = Vec::new();
-        let result = analyze_game(&moves, Color::Black, 10, &mut |cur, tot| {
+        // Pin use_nnue=false so this test isn't sensitive to whether another
+        // parallel test loaded the NNUE net first via the global OnceLock.
+        let result = analyze_game(&moves, Color::Black, 10, false, &mut |cur, tot| {
             progress.push((cur, tot));
         });
 
