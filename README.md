@@ -10,7 +10,7 @@ Focalors (formerly named Hydra/HydraProject during initial development) is an of
 
 The project in its current state ships with most features available and usable, but it needs a lot of further polishment and work
 
-![Focalors desktop GUI with local play and analysis](assets/screenshots/hero.png)
+![Focalors desktop GUI showing a live local game in the redesigned interface](assets/screenshots/hero.png)
 
 ## Current Priorities
 
@@ -83,7 +83,7 @@ Focalors is already usable as both a chess engine and a learning app.
 
 ## Interface Preview
 
-![Focalors showcase covering local play, setup, and game analysis views](assets/screenshots/showcase.png)
+![Focalors showcase with the redesigned local play and statistics views](assets/screenshots/showcase.png)
 
 ## Technical Overview
 
