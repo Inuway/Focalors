@@ -8,6 +8,8 @@ Focalors (formerly named Hydra/HydraProject during initial development) is an of
 - Track rating, openings, and long-term progress in a local SQLite database
 - Run the same engine through the desktop GUI, UCI, or a Lichess bot mode
 
+![Focalors desktop GUI with local play and analysis](assets/screenshots/hero.png)
+
 ## Start Here
 
 Build the project and launch the desktop app:
@@ -18,6 +20,8 @@ cargo run --release -- gui
 ```
 
 The optimized binary will be available at `target/release/focalors`.
+
+Need the engine architecture, NNUE notes, and training commands? See [docs/TECHNICAL.md](docs/TECHNICAL.md).
 
 ### Main Commands
 
@@ -48,7 +52,11 @@ Focalors is already usable as both a chess engine and a learning app.
 - **Engine interfaces**: desktop GUI, UCI mode, and a Lichess bot path
 - **Engine development**: self-play data generation, NNUE training, network promotion, and HCE tuning tools
 
-## How It Works
+## Interface Preview
+
+![Focalors showcase covering local play, setup, and game analysis views](assets/screenshots/showcase.png)
+
+## Technical Overview
 
 Focalors uses a dual-evaluation design.
 
@@ -57,66 +65,12 @@ Focalors uses a dual-evaluation design.
 
 That split is the core idea behind the project: strong play and readable feedback in the same codebase.
 
-At a high level the project is organized like this:
+For the source layout, engine internals, and development commands, see [docs/TECHNICAL.md](docs/TECHNICAL.md).
 
-```text
-src/
-|- gui.rs        desktop interface
-|- analysis.rs   post-game review and coaching logic
-|- db.rs         SQLite persistence
-|- search.rs     alpha-beta search
-|- eval.rs       hand-crafted evaluation for explanations
-|- nnue/         neural network inference
-|- lichess.rs    Lichess integration
-|- uci.rs        UCI protocol support
-|- trainer.rs    NNUE training
-`- selfplay.rs   self-play data generation
-```
+## Learn More
 
-The default NNUE net is embedded directly into the binary, so normal use does not require downloading an extra model file.
-
-## Development And Engine Commands
-
-The most common engine-development commands are:
-
-```bash
-# Generate self-play data
-cargo run --release -- selfplay 100000 nets/gen2v2-data.bin --nnue nets/gen1v2.nnue
-
-# Train or continue an NNUE network
-cargo run --release -- train nets/gen1v2-data.bin \
-  --data nets/gen2v2-data.bin \
-  --mix 0.3,0.7 \
-  --resume nets/gen1v2.nnue \
-  --epochs 30 \
-  --output nets/gen2v2.nnue
-
-# Promote a trained network as the shipped default
-cargo run --release -- promote nets/gen2v2.nnue
-
-# Tune the hand-crafted evaluation
-cargo run --release -- tune dataset.txt
-```
-
-For contributor-oriented build, test, and training notes, see `CONTRIBUTING.md`.
-
-## Current Technical Direction
-
-The engine side already includes:
-
-- bitboard move generation with castling, promotion, and en passant
-- alpha-beta search with iterative deepening, TT, null move pruning, LMR, SEE, singular extensions, and time management
-- pure-Rust NNUE inference with incremental accumulators and AVX2 support
-- a hand-crafted evaluation with multiple explained components for analysis
-- self-play and training tooling for new NNUE generations
-
-The application side already includes:
-
-- a compact egui-based desktop interface
-- player profile storage and saved local game history
-- analysis review, accuracy tracking, and statistics views
-- puzzle generation and solving flows
-- opening tracking and coaching summaries
+- [docs/TECHNICAL.md](docs/TECHNICAL.md) covers architecture, source layout, evaluation design, and engine-development commands.
+- [CONTRIBUTING.md](CONTRIBUTING.md) covers contributor workflow, build expectations, and development notes.
 
 ## Planned Next
 
@@ -129,7 +83,7 @@ The near-term product roadmap is focused on expanding the chess and learning exp
 
 ## Contributing
 
-Focalors is meant to be approachable for both engine work and application work. If you want to contribute, start with `CONTRIBUTING.md` for the practical workflow.
+Focalors is meant to be approachable for both engine work and application work. If you want to contribute, start with [CONTRIBUTING.md](CONTRIBUTING.md) for the practical workflow.
 
 ## License
 
