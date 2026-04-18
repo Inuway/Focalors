@@ -10,6 +10,7 @@ mod moves;
 mod nnue;
 mod search;
 mod openings;
+mod pgn;
 mod puzzles;
 mod selfplay;
 mod strength;

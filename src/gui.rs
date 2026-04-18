@@ -184,6 +184,7 @@ impl Default for LocalDifficulty {
 enum HomePage {
     Overview,
     Lichess,
+    Import,
     Progress,
     Statistics,
     History,
@@ -534,6 +535,10 @@ pub struct FocalorsApp {
     pending_promotion: Option<PendingPromotion>,
     stockfish_level: i32,
     piece_textures: HashMap<(Color, Piece), egui::TextureHandle>,
+    pgn_import_text: String,
+    pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
+    pgn_import_error: Option<String>,
+    pgn_import_user_color: Color,
 }
 
 fn load_piece_texture(
@@ -685,6 +690,10 @@ impl FocalorsApp {
             pending_promotion: None,
             stockfish_level: 1,
             piece_textures,
+            pgn_import_text: String::new(),
+            pgn_import_parsed: None,
+            pgn_import_error: None,
+            pgn_import_user_color: Color::White,
         }
     }
 
@@ -2020,10 +2029,12 @@ impl FocalorsApp {
 
         thread::spawn(move || {
             crate::attacks::init();
+            let use_nnue = crate::nnue::network::get_network().is_some();
             let result = crate::analysis::analyze_game(
                 &uci_moves,
                 user_color,
                 14, // analysis depth
+                use_nnue,
                 &mut |cur, tot| {
                     let mut a = analysis_state.lock().unwrap();
                     *a = AnalysisState::Running {
@@ -2343,6 +2354,10 @@ impl FocalorsApp {
                 self.home_page = HomePage::Lichess;
             }
 
+            if ui.add(home_nav_button(self.home_page == HomePage::Import, "Import")).clicked() {
+                self.home_page = HomePage::Import;
+            }
+
             let progress_response = ui.add_enabled(
                 has_analyzed,
                 home_nav_button(self.home_page == HomePage::Progress, "Progress"),
@@ -2435,6 +2450,7 @@ impl FocalorsApp {
                     });
                 }
             }
+            HomePage::Import => self.draw_pgn_import(ui),
             HomePage::Progress => self.draw_coaching_report(ui),
             HomePage::Statistics => self.draw_statistics_panel(ui),
             HomePage::History => {
@@ -2597,6 +2613,143 @@ impl FocalorsApp {
                 );
             }
         });
+    }
+
+    fn draw_pgn_import(&mut self, ui: &mut egui::Ui) {
+        hydra_card_frame().show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Import PGN")
+                    .strong()
+                    .size(16.0)
+                    .color(hydra_accent()),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Paste a game exported from Lichess or Chess.com to run a full engine review.",
+                )
+                .size(12.0)
+                .color(hydra_subtle_text()),
+            );
+
+            ui.add_space(10.0);
+            ui.add(
+                egui::TextEdit::multiline(&mut self.pgn_import_text)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(12)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("[Event \"…\"]\n[White \"…\"]\n…\n\n1. e4 e5 2. Nf3 Nc6 …"),
+            );
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.add(primary_button("Parse PGN")).clicked() {
+                    self.pgn_import_error = None;
+                    match crate::pgn::parse_pgn(&self.pgn_import_text) {
+                        Ok(parsed) => {
+                            let profile_name = self.profile.as_ref().map(|p| p.name.clone());
+                            self.pgn_import_user_color = crate::pgn::user_color_from_headers(
+                                &parsed,
+                                profile_name.as_deref(),
+                            );
+                            self.pgn_import_parsed = Some(parsed);
+                        }
+                        Err(e) => {
+                            self.pgn_import_parsed = None;
+                            self.pgn_import_error = Some(e);
+                        }
+                    }
+                }
+                if !self.pgn_import_text.is_empty()
+                    && ui.add(secondary_button("Clear")).clicked()
+                {
+                    self.pgn_import_text.clear();
+                    self.pgn_import_parsed = None;
+                    self.pgn_import_error = None;
+                }
+            });
+        });
+
+        if let Some(err) = self.pgn_import_error.clone() {
+            ui.add_space(10.0);
+            hydra_callout_frame().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(err)
+                        .size(12.0)
+                        .strong()
+                        .color(hydra_danger()),
+                );
+            });
+        }
+
+        if let Some(parsed) = self.pgn_import_parsed.clone() {
+            ui.add_space(12.0);
+            hydra_card_frame().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Parsed game")
+                        .strong()
+                        .size(13.0)
+                        .color(hydra_accent()),
+                );
+                ui.add_space(6.0);
+                let row = |ui: &mut egui::Ui, label: &str, value: &str| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(label)
+                                .size(11.0)
+                                .strong()
+                                .color(hydra_subtle_text()),
+                        );
+                        ui.label(egui::RichText::new(value).size(12.0).color(hydra_text()));
+                    });
+                };
+                row(ui, "White", parsed.white.as_deref().unwrap_or("—"));
+                row(ui, "Black", parsed.black.as_deref().unwrap_or("—"));
+                row(ui, "Result", parsed.result.as_deref().unwrap_or("—"));
+                row(ui, "Moves", &parsed.uci_moves.len().to_string());
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Analyze as")
+                            .size(11.0)
+                            .strong()
+                            .color(hydra_subtle_text()),
+                    );
+                    if ui
+                        .selectable_label(self.pgn_import_user_color == Color::White, "White")
+                        .clicked()
+                    {
+                        self.pgn_import_user_color = Color::White;
+                    }
+                    if ui
+                        .selectable_label(self.pgn_import_user_color == Color::Black, "Black")
+                        .clicked()
+                    {
+                        self.pgn_import_user_color = Color::Black;
+                    }
+                });
+
+                ui.add_space(10.0);
+                let analysis_idle = matches!(
+                    *self.analysis_state.lock().unwrap(),
+                    AnalysisState::Idle
+                );
+                let analyze = ui.add_enabled(
+                    analysis_idle,
+                    primary_button(if analysis_idle {
+                        "Analyze with Engine"
+                    } else {
+                        "Analysis already running"
+                    }),
+                );
+                if analyze.clicked() {
+                    let uci_moves = parsed.uci_moves.clone();
+                    let user_color = self.pgn_import_user_color;
+                    self.start_analysis(uci_moves, user_color);
+                    self.home_page = HomePage::Progress;
+                }
+            });
+        }
     }
 
     fn draw_lichess_setup_card(
