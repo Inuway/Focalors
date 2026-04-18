@@ -1,0 +1,26 @@
+[package]
+name = "focalors"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+bitflags = "2.11.0"
+dirs = "6.0.0"
+# Use the glow (OpenGL) backend explicitly. The default wgpu/Vulkan path
+# can have lag/compatibility issues on some Linux setups (Mesa/driver state).
+# OpenGL is more universally compatible and plenty fast for our chess GUI.
+eframe = { version = "0.34.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "accesskit"] }
+egui = "0.34.1"
+egui_plot = "0.35.0"
+futures-util = "0.3.32"
+image = { version = "0.25.10", features = ["png"] }
+reqwest = { version = "0.12", features = ["stream", "json"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.43", features = ["full"] }

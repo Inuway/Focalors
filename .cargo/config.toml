@@ -1,0 +1,5 @@
+# Build for the local CPU architecture (enables AVX2/BMI2/FMA on Ryzen, etc.)
+# Note: this produces a non-portable binary optimized for the dev's CPU.
+# For distribution, override with --target or build without these flags.
+[build]
+rustflags = ["-C", "target-cpu=native"]

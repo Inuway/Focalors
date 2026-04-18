@@ -1,0 +1,7 @@
+/target
+.env
+
+# NNUE training artifacts
+nets/*-data.bin
+nets/*-epoch*.nnue
+
