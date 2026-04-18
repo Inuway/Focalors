@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -178,6 +179,40 @@ impl Default for LocalDifficulty {
         Self::Tournament
     }
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HomePage {
+    Overview,
+    Lichess,
+    Progress,
+    Statistics,
+    History,
+    Puzzles,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiTheme {
+    Dark,
+    Light,
+}
+
+impl UiTheme {
+    fn toggle(self) -> Self {
+        match self {
+            UiTheme::Dark => UiTheme::Light,
+            UiTheme::Light => UiTheme::Dark,
+        }
+    }
+
+    fn index(self) -> u8 {
+        match self {
+            UiTheme::Dark => 0,
+            UiTheme::Light => 1,
+        }
+    }
+}
+
+static ACTIVE_THEME: AtomicU8 = AtomicU8::new(0);
 
 impl TimePreset {
     const ALL: [TimePreset; 8] = [
@@ -476,7 +511,8 @@ pub struct FocalorsApp {
     show_welcome: bool,
     welcome_name: String,
     welcome_rating_choice: i32,
-    show_game_history: bool,
+    home_page: HomePage,
+    ui_theme: UiTheme,
     replay_game: Option<ReplayState>,
     analysis_state: Arc<Mutex<AnalysisState>>,
     analysis_review_cursor: usize, // which move is selected in review
@@ -489,8 +525,6 @@ pub struct FocalorsApp {
     adaptive_level: u32,
     auto_adjust_message: Option<(String, std::time::Instant)>,
     show_eval_panel: bool,
-    show_coaching_report: bool,
-    show_statistics: bool,
     session_start_rating: i32,
     session_start_games: i32,
     session_best_accuracy: Option<f64>,
@@ -518,7 +552,7 @@ fn load_piece_texture(
 
 impl FocalorsApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        configure_theme(&cc.egui_ctx);
+        configure_theme(&cc.egui_ctx, UiTheme::Light);
 
         // Load token from environment if available
         let token = std::env::var("LICHESS_TOKEN").unwrap_or_default();
@@ -628,7 +662,8 @@ impl FocalorsApp {
             show_welcome,
             welcome_name: String::new(),
             welcome_rating_choice: 1200,
-            show_game_history: false,
+            home_page: HomePage::Overview,
+            ui_theme: UiTheme::Light,
             replay_game: None,
             analysis_state: Arc::new(Mutex::new(AnalysisState::Idle)),
             analysis_review_cursor: 0,
@@ -641,8 +676,6 @@ impl FocalorsApp {
             adaptive_level,
             auto_adjust_message: None,
             show_eval_panel: false,
-            show_coaching_report: false,
-            show_statistics: false,
             session_start_rating,
             session_start_games,
             session_best_accuracy: None,
@@ -653,6 +686,11 @@ impl FocalorsApp {
             stockfish_level: 1,
             piece_textures,
         }
+    }
+
+    fn set_ui_theme(&mut self, ctx: &egui::Context, theme: UiTheme) {
+        self.ui_theme = theme;
+        configure_theme(ctx, theme);
     }
 
     fn local_input_enabled(&self) -> bool {
@@ -900,35 +938,34 @@ impl FocalorsApp {
             hydra_card_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(&profile.name)
-                            .size(16.0)
+                        egui::RichText::new("Profile")
+                            .size(12.0)
                             .strong()
-                            .color(hydra_accent()),
+                            .color(hydra_subtle_text()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            egui::RichText::new(format!("Rating: {}", profile.rating))
-                                .size(13.0),
+                            egui::RichText::new(&profile.name)
+                                .size(18.0)
+                                .strong()
+                                .color(hydra_accent()),
                         );
                     });
                 });
 
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} games played",
-                            profile.games_played
-                        ))
-                        .size(12.0)
-                        .color(hydra_subtle_text()),
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    metric_tile(ui, "Rating", &profile.rating.to_string(), hydra_text());
+                    metric_tile(
+                        ui,
+                        "Games",
+                        &profile.games_played.to_string(),
+                        hydra_text(),
                     );
                     if profile.games_played > 0 {
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(format!("W{w} / L{l} / D{d}"))
-                                .size(12.0)
-                                .color(hydra_subtle_text()),
-                        );
+                        metric_tile(ui, "Record", &format!("W{w} / L{l} / D{d}"), hydra_subtle_text());
                     }
                 });
             });
@@ -959,7 +996,7 @@ impl FocalorsApp {
                 ui.label(egui::RichText::new("Statistics Dashboard").size(16.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Close").clicked() {
-                        self.show_statistics = false;
+                        self.home_page = HomePage::Overview;
                     }
                 });
             });
@@ -1315,7 +1352,7 @@ impl FocalorsApp {
                 ui.label(egui::RichText::new("Progress Report").size(15.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Close").clicked() {
-                        self.show_coaching_report = false;
+                        self.home_page = HomePage::Overview;
                     }
                 });
             });
@@ -1443,6 +1480,7 @@ impl FocalorsApp {
             _ => return,
         };
         let puzzle = puzzles.into_iter().next().unwrap();
+        self.home_page = HomePage::Puzzles;
         self.load_puzzle(puzzle);
     }
 
@@ -1671,7 +1709,7 @@ impl FocalorsApp {
                 ui.label(egui::RichText::new("Recent Games").size(14.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Hide").clicked() {
-                        self.show_game_history = false;
+                        self.home_page = HomePage::Overview;
                     }
                 });
             });
@@ -1957,7 +1995,7 @@ impl FocalorsApp {
             // Auto-show coaching report every 10 games
             if let Some(ref p) = self.profile {
                 if p.games_played > 0 && p.games_played % 10 == 0 {
-                    self.show_coaching_report = true;
+                    self.home_page = HomePage::Progress;
                 }
             }
         }
@@ -2254,152 +2292,197 @@ impl FocalorsApp {
             )
         };
 
-        let wide_layout = ui.available_width() > 940.0;
         let ctx = ui.ctx().clone();
         let status_label = match &lichess_status {
             LichessStatus::Disconnected => "Offline local play ready".to_string(),
             LichessStatus::Connected(user) => format!("Lichess connected as {user}"),
             LichessStatus::InGame(id) => format!("Lichess game active: {id}"),
         };
+        let has_puzzles = self
+            .db
+            .as_ref()
+            .and_then(|db| db.get_puzzle_counts().ok())
+            .map_or(false, |(total, _)| total > 0);
+        let has_analyzed = self
+            .db
+            .as_ref()
+            .and_then(|db| db.get_accuracy_history(1).ok())
+            .map_or(false, |h| !h.is_empty());
+        let has_games = !self.recent_games.is_empty();
 
         ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new("Focalors")
-                        .size(30.0)
+                        .size(28.0)
                         .strong()
                         .color(hydra_accent()),
                 );
                 ui.label(
-                    egui::RichText::new(
-                        "Choose a local setup or connect Lichess before entering a session.",
-                    )
-                    .size(13.0)
-                    .color(hydra_subtle_text()),
+                    egui::RichText::new("Train, play, and review chess in one focused workspace.")
+                        .size(13.0)
+                        .color(hydra_subtle_text()),
                 );
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                hydra_badge(ui, &status_label, hydra_panel_alt_fill());
+            });
+        });
+
+        ui.add_space(12.0);
+        self.draw_profile_card(ui);
+        ui.add_space(14.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(home_nav_button(self.home_page == HomePage::Overview, "Overview")).clicked() {
+                self.home_page = HomePage::Overview;
+            }
+
+            if ui.add(home_nav_button(self.home_page == HomePage::Lichess, "Lichess")).clicked() {
+                self.home_page = HomePage::Lichess;
+            }
+
+            let progress_response = ui.add_enabled(
+                has_analyzed,
+                home_nav_button(self.home_page == HomePage::Progress, "Progress"),
+            );
+            if progress_response.clicked() {
+                self.home_page = HomePage::Progress;
+            }
+
+            let statistics_response = ui.add_enabled(
+                has_games,
+                home_nav_button(self.home_page == HomePage::Statistics, "Statistics"),
+            );
+            if statistics_response.clicked() {
+                self.home_page = HomePage::Statistics;
+            }
+
+            let history_response = ui.add_enabled(
+                has_games,
+                home_nav_button(self.home_page == HomePage::History, "History"),
+            );
+            if history_response.clicked() {
+                self.home_page = HomePage::History;
+            }
+
+            let puzzle_response = ui.add_enabled(
+                has_puzzles || self.puzzle_trainer.is_some(),
+                home_nav_button(self.home_page == HomePage::Puzzles, "Puzzles"),
+            );
+            if puzzle_response.clicked() {
+                self.home_page = HomePage::Puzzles;
+            }
+        });
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(14.0);
+
+        match self.home_page {
+            HomePage::Overview => {
+                self.draw_local_setup_card(ui, searching, &lichess_status);
+
+                ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new(status_label)
-                        .size(11.0)
+                    egui::RichText::new(status_message)
+                        .size(12.0)
                         .color(hydra_subtle_text()),
                 );
-            });
-        });
 
-        // Profile card
-        self.draw_profile_card(ui);
-        ui.add_space(8.0);
-
-        ui.add_space(6.0);
-        if wide_layout {
-            ui.columns(2, |columns| {
-                self.draw_local_setup_card(&mut columns[0], searching, &lichess_status);
-                self.draw_lichess_setup_card(
-                    &mut columns[1],
-                    &lichess_status,
-                    searching,
-                    token_set,
-                );
-            });
-        } else {
-            self.draw_local_setup_card(ui, searching, &lichess_status);
-
-            ui.add_space(14.0);
-
-            self.draw_lichess_setup_card(ui, &lichess_status, searching, token_set);
-        }
-
-        ui.add_space(10.0);
-        hydra_subtle_frame().show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(status_message)
-                    .size(12.0)
-                    .color(hydra_text()),
-            );
-        });
-
-        // Auto-adjust toast (fades after 8 seconds)
-        if let Some((ref msg, when)) = self.auto_adjust_message {
-            if when.elapsed().as_secs() < 8 {
-                ui.add_space(4.0);
-                hydra_subtle_frame().show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(msg)
-                            .size(12.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(100, 200, 130)),
-                    );
-                });
-            } else {
-                self.auto_adjust_message = None;
-            }
-        }
-
-        if !lichess_log.is_empty() {
-            ui.add_space(8.0);
-            hydra_subtle_frame().show(ui, |ui| {
-                ui.collapsing("Recent Lichess Log", |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(120.0)
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for log in lichess_log.iter().rev().take(20).rev() {
-                                ui.label(egui::RichText::new(log).size(10.0).monospace());
-                            }
+                if let Some((ref msg, when)) = self.auto_adjust_message {
+                    if when.elapsed().as_secs() < 8 {
+                        ui.add_space(6.0);
+                        hydra_callout_frame().show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(msg)
+                                    .size(12.0)
+                                    .strong()
+                                    .color(hydra_success()),
+                            );
                         });
-                });
-            });
-        }
-
-        // Puzzle trainer / game history section
-        ui.add_space(8.0);
-        if self.puzzle_trainer.is_some() {
-            self.draw_puzzle_trainer(ui);
-        } else {
-            ui.horizontal(|ui| {
-                let has_puzzles = self.db.as_ref()
-                    .and_then(|db| db.get_puzzle_counts().ok())
-                    .map_or(false, |(total, _)| total > 0);
-                if has_puzzles && ui.button("Train Puzzles").clicked() {
-                    self.start_puzzle_trainer();
-                }
-                let has_analyzed = self.db.as_ref()
-                    .and_then(|db| db.get_accuracy_history(1).ok())
-                    .map_or(false, |h| !h.is_empty());
-                if has_analyzed && ui.button("View Progress").clicked() {
-                    self.show_coaching_report = !self.show_coaching_report;
-                }
-                let has_games = !self.recent_games.is_empty();
-                if has_games && ui.button("Statistics").clicked() {
-                    self.show_statistics = !self.show_statistics;
-                }
-                if self.show_game_history {
-                    // game history is shown below
-                } else if !self.recent_games.is_empty() {
-                    if ui.button("Show Game History").clicked() {
-                        self.show_game_history = true;
+                    } else {
+                        self.auto_adjust_message = None;
                     }
                 }
-            });
-            if self.show_coaching_report {
-                self.draw_coaching_report(ui);
-            }
-            if self.show_statistics {
-                self.draw_statistics_panel(ui);
-            }
-            self.draw_opening_stats(ui);
-            if self.show_game_history {
-                self.draw_game_history(ui);
-            }
-        }
 
-        // Replay panel
-        if self.replay_game.is_some() {
-            ui.add_space(8.0);
-            self.draw_replay_panel(ui);
+                if has_games {
+                    ui.add_space(14.0);
+                    self.draw_opening_stats(ui);
+                }
+            }
+            HomePage::Lichess => {
+                self.draw_lichess_setup_card(ui, &lichess_status, searching, token_set);
+
+                if !lichess_log.is_empty() {
+                    ui.add_space(12.0);
+                    hydra_card_frame().show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Recent Activity")
+                                .size(13.0)
+                                .strong()
+                                .color(hydra_accent()),
+                        );
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                for log in lichess_log.iter().rev().take(40).rev() {
+                                    ui.label(egui::RichText::new(log).size(10.5).monospace().color(hydra_subtle_text()));
+                                }
+                            });
+                    });
+                }
+            }
+            HomePage::Progress => self.draw_coaching_report(ui),
+            HomePage::Statistics => self.draw_statistics_panel(ui),
+            HomePage::History => {
+                self.draw_game_history(ui);
+                if self.replay_game.is_some() {
+                    ui.add_space(10.0);
+                    self.draw_replay_panel(ui);
+                }
+            }
+            HomePage::Puzzles => {
+                if self.puzzle_trainer.is_some() {
+                    self.draw_puzzle_trainer(ui);
+                } else {
+                    hydra_card_frame().show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Puzzle Trainer")
+                                .size(16.0)
+                                .strong()
+                                .color(hydra_accent()),
+                        );
+                        ui.add_space(4.0);
+                        if has_puzzles {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Drill positions saved from your analyzed games.",
+                                )
+                                .size(12.0)
+                                .color(hydra_subtle_text()),
+                            );
+                            ui.add_space(12.0);
+                            if ui
+                                .add_sized([ui.available_width().min(240.0), 38.0], primary_button("Start Puzzle Session"))
+                                .clicked()
+                            {
+                                self.start_puzzle_trainer();
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "No saved puzzles yet. Analyze finished games first so Focalors can extract training positions.",
+                                )
+                                .size(12.0)
+                                .color(hydra_subtle_text()),
+                            );
+                        }
+                    });
+                }
+            }
         }
 
         self.draw_home_engine_settings_popup(&ctx, searching);
@@ -2427,61 +2510,66 @@ impl FocalorsApp {
             );
 
             ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new("Side")
-                    .size(11.0)
-                    .strong()
-                    .color(hydra_subtle_text()),
-            );
-            ui.horizontal_wrapped(|ui| {
-                for choice in [SideChoice::White, SideChoice::Black, SideChoice::Random] {
-                    if selectable_chip(ui, self.local_side_choice == choice, side_choice_name(choice))
-                        .clicked()
-                    {
-                        self.local_side_choice = choice;
-                    }
-                }
-            });
+            egui::Grid::new("local_setup_form")
+                .num_columns(2)
+                .spacing([16.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Side")
+                            .size(11.0)
+                            .strong()
+                            .color(hydra_subtle_text()),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.radio_value(&mut self.local_side_choice, SideChoice::White, "White");
+                        ui.radio_value(&mut self.local_side_choice, SideChoice::Black, "Black");
+                        ui.radio_value(&mut self.local_side_choice, SideChoice::Random, "Random");
+                    });
+                    ui.end_row();
 
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("Time Control")
-                    .size(11.0)
-                    .strong()
-                    .color(hydra_subtle_text()),
-            );
-            ui.horizontal_wrapped(|ui| {
-                for preset in TimePreset::ALL {
-                    if selectable_chip(ui, self.local_time_preset == preset, preset.label()).clicked() {
-                        self.local_time_preset = preset;
-                    }
-                }
-            });
+                    ui.label(
+                        egui::RichText::new("Time Control")
+                            .size(11.0)
+                            .strong()
+                            .color(hydra_subtle_text()),
+                    );
+                    egui::ComboBox::from_id_salt("home_time_preset")
+                        .selected_text(self.local_time_preset.label())
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for preset in TimePreset::ALL {
+                                ui.selectable_value(&mut self.local_time_preset, preset, preset.label());
+                            }
+                        });
+                    ui.end_row();
 
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Focalors Profile")
-                        .size(11.0)
-                        .strong()
-                        .color(hydra_subtle_text()),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(secondary_button("Advanced")).clicked() {
-                        self.show_advanced_engine_settings = true;
-                    }
+                    ui.label(
+                        egui::RichText::new("Focalors Profile")
+                            .size(11.0)
+                            .strong()
+                            .color(hydra_subtle_text()),
+                    );
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("home_local_difficulty")
+                            .selected_text(self.local_difficulty.label())
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                for difficulty in LocalDifficulty::ALL {
+                                    ui.selectable_value(
+                                        &mut self.local_difficulty,
+                                        difficulty,
+                                        difficulty.label(),
+                                    );
+                                }
+                            });
+                        if ui.add(secondary_button("Advanced")).clicked() {
+                            self.show_advanced_engine_settings = true;
+                        }
+                    });
+                    ui.end_row();
                 });
-            });
 
-            ui.horizontal_wrapped(|ui| {
-                for difficulty in LocalDifficulty::ALL {
-                    if selectable_chip(ui, self.local_difficulty == difficulty, difficulty.label())
-                        .clicked()
-                    {
-                        self.local_difficulty = difficulty;
-                    }
-                }
-            });
+            ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(self.local_difficulty.description(self.adaptive_level))
                     .size(11.0)
@@ -2534,17 +2622,22 @@ impl FocalorsApp {
             );
 
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(match lichess_status {
-                    LichessStatus::Disconnected => "Status: disconnected".to_string(),
-                    LichessStatus::Connected(user) => format!("Status: connected as {user}"),
-                    LichessStatus::InGame(id) => format!("Status: in game {id}"),
-                })
-                .size(11.0)
-                .color(hydra_subtle_text()),
-            );
+            ui.horizontal(|ui| {
+                let (label, tone) = match lichess_status {
+                    LichessStatus::Disconnected => ("Disconnected".to_string(), hydra_subtle_text()),
+                    LichessStatus::Connected(user) => (format!("Connected as {user}"), hydra_success()),
+                    LichessStatus::InGame(id) => (format!("In game {id}"), hydra_success()),
+                };
+                ui.label(
+                    egui::RichText::new("Status")
+                        .size(11.0)
+                        .strong()
+                        .color(hydra_subtle_text()),
+                );
+                ui.label(egui::RichText::new(label).size(12.0).strong().color(tone));
+            });
 
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             let mut token = self.state.lock().unwrap().lichess_settings.token.clone();
             ui.label(
                 egui::RichText::new("API Token")
@@ -2584,28 +2677,32 @@ impl FocalorsApp {
 
             if matches!(lichess_status, LichessStatus::Connected(_)) {
                 ui.add_space(10.0);
-                hydra_subtle_frame().show(ui, |ui| {
-                    ui.label(egui::RichText::new("Challenge Setup").strong().color(hydra_accent()));
-                    ui.label(
-                        egui::RichText::new("Tune the AI level and clock before sending a challenge.")
-                            .size(11.0)
-                            .color(hydra_subtle_text()),
-                    );
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("Challenge Setup").strong().color(hydra_accent()));
+                ui.label(
+                    egui::RichText::new("Tune the AI level and clock before sending a challenge.")
+                        .size(11.0)
+                        .color(hydra_subtle_text()),
+                );
 
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("Stockfish level")
-                            .size(11.0)
-                            .strong()
-                            .color(hydra_subtle_text()),
-                    );
-                    ui.add(egui::Slider::new(&mut self.stockfish_level, 1..=8));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Stockfish level")
+                        .size(11.0)
+                        .strong()
+                        .color(hydra_subtle_text()),
+                );
+                ui.add(egui::Slider::new(&mut self.stockfish_level, 1..=8));
 
-                    let mut ls = self.state.lock().unwrap().lichess_settings.clone();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
+                let mut ls = self.state.lock().unwrap().lichess_settings.clone();
+                ui.add_space(6.0);
+                egui::Grid::new("lichess_challenge_form")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
                         ui.label(
-                            egui::RichText::new("Clock")
+                            egui::RichText::new("Minutes")
                                 .size(11.0)
                                 .strong()
                                 .color(hydra_subtle_text()),
@@ -2613,20 +2710,28 @@ impl FocalorsApp {
                         let mut mins = ls.clock_minutes as i32;
                         ui.add(egui::DragValue::new(&mut mins).range(1..=180).suffix(" min"));
                         ls.clock_minutes = mins as u32;
-                        let mut inc = ls.clock_increment as i32;
-                        ui.add(egui::DragValue::new(&mut inc).range(0..=60).suffix("s inc"));
-                        ls.clock_increment = inc as u32;
-                    });
-                    self.state.lock().unwrap().lichess_settings = ls;
+                        ui.end_row();
 
-                    ui.add_space(8.0);
-                    if ui
-                        .add_sized([ui.available_width(), 34.0], secondary_button("Challenge Stockfish"))
-                        .clicked()
-                    {
-                        self.challenge_stockfish();
-                    }
-                });
+                        ui.label(
+                            egui::RichText::new("Increment")
+                                .size(11.0)
+                                .strong()
+                                .color(hydra_subtle_text()),
+                        );
+                        let mut inc = ls.clock_increment as i32;
+                        ui.add(egui::DragValue::new(&mut inc).range(0..=60).suffix(" s"));
+                        ls.clock_increment = inc as u32;
+                        ui.end_row();
+                    });
+                self.state.lock().unwrap().lichess_settings = ls;
+
+                ui.add_space(8.0);
+                if ui
+                    .add_sized([ui.available_width(), 34.0], secondary_button("Challenge Stockfish"))
+                    .clicked()
+                {
+                    self.challenge_stockfish();
+                }
             }
 
             ui.add_space(8.0);
@@ -2817,25 +2922,44 @@ impl eframe::App for FocalorsApp {
                         .size(12.0)
                         .color(hydra_subtle_text()),
                 );
-                ui.separator();
                 if searching {
+                    ui.separator();
                     ui.spinner();
                     hydra_badge(ui, "Thinking", hydra_warning());
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let toggle_label = match self.ui_theme {
+                        UiTheme::Dark => "Light Mode",
+                        UiTheme::Light => "Dark Mode",
+                    };
+                    if ui.add(theme_toggle_button(toggle_label)).clicked() {
+                        self.set_ui_theme(&ctx, self.ui_theme.toggle());
+                    }
+                });
             });
         });
 
-        // Right panel: settings and controls
+        // Right panel: settings and controls (only during play)
         if !show_home_screen {
             egui::Panel::right("controls")
-                .min_size(280.0)
-                .max_size(320.0)
+                .min_size(300.0)
+                .max_size(360.0)
                 .show_inside(ui, |ui| {
                     self.draw_controls(ui);
                 });
+
+            // Bottom info strip: clocks + status + last move (compact, no scroll)
+            egui::Panel::bottom("play_status_bar")
+                .resizable(false)
+                .default_size(56.0)
+                .min_size(48.0)
+                .max_size(96.0)
+                .show_inside(ui, |ui| {
+                    self.draw_play_status_bar(ui);
+                });
         }
 
-        // Central panel: board + info
+        // Central panel: home (scrollable) or board only (fills remaining space)
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if show_home_screen {
                 egui::ScrollArea::vertical()
@@ -2844,30 +2968,8 @@ impl eframe::App for FocalorsApp {
                         self.draw_idle_home(ui);
                     });
             } else {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        hydra_card_frame().show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    egui::RichText::new(if mode_label == "Local Play" {
-                                        "Board Session"
-                                    } else {
-                                        "Live Board"
-                                    })
-                                    .strong()
-                                    .size(16.0)
-                                    .color(hydra_accent()),
-                                );
-                                ui.add_space(8.0);
-                                hydra_badge(ui, mode_label, hydra_panel_raised_fill());
-                            });
-                            ui.add_space(8.0);
-                            self.draw_board(ui);
-                        });
-                        ui.add_space(8.0);
-                        self.draw_engine_info(ui);
-                    });
+                ui.add_space(6.0);
+                self.draw_board(ui);
             }
         });
     }
@@ -3271,30 +3373,19 @@ impl FocalorsApp {
         });
     }
 
-    // ── Engine info display ────────────────────────────────────────────
+    // ── Compact bottom status bar (clocks + status + eval) ─────────────
 
-    fn draw_engine_info(&self, ui: &mut egui::Ui) {
+    fn draw_play_status_bar(&self, ui: &mut egui::Ui) {
         let state = self.state.lock().unwrap();
-        hydra_card_frame().show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new("Session Feed")
-                        .strong()
-                        .size(16.0)
-                        .color(hydra_accent()),
-                );
-                if state.search_info.searching {
-                    hydra_badge(ui, "Focalors thinking", hydra_warning());
-                }
-            });
+        let active_side = if state.local_game.active && state.local_game.outcome.is_none() {
+            Some(state.board.side_to_move)
+        } else {
+            None
+        };
 
-            ui.add_space(6.0);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
             if state.local_game.active {
-                let active_side = if state.local_game.outcome.is_none() {
-                    Some(state.board.side_to_move)
-                } else {
-                    None
-                };
                 let white_ms = state
                     .local_game
                     .time_control
@@ -3304,109 +3395,104 @@ impl FocalorsApp {
                     .time_control
                     .displayed_remaining_ms(Color::Black, active_side);
 
-                ui.horizontal_wrapped(|ui| {
-                    metric_tile(
-                        ui,
-                        "White",
-                        &format_clock_ms(white_ms),
-                        clock_color(white_ms, active_side == Some(Color::White)),
-                    );
-                    metric_tile(
-                        ui,
-                        "Black",
-                        &format_clock_ms(black_ms),
-                        clock_color(black_ms, active_side == Some(Color::Black)),
-                    );
-                    metric_tile(
-                        ui,
-                        "Time control",
-                        state.local_game.time_control.label,
-                        hydra_text(),
-                    );
-                    metric_tile(
-                        ui,
-                        "Difficulty",
-                        state.local_game.difficulty.label(),
-                        hydra_text(),
-                    );
-                });
-                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("White")
+                        .size(10.0)
+                        .strong()
+                        .color(hydra_subtle_text()),
+                );
+                ui.label(
+                    egui::RichText::new(format_clock_ms(white_ms))
+                        .size(15.0)
+                        .strong()
+                        .monospace()
+                        .color(clock_color(white_ms, active_side == Some(Color::White))),
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new("Black")
+                        .size(10.0)
+                        .strong()
+                        .color(hydra_subtle_text()),
+                );
+                ui.label(
+                    egui::RichText::new(format_clock_ms(black_ms))
+                        .size(15.0)
+                        .strong()
+                        .monospace()
+                        .color(clock_color(black_ms, active_side == Some(Color::Black))),
+                );
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
             }
 
-            hydra_subtle_frame().show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&state.status_message)
-                            .size(13.0)
-                            .color(hydra_text()),
-                    )
-                    .wrap(),
-                );
-            });
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&state.status_message)
+                        .size(12.0)
+                        .color(hydra_text()),
+                )
+                .truncate(),
+            );
 
             if state.search_info.depth > 0 {
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let score = state.search_info.score;
                     let score_text = if score.abs() > 20000 {
                         format!("M{}", (29000 - score.abs() + 1) / 2)
                     } else {
-                        format!("{:.1}", score as f64 / 100.0)
+                        format!("{:+.2}", score as f64 / 100.0)
                     };
 
-                    metric_tile(
-                        ui,
-                        "Depth",
-                        &state.search_info.depth.to_string(),
-                        hydra_text(),
-                    );
-                    metric_tile(ui, "Eval", &score_text, hydra_accent());
-                    metric_tile(
-                        ui,
-                        "Nodes",
-                        &format_nodes(state.search_info.nodes),
-                        hydra_text(),
-                    );
-
                     if !state.search_info.best_move.is_empty() {
-                        metric_tile(
-                            ui,
-                            "Best move",
-                            &state.search_info.best_move,
-                            hydra_success(),
+                        ui.label(
+                            egui::RichText::new(&state.search_info.best_move)
+                                .size(11.0)
+                                .strong()
+                                .monospace()
+                                .color(hydra_success()),
                         );
+                        ui.label(
+                            egui::RichText::new("best")
+                                .size(10.0)
+                                .color(hydra_subtle_text()),
+                        );
+                        ui.add_space(10.0);
                     }
-                });
-            }
 
-            if !state.move_history.is_empty() {
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("Moves").strong().size(12.0));
-                let moves_text: String = state
-                    .move_history
-                    .chunks(2)
-                    .enumerate()
-                    .map(|(i, pair)| {
-                        let w = &pair[0];
-                        if pair.len() > 1 {
-                            format!("{}. {} {}", i + 1, w, pair[1])
-                        } else {
-                            format!("{}. {}", i + 1, w)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                hydra_subtle_frame().show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(110.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(moves_text).size(11.0).monospace(),
-                                )
-                                .wrap(),
-                            );
-                        });
+                    ui.label(
+                        egui::RichText::new(score_text)
+                            .size(12.0)
+                            .strong()
+                            .monospace()
+                            .color(hydra_accent()),
+                    );
+                    ui.label(
+                        egui::RichText::new("eval")
+                            .size(10.0)
+                            .color(hydra_subtle_text()),
+                    );
+                    ui.add_space(10.0);
+
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "d{} · {}",
+                            state.search_info.depth,
+                            format_nodes(state.search_info.nodes)
+                        ))
+                        .size(11.0)
+                        .monospace()
+                        .color(hydra_subtle_text()),
+                    );
+                });
+            } else if state.search_info.searching {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("Focalors thinking…")
+                            .size(11.0)
+                            .color(hydra_warning()),
+                    );
                 });
             }
         });
@@ -3472,21 +3558,15 @@ impl FocalorsApp {
             let mut resume = false;
             let mut abort = false;
 
-            ui.label(
-                egui::RichText::new("Game Session")
-                    .strong()
-                    .size(18.0)
-                    .color(hydra_accent()),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "Setup stays on the home screen so this sidebar can focus on the current board state.",
-                )
-                .size(11.0)
-                .color(hydra_subtle_text()),
-            );
-
             hydra_card_frame().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Game Session")
+                        .strong()
+                        .size(16.0)
+                        .color(hydra_accent()),
+                );
+                ui.add_space(10.0);
+
                 egui::Grid::new("local_session_summary")
                     .num_columns(2)
                     .spacing([10.0, 6.0])
@@ -3534,6 +3614,7 @@ impl FocalorsApp {
                         );
                         ui.end_row();
                     });
+
                 if history_paused && local_game.outcome.is_none() {
                     ui.add_space(8.0);
                     hydra_callout_frame().show(ui, |ui| {
@@ -3544,52 +3625,54 @@ impl FocalorsApp {
                         );
                     });
                 }
-            });
 
-            hydra_card_frame().show(ui, |ui| {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new("Quick Actions").strong().color(hydra_accent()));
                 ui.add_space(6.0);
-                if ui.add_sized([ui.available_width(), 34.0], secondary_button("Flip Board")).clicked() {
-                    self.flipped = !self.flipped;
-                }
-                let can_resign = local_game.outcome.is_none() && !searching;
-                let resign_clicked = ui
-                    .add_enabled_ui(can_resign, |ui| {
-                        ui.add_sized([ui.available_width(), 34.0], danger_button("Resign"))
-                            .clicked()
-                    })
-                    .inner;
-                if resign_clicked {
-                    let mut s = self.state.lock().unwrap();
-                    self.pending_promotion = None;
-                    self.selected_square = None;
-                    self.drag_state = None;
-                    set_local_game_outcome(&mut s, GameOutcome::Resignation(local_game.human_color.flip()));
-                }
-                if ui.add_sized([ui.available_width(), 34.0], danger_button("End Game")).clicked() {
-                    abort = true;
-                }
-            });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_sized([138.0, 34.0], secondary_button("Flip Board")).clicked() {
+                        self.flipped = !self.flipped;
+                    }
 
-            ui.add_space(6.0);
-            hydra_card_frame().show(ui, |ui| {
+                    let can_resign = local_game.outcome.is_none() && !searching;
+                    let resign_clicked = ui
+                        .add_enabled_ui(can_resign, |ui| {
+                            ui.add_sized([138.0, 34.0], danger_button("Resign"))
+                                .clicked()
+                        })
+                        .inner;
+                    if resign_clicked {
+                        let mut s = self.state.lock().unwrap();
+                        self.pending_promotion = None;
+                        self.selected_square = None;
+                        self.drag_state = None;
+                        set_local_game_outcome(
+                            &mut s,
+                            GameOutcome::Resignation(local_game.human_color.flip()),
+                        );
+                    }
+
+                    if ui.add_sized([138.0, 34.0], danger_button("End Game")).clicked() {
+                        abort = true;
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new("History").strong().color(hydra_accent()));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(
-                            history_cursor > 0,
-                            secondary_button("< Prev"),
-                        )
+                        .add_enabled(history_cursor > 0, secondary_button("< Prev"))
                         .clicked()
                     {
                         navigate_to = Some(history_cursor - 1);
                     }
                     if ui
-                        .add_enabled(
-                            history_cursor + 1 < history_len,
-                            secondary_button("Next >"),
-                        )
+                        .add_enabled(history_cursor + 1 < history_len, secondary_button("Next >"))
                         .clicked()
                     {
                         navigate_to = Some(history_cursor + 1);
@@ -3624,30 +3707,29 @@ impl FocalorsApp {
                             .color(hydra_subtle_text()),
                     );
                 }
-            });
 
-            ui.add_space(8.0);
-            hydra_subtle_frame().show(ui, |ui| {
-                if let Some(outcome) = local_game.outcome {
-                    let (headline, color) = local_outcome_banner(outcome, local_game.human_color);
-                    ui.label(
-                        egui::RichText::new(headline)
-                            .color(color)
-                            .strong()
-                            .size(18.0),
-                    );
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+                let (status_text, status_color) = if let Some(outcome) = local_game.outcome {
+                    local_outcome_banner(outcome, local_game.human_color)
                 } else if searching {
-                    ui.label("Focalors is thinking...");
+                    ("Focalors is thinking...".to_string(), hydra_warning())
                 } else if history_paused {
-                    ui.label("Reviewing the game history.");
+                    ("Reviewing the game history.".to_string(), hydra_subtle_text())
                 } else if side_to_move == local_game.human_color {
-                    ui.label("Your turn.");
+                    ("Your turn.".to_string(), hydra_text())
                 } else {
-                    ui.label("Focalors to move.");
-                }
+                    ("Focalors to move.".to_string(), hydra_subtle_text())
+                };
+                ui.label(
+                    egui::RichText::new(status_text)
+                        .color(status_color)
+                        .strong()
+                        .size(15.0),
+                );
             });
 
-            // Analysis: button + progress + review
             self.draw_analysis_button(ui);
             self.draw_analysis_progress(ui);
             self.draw_analysis_review(ui);
@@ -3671,19 +3753,15 @@ impl FocalorsApp {
                 (state.lichess_status.clone(), state.lichess_log.clone())
             };
 
-            ui.label(
-                egui::RichText::new("Lichess Game")
-                    .strong()
-                    .size(18.0)
-                    .color(hydra_accent()),
-            );
-            ui.label(
-                egui::RichText::new("Connection and challenge setup stay on the home screen.")
-                    .size(11.0)
-                    .color(hydra_subtle_text()),
-            );
-
             hydra_card_frame().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Lichess Session")
+                        .strong()
+                        .size(16.0)
+                        .color(hydra_accent()),
+                );
+                ui.add_space(10.0);
+
                 match &status {
                     LichessStatus::InGame(id) => {
                         hydra_badge(ui, &format!("Current game: {id}"), hydra_success());
@@ -3696,21 +3774,23 @@ impl FocalorsApp {
                     }
                 }
 
-                ui.add_space(8.0);
-                if ui.add_sized([ui.available_width(), 34.0], secondary_button("Flip Board")).clicked() {
-                    self.flipped = !self.flipped;
-                }
-                if ui.add_sized([ui.available_width(), 34.0], danger_button("Disconnect")).clicked() {
-                    let mut s = self.state.lock().unwrap();
-                    s.lichess_status = LichessStatus::Disconnected;
-                    s.lichess_log.push("Disconnected".to_string());
-                    s.status_message = "Disconnected from Lichess.".to_string();
-                }
-            });
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_sized([138.0, 34.0], secondary_button("Flip Board")).clicked() {
+                        self.flipped = !self.flipped;
+                    }
+                    if ui.add_sized([138.0, 34.0], danger_button("Disconnect")).clicked() {
+                        let mut s = self.state.lock().unwrap();
+                        s.lichess_status = LichessStatus::Disconnected;
+                        s.lichess_log.push("Disconnected".to_string());
+                        s.status_message = "Disconnected from Lichess.".to_string();
+                    }
+                });
 
-            if !logs.is_empty() {
-                ui.add_space(8.0);
-                hydra_card_frame().show(ui, |ui| {
+                if !logs.is_empty() {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(8.0);
                     ui.label(egui::RichText::new("Log").strong().color(hydra_accent()));
                     egui::ScrollArea::vertical()
                         .max_height(180.0)
@@ -3720,8 +3800,8 @@ impl FocalorsApp {
                                 ui.label(egui::RichText::new(log).size(10.0).monospace());
                             }
                         });
-                });
-            }
+                }
+            });
         });
     }
 
@@ -3733,11 +3813,7 @@ impl FocalorsApp {
             let s = self.state.lock().unwrap();
             let mut paused_local_game = s.local_game.clone();
             paused_local_game.time_control.clear_active();
-            (
-                state,
-                s.lichess_settings.token.clone(),
-                paused_local_game,
-            )
+            (state, s.lichess_settings.token.clone(), paused_local_game)
         };
 
         if token.is_empty() {
@@ -3763,7 +3839,6 @@ impl FocalorsApp {
             rt.block_on(async {
                 let client = reqwest::Client::new();
 
-                // Verify account
                 let resp = client
                     .get("https://lichess.org/api/account")
                     .bearer_auth(&token)
@@ -3780,8 +3855,7 @@ impl FocalorsApp {
                         let mut s = state.lock().unwrap();
                         s.lichess_username = username.to_lowercase();
                         s.lichess_status = LichessStatus::Connected(username.clone());
-                        s.lichess_log
-                            .push(format!("Connected as {username}"));
+                        s.lichess_log.push(format!("Connected as {username}"));
                     }
                     Ok(r) => {
                         let body = r.text().await.unwrap_or_default();
@@ -3802,12 +3876,10 @@ impl FocalorsApp {
                         }
                         s.local_game = resumed_game;
                         s.status_message = "Lichess connection failed. Local play resumed.".to_string();
-                        s.lichess_log
-                            .push(format!("Connection failed: {e}"));
+                        s.lichess_log.push(format!("Connection failed: {e}"));
                     }
                 }
 
-                // Start event stream for accepting games
                 lichess_event_loop(state.clone(), token.clone()).await;
             });
         });
@@ -3839,20 +3911,17 @@ impl FocalorsApp {
                         let body: serde_json::Value = r.json().await.unwrap_or_default();
                         let game_id = body["id"].as_str().unwrap_or("unknown");
                         let mut s = state.lock().unwrap();
-                        s.lichess_log
-                            .push(format!("Challenge sent! Game: {game_id}"));
+                        s.lichess_log.push(format!("Challenge sent! Game: {game_id}"));
                         s.lichess_status = LichessStatus::InGame(game_id.to_string());
                     }
                     Ok(r) => {
                         let body = r.text().await.unwrap_or_default();
                         let mut s = state.lock().unwrap();
-                        s.lichess_log
-                            .push(format!("Challenge failed: {body}"));
+                        s.lichess_log.push(format!("Challenge failed: {body}"));
                     }
                     Err(e) => {
                         let mut s = state.lock().unwrap();
-                        s.lichess_log
-                            .push(format!("Challenge error: {e}"));
+                        s.lichess_log.push(format!("Challenge error: {e}"));
                     }
                 }
             });
@@ -3860,114 +3929,132 @@ impl FocalorsApp {
     }
 }
 
+fn current_theme() -> UiTheme {
+    match ACTIVE_THEME.load(Ordering::Relaxed) {
+        1 => UiTheme::Light,
+        _ => UiTheme::Dark,
+    }
+}
+
+fn theme_rgb(dark: [u8; 3], light: [u8; 3]) -> egui::Color32 {
+    match current_theme() {
+        UiTheme::Dark => egui::Color32::from_rgb(dark[0], dark[1], dark[2]),
+        UiTheme::Light => egui::Color32::from_rgb(light[0], light[1], light[2]),
+    }
+}
+
+fn theme_rgba(dark: [u8; 4], light: [u8; 4]) -> egui::Color32 {
+    match current_theme() {
+        UiTheme::Dark => egui::Color32::from_rgba_premultiplied(dark[0], dark[1], dark[2], dark[3]),
+        UiTheme::Light => egui::Color32::from_rgba_premultiplied(light[0], light[1], light[2], light[3]),
+    }
+}
+
 fn hydra_accent() -> egui::Color32 {
-    egui::Color32::from_rgb(191, 157, 116)
+    theme_rgb([118, 147, 255], [69, 102, 214])
+}
+
+fn hydra_accent_soft() -> egui::Color32 {
+    theme_rgba([118, 147, 255, 34], [69, 102, 214, 24])
 }
 
 fn hydra_text() -> egui::Color32 {
-    egui::Color32::from_rgb(236, 233, 225)
+    theme_rgb([232, 236, 242], [34, 39, 46])
+}
+
+fn hydra_text_on_accent() -> egui::Color32 {
+    theme_rgb([246, 248, 252], [247, 249, 255])
 }
 
 fn hydra_subtle_text() -> egui::Color32 {
-    egui::Color32::from_rgb(173, 175, 181)
+    theme_rgb([151, 160, 173], [82, 92, 108])
 }
 
 fn hydra_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(16, 18, 22)
+    theme_rgb([20, 24, 31], [237, 240, 244])
 }
 
 fn hydra_panel_fill() -> egui::Color32 {
-    egui::Color32::from_rgb(27, 29, 34)
+    theme_rgb([30, 35, 43], [249, 250, 252])
 }
 
 fn hydra_panel_alt_fill() -> egui::Color32 {
-    egui::Color32::from_rgb(35, 37, 43)
+    theme_rgb([38, 44, 53], [242, 245, 248])
 }
 
 fn hydra_panel_raised_fill() -> egui::Color32 {
-    egui::Color32::from_rgb(46, 49, 56)
+    theme_rgb([47, 55, 65], [233, 237, 242])
 }
 
 fn hydra_border() -> egui::Color32 {
-    egui::Color32::from_rgb(78, 82, 91)
+    theme_rgb([66, 76, 89], [208, 215, 224])
 }
 
 fn hydra_success() -> egui::Color32 {
-    egui::Color32::from_rgb(138, 149, 172)
+    theme_rgb([111, 191, 143], [51, 126, 87])
 }
 
 fn hydra_warning() -> egui::Color32 {
-    egui::Color32::from_rgb(191, 157, 116)
+    theme_rgb([203, 159, 92], [170, 121, 51])
 }
 
 fn hydra_danger() -> egui::Color32 {
-    egui::Color32::from_rgb(171, 98, 96)
+    theme_rgb([199, 109, 102], [181, 84, 72])
 }
 
 fn hydra_card_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(hydra_panel_fill())
         .stroke(egui::Stroke::new(1.0, hydra_border()))
-        .corner_radius(18)
-        .inner_margin(egui::Margin::same(14))
+        .corner_radius(3)
+        .inner_margin(egui::Margin::same(18))
         .shadow(egui::epaint::Shadow {
-            offset: [0, 5],
-            blur: 18,
+            offset: [0, 0],
+            blur: 0,
             spread: 0,
-            color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 42),
+            color: egui::Color32::TRANSPARENT,
         })
-}
-
-fn hydra_subtle_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(hydra_panel_alt_fill())
-        .stroke(egui::Stroke::new(1.0, hydra_border()))
-        .corner_radius(14)
-        .inner_margin(egui::Margin::same(10))
 }
 
 fn hydra_callout_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(hydra_panel_alt_fill())
+        .fill(hydra_accent_soft())
         .stroke(egui::Stroke::new(1.0, hydra_accent()))
-        .corner_radius(14)
+        .corner_radius(2)
         .inner_margin(egui::Margin::same(10))
 }
 
 fn hydra_badge(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0, hydra_border()))
-        .corner_radius(255)
-        .inner_margin(egui::Margin::symmetric(9, 4))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .size(10.0)
-                    .color(hydra_text()),
-            );
-        });
+    let text_color = if fill == hydra_panel_alt_fill() || fill == hydra_panel_raised_fill() {
+        hydra_subtle_text()
+    } else {
+        fill
+    };
+    ui.label(
+        egui::RichText::new(label)
+            .size(10.0)
+            .strong()
+            .color(text_color),
+    );
 }
 
-fn selectable_chip(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new(label)
-                .size(12.0)
-                .strong()
-                .color(if selected { hydra_text() } else { hydra_subtle_text() }),
-        )
-        .fill(if selected {
-            hydra_panel_raised_fill()
-        } else {
-            hydra_panel_alt_fill()
-        })
-        .stroke(egui::Stroke::new(
-            1.0,
-            if selected { hydra_accent() } else { hydra_border() },
-        ))
-        .corner_radius(14),
+fn home_nav_button<'a>(selected: bool, label: &'a str) -> egui::Button<'a> {
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(12.0)
+            .strong()
+            .color(if selected { hydra_text() } else { hydra_subtle_text() }),
     )
+    .fill(if selected {
+        hydra_accent_soft()
+    } else {
+        egui::Color32::TRANSPARENT
+    })
+    .stroke(egui::Stroke::new(
+        if selected { 1.0 } else { 0.0 },
+        if selected { hydra_accent() } else { egui::Color32::TRANSPARENT },
+    ))
+    .corner_radius(0)
 }
 
 fn primary_button(label: &str) -> egui::Button<'_> {
@@ -3975,11 +4062,11 @@ fn primary_button(label: &str) -> egui::Button<'_> {
         egui::RichText::new(label)
             .size(13.0)
             .strong()
-            .color(hydra_text()),
+            .color(hydra_text_on_accent()),
     )
-    .fill(egui::Color32::from_rgb(115, 88, 48))
+    .fill(hydra_accent())
     .stroke(egui::Stroke::new(1.0, hydra_accent()))
-    .corner_radius(14)
+    .corner_radius(2)
 }
 
 fn secondary_button(label: &str) -> egui::Button<'_> {
@@ -3989,9 +4076,9 @@ fn secondary_button(label: &str) -> egui::Button<'_> {
             .strong()
             .color(hydra_text()),
     )
-    .fill(hydra_panel_alt_fill())
+    .fill(egui::Color32::TRANSPARENT)
     .stroke(egui::Stroke::new(1.0, hydra_border()))
-    .corner_radius(14)
+    .corner_radius(2)
 }
 
 fn danger_button(label: &str) -> egui::Button<'_> {
@@ -3999,11 +4086,23 @@ fn danger_button(label: &str) -> egui::Button<'_> {
         egui::RichText::new(label)
             .size(12.0)
             .strong()
+            .color(hydra_danger()),
+    )
+    .fill(egui::Color32::TRANSPARENT)
+    .stroke(egui::Stroke::new(1.0, hydra_danger()))
+    .corner_radius(2)
+}
+
+fn theme_toggle_button(label: &str) -> egui::Button<'_> {
+    egui::Button::new(
+        egui::RichText::new(label)
+            .size(12.0)
+            .strong()
             .color(hydra_text()),
     )
-    .fill(egui::Color32::from_rgb(88, 40, 38))
-    .stroke(egui::Stroke::new(1.0, hydra_danger()))
-    .corner_radius(14)
+    .fill(egui::Color32::TRANSPARENT)
+    .stroke(egui::Stroke::new(1.0, hydra_border()))
+    .corner_radius(2)
 }
 
 fn draw_engine_settings_controls(
@@ -4012,59 +4111,55 @@ fn draw_engine_settings_controls(
     searching: bool,
 ) {
     ui.add_enabled_ui(!searching, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            if selectable_chip(ui, settings.use_time_limit, "Time limit").clicked() {
-                settings.use_time_limit = true;
-            }
-            if selectable_chip(ui, !settings.use_time_limit, "Fixed depth").clicked() {
-                settings.use_time_limit = false;
-            }
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut settings.use_time_limit, true, "Time limit");
+            ui.radio_value(&mut settings.use_time_limit, false, "Fixed depth");
         });
 
         ui.add_space(8.0);
-        hydra_subtle_frame().show(ui, |ui| {
-            if settings.use_time_limit {
-                ui.label(
-                    egui::RichText::new("Think time per move")
-                        .size(11.0)
-                        .color(hydra_subtle_text()),
-                );
-                let secs = settings.think_time_ms as f32 / 1000.0;
-                let mut secs_val = secs;
-                ui.add(egui::Slider::new(&mut secs_val, 0.5..=30.0).suffix(" s"));
-                settings.think_time_ms = (secs_val * 1000.0) as u64;
-            } else {
-                ui.label(
-                    egui::RichText::new("Search depth ceiling")
-                        .size(11.0)
-                        .color(hydra_subtle_text()),
-                );
-                let mut depth = settings.max_depth as i32;
-                ui.add(egui::Slider::new(&mut depth, 1..=30));
-                settings.max_depth = depth as u32;
-            }
-
-            ui.add_space(8.0);
+        if settings.use_time_limit {
             ui.label(
-                egui::RichText::new("Transposition table")
+                egui::RichText::new("Think time per move")
                     .size(11.0)
                     .color(hydra_subtle_text()),
             );
-            let mut mb = settings.tt_size_mb as i32;
-            ui.add(egui::Slider::new(&mut mb, 1..=256).suffix(" MB"));
-            settings.tt_size_mb = mb as usize;
-        });
+            let secs = settings.think_time_ms as f32 / 1000.0;
+            let mut secs_val = secs;
+            ui.add(egui::Slider::new(&mut secs_val, 0.5..=30.0).suffix(" s"));
+            settings.think_time_ms = (secs_val * 1000.0) as u64;
+        } else {
+            ui.label(
+                egui::RichText::new("Search depth ceiling")
+                    .size(11.0)
+                    .color(hydra_subtle_text()),
+            );
+            let mut depth = settings.max_depth as i32;
+            ui.add(egui::Slider::new(&mut depth, 1..=30));
+            settings.max_depth = depth as u32;
+        }
+
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Transposition table")
+                .size(11.0)
+                .color(hydra_subtle_text()),
+        );
+        let mut mb = settings.tt_size_mb as i32;
+        ui.add(egui::Slider::new(&mut mb, 1..=256).suffix(" MB"));
+        settings.tt_size_mb = mb as usize;
     });
 }
 
 fn metric_tile(ui: &mut egui::Ui, label: &str, value: &str, tone: egui::Color32) {
-    hydra_subtle_frame().show(ui, |ui| {
+    ui.vertical(|ui| {
+        ui.set_min_width(96.0);
         ui.label(
             egui::RichText::new(label)
                 .size(10.0)
                 .strong()
                 .color(hydra_subtle_text()),
         );
+        ui.add_space(2.0);
         ui.label(
             egui::RichText::new(value)
                 .size(16.0)
@@ -4074,8 +4169,13 @@ fn metric_tile(ui: &mut egui::Ui, label: &str, value: &str, tone: egui::Color32)
     });
 }
 
-fn configure_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
+fn configure_theme(ctx: &egui::Context, theme: UiTheme) {
+    ACTIVE_THEME.store(theme.index(), Ordering::Relaxed);
+
+    let mut visuals = match theme {
+        UiTheme::Dark => egui::Visuals::dark(),
+        UiTheme::Light => egui::Visuals::light(),
+    };
     visuals.override_text_color = Some(hydra_text());
     visuals.panel_fill = hydra_bg();
     visuals.window_fill = hydra_panel_fill();
@@ -4083,67 +4183,67 @@ fn configure_theme(ctx: &egui::Context) {
     visuals.extreme_bg_color = hydra_bg();
     visuals.code_bg_color = hydra_panel_alt_fill();
     visuals.hyperlink_color = hydra_accent();
-    visuals.selection.bg_fill = egui::Color32::from_rgb(119, 87, 48);
-    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(247, 226, 182));
+    visuals.selection.bg_fill = hydra_accent();
+    visuals.selection.stroke = egui::Stroke::new(1.0, hydra_text_on_accent());
     visuals.window_stroke = egui::Stroke::new(1.0, hydra_border());
-    visuals.window_corner_radius = egui::CornerRadius::same(22);
-    visuals.menu_corner_radius = egui::CornerRadius::same(18);
+    visuals.window_corner_radius = egui::CornerRadius::same(4);
+    visuals.menu_corner_radius = egui::CornerRadius::same(2);
     visuals.window_shadow = egui::epaint::Shadow {
-        offset: [0, 12],
-        blur: 20,
+        offset: [0, 0],
+        blur: 0,
         spread: 0,
-        color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 56),
+        color: egui::Color32::TRANSPARENT,
     };
     visuals.popup_shadow = egui::epaint::Shadow {
-        offset: [0, 10],
-        blur: 18,
+        offset: [0, 0],
+        blur: 0,
         spread: 0,
-        color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 50),
+        color: egui::Color32::TRANSPARENT,
     };
     visuals.widgets.noninteractive.bg_fill = hydra_panel_fill();
     visuals.widgets.noninteractive.weak_bg_fill = hydra_panel_fill();
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, hydra_border());
-    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(16);
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(2);
     visuals.widgets.inactive.bg_fill = hydra_panel_alt_fill();
     visuals.widgets.inactive.weak_bg_fill = hydra_panel_alt_fill();
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, hydra_border());
-    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(14);
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
     visuals.widgets.hovered.bg_fill = hydra_panel_raised_fill();
     visuals.widgets.hovered.weak_bg_fill = hydra_panel_raised_fill();
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, hydra_accent());
-    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(14);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(102, 83, 62);
-    visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(102, 83, 62);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.active.bg_fill = hydra_panel_raised_fill();
+    visuals.widgets.active.weak_bg_fill = hydra_panel_raised_fill();
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, hydra_accent());
-    visuals.widgets.active.corner_radius = egui::CornerRadius::same(14);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(2);
     visuals.widgets.open.bg_fill = hydra_panel_raised_fill();
     visuals.widgets.open.weak_bg_fill = hydra_panel_raised_fill();
     visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, hydra_accent());
-    visuals.widgets.open.corner_radius = egui::CornerRadius::same(16);
+    visuals.widgets.open.corner_radius = egui::CornerRadius::same(2);
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.global_style()).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);
-    style.spacing.interact_size = egui::vec2(44.0, 32.0);
+    style.spacing.interact_size = egui::vec2(42.0, 30.0);
     style.spacing.menu_margin = egui::Margin::same(12);
     style.spacing.window_margin = egui::Margin::same(16);
     style.visuals.clip_rect_margin = 6.0;
     style.text_styles.insert(
         egui::TextStyle::Heading,
-        egui::FontId::proportional(28.0),
+        egui::FontId::proportional(26.0),
     );
     style.text_styles.insert(
         egui::TextStyle::Body,
-        egui::FontId::proportional(15.0),
+        egui::FontId::proportional(14.5),
     );
     style.text_styles.insert(
         egui::TextStyle::Button,
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(13.5),
     );
     style.text_styles.insert(
         egui::TextStyle::Small,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(11.5),
     );
     ctx.set_global_style(style);
 }
@@ -4224,14 +4324,6 @@ fn color_name(color: Color) -> &'static str {
     match color {
         Color::White => "White",
         Color::Black => "Black",
-    }
-}
-
-fn side_choice_name(choice: SideChoice) -> &'static str {
-    match choice {
-        SideChoice::White => "White",
-        SideChoice::Black => "Black",
-        SideChoice::Random => "Random",
     }
 }
 
