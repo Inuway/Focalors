@@ -21,11 +21,11 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
-          - macos-13
+          - macos-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -49,10 +49,10 @@ jobs:
             artifact_name: focalors-linux-x86_64
             binary_path: target/release/focalors
             archive_name: focalors-linux-x86_64.tar.gz
-          - os: macos-13
-            artifact_name: focalors-macos-x86_64
+          - os: macos-latest
+            artifact_name: focalors-macos-aarch64
             binary_path: target/release/focalors
-            archive_name: focalors-macos-x86_64.tar.gz
+            archive_name: focalors-macos-aarch64.tar.gz
           - os: windows-latest
             artifact_name: focalors-windows-x86_64
             binary_path: target/release/focalors.exe
@@ -60,7 +60,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -68,9 +68,13 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build portable release binary (Unix)
-        if: runner.os != 'Windows'
+      - name: Build portable release binary (Linux)
+        if: runner.os == 'Linux'
         run: cargo rustc --release --locked --bin focalors -- -C target-cpu=x86-64
+
+      - name: Build portable release binary (macOS)
+        if: runner.os == 'macOS'
+        run: cargo rustc --release --locked --bin focalors
 
       - name: Build portable release binary (Windows)
         if: runner.os == 'Windows'
