@@ -559,6 +559,9 @@ pub struct FocalorsApp {
     pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
     pgn_import_error: Option<String>,
     pgn_import_user_color: Color,
+    /// When true, the GUI exposes developer-only surfaces (currently the
+    /// Lichess bot page). Set via the `FOCALORS_DEBUG=1` env var at startup.
+    show_dev_features: bool,
 }
 
 /// Replay the saved PGN once, building parallel `boards`/`moves` vectors so the
@@ -747,6 +750,7 @@ impl FocalorsApp {
             pgn_import_parsed: None,
             pgn_import_error: None,
             pgn_import_user_color: Color::White,
+            show_dev_features: std::env::var("FOCALORS_DEBUG").is_ok(),
         }
     }
 
@@ -2783,7 +2787,9 @@ impl FocalorsApp {
                 self.home_page = HomePage::Overview;
             }
 
-            if ui.add(home_nav_button(self.home_page == HomePage::Lichess, "Lichess")).clicked() {
+            if self.show_dev_features
+                && ui.add(home_nav_button(self.home_page == HomePage::Lichess, "Lichess")).clicked()
+            {
                 self.home_page = HomePage::Lichess;
             }
 
