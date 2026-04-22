@@ -81,9 +81,19 @@ pub fn uci_loop() {
             "go" => {
                 searcher.set_position_history(position_hashes.clone());
                 let result = execute_go(&mut searcher, &board, &tokens);
+                let pv_str = if result.pv.is_empty() {
+                    result.best_move.to_string()
+                } else {
+                    result
+                        .pv
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
                 println!(
-                    "info depth {} score cp {} nodes {}",
-                    result.depth, result.score, result.nodes
+                    "info depth {} score cp {} nodes {} pv {}",
+                    result.depth, result.score, result.nodes, pv_str
                 );
                 println!("bestmove {}", result.best_move);
             }

@@ -425,6 +425,23 @@ struct LocalSearchRequest {
 #[derive(Clone)]
 struct ReplayState {
     game: crate::db::SavedGame,
+    /// Parsed UCI move list, lazily populated on first open.
+    uci_moves: Vec<String>,
+    /// Cached positions: `boards[i]` is the position before ply `i`.
+    /// `boards[0]` is the start position; `boards[uci_moves.len()]` is the final position.
+    boards: Vec<Board>,
+    /// Move objects parallel to `uci_moves`, used for last-move highlighting.
+    moves: Vec<Move>,
+    /// Currently displayed ply index, in `0..=uci_moves.len()`.
+    cursor: usize,
+}
+
+/// Read-only view of a board position, used by `draw_board` when rendering
+/// something other than the live game (e.g. replay).
+struct BoardView<'a> {
+    board: &'a Board,
+    last_move: Option<Move>,
+    interactive: bool,
 }
 
 /// Puzzle trainer state — active when the user is solving puzzles.
@@ -517,6 +534,9 @@ pub struct FocalorsApp {
     replay_game: Option<ReplayState>,
     analysis_state: Arc<Mutex<AnalysisState>>,
     analysis_review_cursor: usize, // which move is selected in review
+    /// If set, completed analysis should be persisted against this game id
+    /// instead of the most-recent-game fallback.
+    analysis_target_game_id: Option<i64>,
     selected_square: Option<u8>,
     drag_state: Option<DragState>,
     flipped: bool,
@@ -539,6 +559,38 @@ pub struct FocalorsApp {
     pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
     pgn_import_error: Option<String>,
     pgn_import_user_color: Color,
+}
+
+/// Replay the saved PGN once, building parallel `boards`/`moves` vectors so the
+/// review UI can step through positions without re-parsing on every frame.
+/// Falls back to a start-position-only state if the PGN is unparseable.
+fn build_replay_state(game: crate::db::SavedGame) -> ReplayState {
+    let parsed = crate::pgn::parse_pgn(&game.pgn).ok();
+    let mut board = Board::startpos();
+    let mut boards = vec![board.clone()];
+    let mut moves = Vec::new();
+    let mut uci_moves = Vec::new();
+
+    if let Some(p) = parsed {
+        for uci in p.uci_moves {
+            let mv = match crate::uci::parse_move(&board, &uci) {
+                Some(m) => m,
+                None => break,
+            };
+            make_move(&mut board, mv);
+            uci_moves.push(uci);
+            moves.push(mv);
+            boards.push(board.clone());
+        }
+    }
+
+    ReplayState {
+        game,
+        uci_moves,
+        boards,
+        moves,
+        cursor: 0,
+    }
 }
 
 fn load_piece_texture(
@@ -672,6 +724,7 @@ impl FocalorsApp {
             replay_game: None,
             analysis_state: Arc::new(Mutex::new(AnalysisState::Idle)),
             analysis_review_cursor: 0,
+            analysis_target_game_id: None,
             selected_square: None,
             drag_state: None,
             flipped: false,
@@ -1797,55 +1850,383 @@ impl FocalorsApp {
             Some(g) => g,
             None => return,
         };
-        self.replay_game = Some(ReplayState { game });
+        let replay = build_replay_state(game);
+        self.replay_game = Some(replay);
     }
 
     fn draw_replay_panel(&mut self, ui: &mut egui::Ui) {
-        let replay = match &self.replay_game {
-            Some(r) => r.clone(),
-            None => return,
+        self.persist_completed_analysis();
+        let (cursor, num_plies, board, last_move, game_id, header_text, user_color, uci_moves) = {
+            let r = match &self.replay_game {
+                Some(r) => r,
+                None => return,
+            };
+            let total_plies = r.moves.len();
+            let cursor = r.cursor.min(total_plies);
+            let board = r.boards[cursor].clone();
+            let last_move = if cursor > 0 {
+                r.moves.get(cursor - 1).copied()
+            } else {
+                None
+            };
+            let header = format!(
+                "{} — {} ({})",
+                r.game.result,
+                r.game.result_reason.as_deref().unwrap_or(""),
+                r.game.played_at.get(..10).unwrap_or(""),
+            );
+            let user_color = if r.game.user_color == "white" {
+                Color::White
+            } else {
+                Color::Black
+            };
+            (
+                cursor,
+                total_plies,
+                board,
+                last_move,
+                r.game.id,
+                header,
+                user_color,
+                r.uci_moves.clone(),
+            )
         };
+
+        // Keyboard navigation: ← / → / Home / End
+        let (key_left, key_right, key_home, key_end) = ui.ctx().input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Home),
+                i.key_pressed(egui::Key::End),
+            )
+        });
+
+        let mut new_cursor = cursor;
+        if key_left && new_cursor > 0 {
+            new_cursor -= 1;
+        }
+        if key_right && new_cursor < num_plies {
+            new_cursor += 1;
+        }
+        if key_home {
+            new_cursor = 0;
+        }
+        if key_end {
+            new_cursor = num_plies;
+        }
+
+        // Snapshot of any analysis result that belongs to this game.
+        let analysis_for_this_game: Option<crate::analysis::GameAnalysis> = {
+            let a = self.analysis_state.lock().unwrap();
+            match &*a {
+                AnalysisState::Complete { analysis, .. }
+                    if self.analysis_target_game_id == Some(game_id) =>
+                {
+                    Some(analysis.clone())
+                }
+                _ => None,
+            }
+        };
+
+        let mut want_close = false;
+        let mut want_analyze = false;
 
         hydra_card_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Game Replay")
-                        .size(14.0)
+                    egui::RichText::new("Game Review")
+                        .size(15.0)
                         .strong(),
                 );
-                let result_text = format!(
-                    "{} — {} ({})",
-                    replay.game.result,
-                    replay.game.result_reason.as_deref().unwrap_or(""),
-                    replay.game.played_at.get(..10).unwrap_or(""),
-                );
                 ui.label(
-                    egui::RichText::new(result_text)
+                    egui::RichText::new(header_text)
                         .size(11.0)
                         .color(hydra_subtle_text()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Close").clicked() {
-                        self.replay_game = None;
-                        return;
+                        want_close = true;
                     }
                 });
             });
 
-            ui.add_space(4.0);
+            if num_plies == 0 {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Could not parse this game's PGN — nothing to replay.")
+                        .color(hydra_warning()),
+                );
+                return;
+            }
 
-            // Show PGN text
-            ui.label(egui::RichText::new("PGN:").size(11.0).strong());
-            egui::ScrollArea::vertical()
-                .max_height(120.0)
-                .show(ui, |ui| {
+            ui.add_space(6.0);
+
+            ui.horizontal_top(|ui| {
+                // ── Board (read-only) ────────────────────────────
+                ui.vertical(|ui| {
+                    ui.set_max_width(420.0);
+                    let view = BoardView {
+                        board: &board,
+                        last_move,
+                        interactive: false,
+                    };
+                    self.draw_board(ui, Some(&view));
+                });
+
+                ui.add_space(8.0);
+
+                // ── Move list + (optional) analysis ──────────────
+                ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new(&replay.game.pgn)
+                        egui::RichText::new(format!("Move {} / {}", cursor, num_plies))
+                            .size(12.0)
+                            .color(hydra_subtle_text()),
+                    );
+                    ui.add_space(4.0);
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("replay_move_list")
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for ply in 0..num_plies {
+                                    let move_no = ply / 2 + 1;
+                                    let is_white = ply % 2 == 0;
+                                    let san_or_uci = analysis_for_this_game
+                                        .as_ref()
+                                        .and_then(|ga| ga.moves.get(ply))
+                                        .map(|m| m.move_san.clone())
+                                        .unwrap_or_else(|| {
+                                            uci_moves.get(ply).cloned().unwrap_or_default()
+                                        });
+
+                                    if is_white {
+                                        ui.label(
+                                            egui::RichText::new(format!("{move_no}."))
+                                                .size(11.0)
+                                                .color(hydra_subtle_text())
+                                                .monospace(),
+                                        );
+                                    }
+
+                                    let class_color = analysis_for_this_game
+                                        .as_ref()
+                                        .and_then(|ga| ga.moves.get(ply))
+                                        .map(|m| classification_color(m.classification))
+                                        .unwrap_or_else(hydra_text);
+                                    let symbol = analysis_for_this_game
+                                        .as_ref()
+                                        .and_then(|ga| ga.moves.get(ply))
+                                        .map(|m| m.classification.symbol())
+                                        .unwrap_or("");
+
+                                    let label = format!("{san_or_uci}{symbol}");
+                                    let selected = new_cursor == ply + 1;
+                                    let resp = ui.selectable_label(
+                                        selected,
+                                        egui::RichText::new(label)
+                                            .size(12.0)
+                                            .color(class_color)
+                                            .monospace(),
+                                    );
+                                    if resp.clicked() {
+                                        new_cursor = ply + 1;
+                                    }
+                                }
+                            });
+                        });
+
+                    // Inline detail for the move that landed us at this cursor
+                    if new_cursor > 0
+                        && let Some(ga) = analysis_for_this_game.as_ref()
+                        && let Some(ma) = ga.moves.get(new_cursor - 1)
+                    {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} — CPL {} | Eval {:.2} → {:.2} | Best: {} ({:.2})",
+                                ma.classification.label(),
+                                ma.cpl,
+                                ma.eval_before as f64 / 100.0,
+                                ma.eval_after as f64 / 100.0,
+                                ma.best_move_uci,
+                                ma.best_eval as f64 / 100.0,
+                            ))
                             .size(11.0)
-                            .monospace(),
+                            .color(classification_color(ma.classification)),
+                        );
+                        if let Some(ref explanation) = ma.explanation {
+                            ui.label(
+                                egui::RichText::new(explanation)
+                                    .size(11.0)
+                                    .color(hydra_subtle_text()),
+                            );
+                        }
+                    }
+                });
+            });
+
+            // ── Navigation ───────────────────────────────────────
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("|◀ Start").clicked() {
+                    new_cursor = 0;
+                }
+                if ui.button("◀ Prev").clicked() && new_cursor > 0 {
+                    new_cursor -= 1;
+                }
+                if ui.button("Next ▶").clicked() && new_cursor < num_plies {
+                    new_cursor += 1;
+                }
+                if ui.button("End ▶|").clicked() {
+                    new_cursor = num_plies;
+                }
+                ui.label(
+                    egui::RichText::new("← / → / Home / End")
+                        .size(10.0)
+                        .color(hydra_subtle_text()),
+                );
+            });
+
+            // ── Analysis: graph + button / progress ──────────────
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            if let Some(ga) = analysis_for_this_game.as_ref() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Accuracy: {:.1}%",
+                            ga.user_accuracy
+                        ))
+                        .size(13.0)
+                        .strong()
+                        .color(accuracy_color(ga.user_accuracy)),
+                    );
+                    ui.separator();
+                    let mut counts = [0u32; 5];
+                    for m in &ga.moves {
+                        if m.side != user_color {
+                            continue;
+                        }
+                        match m.classification {
+                            crate::analysis::MoveClass::Best => counts[0] += 1,
+                            crate::analysis::MoveClass::Good => counts[1] += 1,
+                            crate::analysis::MoveClass::Inaccuracy => counts[2] += 1,
+                            crate::analysis::MoveClass::Mistake => counts[3] += 1,
+                            crate::analysis::MoveClass::Blunder => counts[4] += 1,
+                            _ => {}
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Best:{} Good:{} Inacc:{} Mistake:{} Blunder:{}",
+                            counts[0], counts[1], counts[2], counts[3], counts[4],
+                        ))
+                        .size(11.0)
+                        .color(hydra_subtle_text()),
                     );
                 });
+
+                ui.add_space(4.0);
+                let points: Vec<[f64; 2]> = ga
+                    .eval_history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &e)| [i as f64, (e as f64 / 100.0).clamp(-5.0, 5.0)])
+                    .collect();
+                let line = egui_plot::Line::new("eval", egui_plot::PlotPoints::new(points))
+                    .color(hydra_accent());
+                let zero =
+                    egui_plot::HLine::new("zero", 0.0).color(egui::Color32::from_gray(80));
+                egui_plot::Plot::new(format!("replay_eval_graph_{game_id}"))
+                    .height(120.0)
+                    .include_y(-3.0)
+                    .include_y(3.0)
+                    .allow_drag(false)
+                    .allow_zoom(false)
+                    .allow_scroll(false)
+                    .show_axes(true)
+                    .y_axis_label("Eval")
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(line);
+                        plot_ui.hline(zero);
+                        if new_cursor > 0 {
+                            let vline = egui_plot::VLine::new("cursor", new_cursor as f64)
+                                .color(egui::Color32::from_rgb(255, 200, 50));
+                            plot_ui.vline(vline);
+                        }
+                    });
+            } else {
+                let analysis_running = matches!(
+                    *self.analysis_state.lock().unwrap(),
+                    AnalysisState::Running { .. }
+                );
+                if analysis_running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Analyzing this game…")
+                                .size(12.0)
+                                .color(hydra_subtle_text()),
+                        );
+                    });
+                    let a = self.analysis_state.lock().unwrap();
+                    if let AnalysisState::Running { progress, total } = *a
+                        && total > 0
+                    {
+                        ui.add(
+                            egui::ProgressBar::new(progress as f32 / total as f32)
+                                .show_percentage(),
+                        );
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(
+                                egui::RichText::new("Analyze this game").size(13.0).strong(),
+                            )
+                            .clicked()
+                        {
+                            want_analyze = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "Runs the engine over every move to grade them and show explanations.",
+                            )
+                            .size(10.5)
+                            .color(hydra_subtle_text()),
+                        );
+                    });
+                }
+            }
         });
+
+        // Apply state changes after the closure releases the borrows.
+        if want_close {
+            self.replay_game = None;
+            return;
+        }
+        if let Some(r) = self.replay_game.as_mut() {
+            r.cursor = new_cursor.min(num_plies);
+        }
+        if want_analyze && !uci_moves.is_empty() {
+            self.start_analysis_for_replay(game_id, uci_moves, user_color);
+        }
+    }
+
+    fn start_analysis_for_replay(
+        &mut self,
+        game_id: i64,
+        uci_moves: Vec<String>,
+        user_color: Color,
+    ) {
+        self.analysis_target_game_id = Some(game_id);
+        self.start_analysis(uci_moves, user_color);
     }
 
     // ── Save game to database ──────────────────────────────────────────
@@ -2056,7 +2437,8 @@ impl FocalorsApp {
         let state = self.state.lock().unwrap();
         let analysis = self.analysis_state.lock().unwrap();
 
-        // Show "Analyze Game" button when game is over and not already analyzing
+        // Show "Review this game" + "Analyze Game" buttons when the game is
+        // over and not already analyzing.
         if state.local_game.active
             && state.local_game.outcome.is_some()
             && matches!(*analysis, AnalysisState::Idle)
@@ -2070,13 +2452,46 @@ impl FocalorsApp {
             drop(state);
             drop(analysis);
 
-            if !uci_moves.is_empty() && ui.button("Analyze Game").clicked() {
-                self.start_analysis(uci_moves, user_color);
+            if uci_moves.is_empty() {
+                return;
             }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(
+                        egui::RichText::new("Review this game")
+                            .size(13.0)
+                            .strong(),
+                    )
+                    .clicked()
+                {
+                    self.open_review_for_most_recent_game();
+                }
+                if ui.button("Analyze Game").clicked() {
+                    self.start_analysis(uci_moves, user_color);
+                }
+            });
             return;
         }
         drop(state);
         drop(analysis);
+    }
+
+    /// Look up the most recently saved game and open it in the replay panel.
+    /// Used by the "Review this game" button shown right after a live game
+    /// finishes (the just-saved game is the most recent one).
+    fn open_review_for_most_recent_game(&mut self) {
+        let game_id = self
+            .db
+            .as_ref()
+            .and_then(|db| db.get_recent_games(1).ok())
+            .and_then(|g| g.into_iter().next())
+            .map(|g| g.id);
+        if let Some(id) = game_id {
+            self.start_replay(id);
+            self.home_page = HomePage::History;
+        }
     }
 
     fn draw_analysis_progress(&self, ui: &mut egui::Ui) {
@@ -2099,48 +2514,66 @@ impl FocalorsApp {
         }
     }
 
-    fn draw_analysis_review(&mut self, ui: &mut egui::Ui) {
-        // Save analysis data to DB (one-shot on first render of Complete state)
-        {
+    /// One-shot persistence of completed analysis. Persists puzzles + move
+    /// analysis against the chosen game id (preferring `analysis_target_game_id`
+    /// when set, falling back to the most recent saved game). Clears `puzzles`
+    /// and `uci_moves` on the `Complete` state to mark "already saved".
+    fn persist_completed_analysis(&mut self) {
+        let target = self.analysis_target_game_id;
+        let acc_opt: Option<f64> = {
             let analysis = self.analysis_state.lock().unwrap();
             if let AnalysisState::Complete { puzzles, analysis: ga, uci_moves } = &*analysis {
                 if let Some(ref db) = self.db {
-                    // Save puzzles
                     if !puzzles.is_empty() {
                         for p in puzzles {
-                            let _ = db.save_puzzle(p.game_id, &p.fen, &p.solution_uci, p.theme.to_db_str(), p.rating);
+                            let _ = db.save_puzzle(
+                                p.game_id,
+                                &p.fen,
+                                &p.solution_uci,
+                                p.theme.to_db_str(),
+                                p.rating,
+                            );
                         }
                     }
-                    // Persist move analysis and accuracy to DB
                     if !uci_moves.is_empty() {
-                        if let Some(recent) = db.get_recent_games(1).ok().and_then(|g| g.into_iter().next()) {
-                            let _ = db.save_move_analysis(recent.id, uci_moves, &ga.moves);
-                            let _ = db.update_game_accuracy(recent.id, ga.user_accuracy);
-                            // Track session best accuracy
-                            let acc = ga.user_accuracy;
-                            if self.session_best_accuracy.map_or(true, |best| acc > best) {
-                                self.session_best_accuracy = Some(acc);
-                            }
+                        let game_id = target.or_else(|| {
+                            db.get_recent_games(1)
+                                .ok()
+                                .and_then(|g| g.into_iter().next())
+                                .map(|g| g.id)
+                        });
+                        if let Some(gid) = game_id {
+                            let _ = db.save_move_analysis(gid, uci_moves, &ga.moves);
+                            let _ = db.update_game_accuracy(gid, ga.user_accuracy);
                         }
                     }
                 }
+                Some(ga.user_accuracy)
+            } else {
+                None
+            }
+        };
+        if let Some(acc) = acc_opt {
+            if self.session_best_accuracy.map_or(true, |best| acc > best) {
+                self.session_best_accuracy = Some(acc);
             }
         }
-        // Clear puzzles and uci_moves after saving (avoid re-saving on next frame)
-        {
-            let mut analysis = self.analysis_state.lock().unwrap();
-            if let AnalysisState::Complete { puzzles, uci_moves, .. } = &mut *analysis {
-                puzzles.clear();
-                uci_moves.clear();
-            }
+        // Clear puzzles + uci_moves to mark "saved" so we don't re-save next frame.
+        let mut analysis = self.analysis_state.lock().unwrap();
+        if let AnalysisState::Complete { puzzles, uci_moves, .. } = &mut *analysis {
+            puzzles.clear();
+            uci_moves.clear();
         }
+    }
+
+    fn draw_analysis_review(&mut self, ui: &mut egui::Ui) {
+        self.persist_completed_analysis();
 
         let analysis = self.analysis_state.lock().unwrap().clone();
-        let (ga, puzzle_count) = match &analysis {
-            AnalysisState::Complete { analysis, puzzles, .. } => (analysis, puzzles.len()),
+        let ga = match &analysis {
+            AnalysisState::Complete { analysis, .. } => analysis,
             _ => return,
         };
-        let _ = puzzle_count; // used below
 
         ui.add_space(8.0);
         hydra_card_frame().show(ui, |ui| {
@@ -2730,26 +3163,71 @@ impl FocalorsApp {
                 });
 
                 ui.add_space(10.0);
-                let analysis_idle = matches!(
-                    *self.analysis_state.lock().unwrap(),
-                    AnalysisState::Idle
-                );
-                let analyze = ui.add_enabled(
-                    analysis_idle,
-                    primary_button(if analysis_idle {
-                        "Analyze with Engine"
-                    } else {
-                        "Analysis already running"
-                    }),
-                );
-                if analyze.clicked() {
-                    let uci_moves = parsed.uci_moves.clone();
-                    let user_color = self.pgn_import_user_color;
-                    self.start_analysis(uci_moves, user_color);
-                    self.home_page = HomePage::Progress;
+                if ui.add(primary_button("Save & Review")).clicked() {
+                    self.save_imported_pgn_and_open_review(&parsed);
                 }
             });
         }
+    }
+
+    /// Persist a parsed PGN as a `SavedGame` with `engine_level = "imported"`,
+    /// then route the user into the History → replay panel for that game.
+    /// Imports get the same review pipeline as locally played games.
+    fn save_imported_pgn_and_open_review(&mut self, parsed: &crate::pgn::ParsedPgn) {
+        let db = match self.db.as_ref() {
+            Some(d) => d,
+            None => return,
+        };
+        let user_color_str = if self.pgn_import_user_color == Color::White {
+            "white"
+        } else {
+            "black"
+        };
+        let result_token = parsed.result.as_deref().unwrap_or("*");
+        let result = match (result_token, self.pgn_import_user_color) {
+            ("1-0", Color::White) | ("0-1", Color::Black) => "win",
+            ("1-0", Color::Black) | ("0-1", Color::White) => "loss",
+            ("1/2-1/2", _) => "draw",
+            _ => "draw",
+        };
+        // Re-emit a clean PGN from the UCI moves so generated SAN matches what
+        // the replay panel expects.
+        let white = parsed.white.clone().unwrap_or_else(|| "?".to_string());
+        let black = parsed.black.clone().unwrap_or_else(|| "?".to_string());
+        let pgn = crate::db::generate_pgn(
+            &parsed.uci_moves,
+            &white,
+            &black,
+            result_token,
+            None,
+            Some(&chrono_today()),
+        );
+        let move_count = parsed.uci_moves.len() as i32;
+
+        let game_id = match db.save_game(
+            user_color_str,
+            result,
+            Some("imported"),
+            None,
+            Some("imported"),
+            &pgn,
+            Some(move_count),
+        ) {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+
+        if let Some((_, opening_name)) = crate::openings::detect_opening(&parsed.uci_moves) {
+            let _ = db.update_game_opening(game_id, opening_name);
+        }
+
+        self.recent_games = db.get_recent_games(20).ok().unwrap_or_default();
+        self.pgn_import_text.clear();
+        self.pgn_import_parsed = None;
+        self.pgn_import_error = None;
+
+        self.start_replay(game_id);
+        self.home_page = HomePage::History;
     }
 
     fn draw_lichess_setup_card(
@@ -3122,7 +3600,7 @@ impl eframe::App for FocalorsApp {
                     });
             } else {
                 ui.add_space(6.0);
-                self.draw_board(ui);
+                self.draw_board(ui, None);
             }
         });
     }
@@ -3131,8 +3609,16 @@ impl eframe::App for FocalorsApp {
 impl FocalorsApp {
     // ── Chess board ────────────────────────────────────────────────────
 
-    fn draw_board(&mut self, ui: &mut egui::Ui) {
-        let board = self.state.lock().unwrap().board.clone();
+    fn draw_board(&mut self, ui: &mut egui::Ui, override_pos: Option<&BoardView<'_>>) {
+        let interactive = override_pos.map(|v| v.interactive).unwrap_or(true);
+        let board = match override_pos {
+            Some(v) => v.board.clone(),
+            None => self.state.lock().unwrap().board.clone(),
+        };
+        let last_move_squares: Option<(u8, u8)> = override_pos
+            .and_then(|v| v.last_move)
+            .filter(|m| !m.is_null())
+            .map(|m| (m.from_sq().0, m.to_sq().0));
         let available = ui.available_size();
         let max_height = (available.y - 18.0).max(180.0);
         let board_size = available.x.min(max_height);
@@ -3143,9 +3629,12 @@ impl FocalorsApp {
         let dark = egui::Color32::from_rgb(120, 99, 81);
         let selected_color = egui::Color32::from_rgba_premultiplied(216, 179, 92, 180);
         let legal_color = egui::Color32::from_rgba_premultiplied(148, 126, 98, 110);
+        let last_move_color = egui::Color32::from_rgba_premultiplied(212, 181, 96, 130);
 
-        // Compute legal moves from selected square
-        let legal_targets: Vec<u8> = if let Some(from_sq) = self.selected_square {
+        // Compute legal moves from selected square (interactive only)
+        let legal_targets: Vec<u8> = if interactive
+            && let Some(from_sq) = self.selected_square
+        {
             let moves = generate_legal_moves(&board);
             let mut targets = Vec::new();
             for i in 0..moves.len() {
@@ -3169,11 +3658,20 @@ impl FocalorsApp {
             egui::vec2(board_size, board_size),
         );
         let board_shell = board_rect.expand(14.0);
-        let allow_input = self.local_input_enabled();
-        let dragged_from_sq = self.drag_state.map(|drag| drag.from_sq);
-        let drag_hover_sq = self.drag_state.and_then(|drag| {
-            board_square_from_pos(board_rect, sq_size, self.flipped, drag.pointer_pos)
-        });
+        let allow_input = interactive && self.local_input_enabled();
+        let dragged_from_sq = if interactive {
+            self.drag_state.map(|drag| drag.from_sq)
+        } else {
+            None
+        };
+        let drag_hover_sq = if interactive {
+            self.drag_state.and_then(|drag| {
+                board_square_from_pos(board_rect, sq_size, self.flipped, drag.pointer_pos)
+            })
+        } else {
+            None
+        };
+        let selected_square = if interactive { self.selected_square } else { None };
 
         painter.rect_filled(
             board_shell.translate(egui::vec2(0.0, 8.0)),
@@ -3199,12 +3697,17 @@ impl FocalorsApp {
                 // Square color
                 let is_light = (display_rank + display_file) % 2 == 0;
                 let base_color = if is_light { light } else { dark };
-                let color = if self.selected_square == Some(sq_idx) {
+                let is_last_move = last_move_squares
+                    .map(|(f, t)| f == sq_idx || t == sq_idx)
+                    .unwrap_or(false);
+                let color = if selected_square == Some(sq_idx) {
                     selected_color
                 } else if drag_hover_sq == Some(sq_idx) {
                     egui::Color32::from_rgba_premultiplied(201, 150, 74, 135)
                 } else if legal_targets.contains(&sq_idx) {
                     legal_color
+                } else if is_last_move {
+                    last_move_color
                 } else {
                     base_color
                 };
@@ -3284,7 +3787,9 @@ impl FocalorsApp {
             }
         }
 
-        if let Some(drag_state) = &mut self.drag_state {
+        if interactive
+            && let Some(drag_state) = &mut self.drag_state
+        {
             if let Some(pos) = response.interact_pointer_pos() {
                 drag_state.pointer_pos = pos;
             }
@@ -3317,7 +3822,7 @@ impl FocalorsApp {
         }
 
         let pointer_down = ui.ctx().input(|input| input.pointer.primary_down());
-        if let Some(drag_state) = self.drag_state {
+        if interactive && let Some(drag_state) = self.drag_state {
             if let Some(texture) = self
                 .piece_textures
                 .get(&(drag_state.piece_color, drag_state.piece))
@@ -3359,7 +3864,9 @@ impl FocalorsApp {
             }
         }
 
-        self.draw_promotion_window(ui.ctx());
+        if interactive {
+            self.draw_promotion_window(ui.ctx());
+        }
     }
 
     fn try_make_move(&mut self, from: u8, to: u8) -> bool {

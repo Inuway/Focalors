@@ -1,6 +1,8 @@
+use crate::attacks;
 use crate::board::Board;
 use crate::eval::{self, EvalBreakdown, Score};
 use crate::movegen::{generate_legal_moves, make_move};
+use crate::moves::{Move, MoveFlag};
 use crate::search::Searcher;
 use crate::types::*;
 
@@ -176,15 +178,26 @@ pub fn analyze_game(
             MoveClass::from_cpl(cpl, was_sacrifice)
         };
 
-        // Compute explanation for mistakes/blunders using eval component breakdown
-        let explanation =
-            if matches!(classification, MoveClass::Mistake | MoveClass::Blunder) {
-                let bb = eval::eval_components(&board);
-                let ba = eval::eval_components(&board_after);
-                Some(generate_explanation(&bb, &ba, side, &san, &best_move_uci, cpl))
-            } else {
-                None
-            };
+        // Compute explanation for every meaningful classification.
+        let explanation = if matches!(classification, MoveClass::Best | MoveClass::Forced) {
+            None
+        } else {
+            let bb = eval::eval_components(&board);
+            let ba = eval::eval_components(&board_after);
+            Some(generate_explanation(
+                &board,
+                &board_after,
+                &bb,
+                &ba,
+                side,
+                &san,
+                played_mv,
+                &best_move_uci,
+                &search_result.pv,
+                cpl,
+                classification,
+            ))
+        };
 
         analysis.push(MoveAnalysis {
             move_number,
@@ -261,62 +274,190 @@ fn material_count(board: &Board, color: Color) -> Score {
 // Human-readable explanations
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Build a human-readable explanation for a single classified move. Combines:
+///   - a tone-appropriate intro for the classification,
+///   - a static check for hanging material the opponent can win next move,
+///   - the top three signed component swings (always rendered for consistency),
+///   - the engine's preferred line as PV-SAN (`Nf3 → Bxe4 Nxe4`).
 fn generate_explanation(
+    before_board: &Board,
+    after_board: &Board,
     before: &EvalBreakdown,
     after: &EvalBreakdown,
     side: Color,
     played_san: &str,
+    _played_mv: Move,
     best_uci: &str,
+    pv: &[Move],
     cpl: Score,
+    class: MoveClass,
 ) -> String {
     let mut parts = Vec::new();
+    parts.push(class_intro(class, played_san, cpl));
 
-    let class = if cpl > 150 { "Blunder" } else { "Mistake" };
-    parts.push(format!(
-        "{played_san} was a {class} (lost {} centipawns).",
-        cpl
-    ));
-
-    // Find the biggest component swings
-    let mut swings: Vec<(&str, Score)> = vec![
-        ("Material", component_swing(before.material, after.material, side)),
-        ("Piece activity", component_swing(before.pst, after.pst, side)),
-        ("Mobility", component_swing(before.mobility, after.mobility, side)),
-        ("Pawn structure", component_swing(before.pawn_structure, after.pawn_structure, side)),
-        ("Passed pawns", component_swing(before.passed_pawns, after.passed_pawns, side)),
-        ("King safety", component_swing(before.king_safety, after.king_safety, side)),
-        ("Bishop pair", component_swing(before.bishop_pair, after.bishop_pair, side)),
-        ("Rook placement", component_swing(before.rook_placement, after.rook_placement, side)),
-        ("Knight outpost", component_swing(before.knight_outpost, after.knight_outpost, side)),
-        ("Connected passers", component_swing(before.connected_passers, after.connected_passers, side)),
-        ("King-pawn proximity", component_swing(before.king_pawn_proximity, after.king_pawn_proximity, side)),
-        ("Tempo", component_swing(before.tempo, after.tempo, side)),
-    ];
-
-    // Sort by magnitude of loss (most negative first)
-    swings.sort_by_key(|(_, v)| *v);
-
-    for (name, swing) in &swings {
-        if *swing < -15 {
-            parts.push(format!("  • {name} worsened by {} cp.", -swing));
-        }
+    // For mistakes/blunders, surface the concrete punishment the opponent has.
+    if matches!(class, MoveClass::Mistake | MoveClass::Blunder)
+        && let Some(loss) = describe_material_loss(after_board)
+    {
+        parts.push(format!("  • {loss}"));
     }
 
-    // Mention what the best move was
-    if !best_uci.is_empty() {
+    // Top-3 component swings by magnitude, always rendered for consistency.
+    let labels: [(&str, Score, Score); 12] = [
+        ("Material", before.material, after.material),
+        ("Piece activity", before.pst, after.pst),
+        ("Mobility", before.mobility, after.mobility),
+        ("Pawn structure", before.pawn_structure, after.pawn_structure),
+        ("Passed pawns", before.passed_pawns, after.passed_pawns),
+        ("King safety", before.king_safety, after.king_safety),
+        ("Bishop pair", before.bishop_pair, after.bishop_pair),
+        ("Rook placement", before.rook_placement, after.rook_placement),
+        ("Knight outpost", before.knight_outpost, after.knight_outpost),
+        ("Connected passers", before.connected_passers, after.connected_passers),
+        ("King-pawn proximity", before.king_pawn_proximity, after.king_pawn_proximity),
+        ("Tempo", before.tempo, after.tempo),
+    ];
+    let mut swings: Vec<(&str, Score)> = labels
+        .iter()
+        .map(|(name, b, a)| (*name, component_swing(*b, *a, side)))
+        .filter(|(_, s)| *s != 0)
+        .collect();
+    swings.sort_by_key(|(_, v)| -v.abs());
+    for (name, swing) in swings.iter().take(3) {
+        let verb = if *swing < 0 { "worsened" } else { "improved" };
+        parts.push(format!("  • {name} {verb} by {} cp.", swing.abs()));
+    }
+
+    // Engine line: render as SAN for the first 4 plies of the PV.
+    let pv_san = pv_to_san(before_board, pv, 4);
+    if !pv_san.is_empty() {
+        parts.push(format!("Engine line: {}", pv_san.join(" → ")));
+    } else if !best_uci.is_empty() {
         parts.push(format!("Engine preferred: {best_uci}."));
     }
 
     parts.join("\n")
 }
 
+fn class_intro(class: MoveClass, san: &str, cpl: Score) -> String {
+    match class {
+        MoveClass::Brilliant => format!("{san}!! is a brilliant find."),
+        MoveClass::Good => format!("{san} is solid (only {cpl} cp loss)."),
+        MoveClass::Inaccuracy => format!("{san} is an inaccuracy ({cpl} cp loss)."),
+        MoveClass::Mistake => format!("{san} is a mistake (lost {cpl} cp)."),
+        MoveClass::Blunder => format!("{san} is a blunder (lost {cpl} cp)."),
+        MoveClass::Best | MoveClass::Forced => String::new(),
+    }
+}
+
 /// How much a component changed from the moving side's perspective.
 /// Negative = got worse for the moving side.
 fn component_swing(before: Score, after: Score, side: Color) -> Score {
-    // Components are stored from White's perspective
     let before_s = to_side_perspective(before, side);
     let after_s = to_side_perspective(after, side);
     after_s - before_s
+}
+
+fn piece_value(p: Piece) -> Score {
+    match p {
+        Piece::Pawn => 100,
+        Piece::Knight => 320,
+        Piece::Bishop => 330,
+        Piece::Rook => 500,
+        Piece::Queen => 900,
+        Piece::King => 20000,
+    }
+}
+
+fn piece_name(p: Piece) -> &'static str {
+    match p {
+        Piece::Pawn => "pawn",
+        Piece::Knight => "knight",
+        Piece::Bishop => "bishop",
+        Piece::Rook => "rook",
+        Piece::Queen => "queen",
+        Piece::King => "king",
+    }
+}
+
+fn square_name(sq: Square) -> String {
+    let file = (b'a' + (sq.0 % 8)) as char;
+    let rank = (b'1' + (sq.0 / 8)) as char;
+    format!("{file}{rank}")
+}
+
+/// Render the first `max_plies` of a PV as SAN by replaying on a clone of `start`.
+fn pv_to_san(start: &Board, pv: &[Move], max_plies: usize) -> Vec<String> {
+    let mut board = start.clone();
+    let mut out = Vec::with_capacity(max_plies);
+    for &mv in pv.iter().take(max_plies) {
+        if mv.is_null() {
+            break;
+        }
+        let san = crate::db::uci_to_san(&board, &mv.to_uci());
+        out.push(san);
+        make_move(&mut board, mv);
+    }
+    out
+}
+
+/// Static "hanging piece" detector: look at the strongest opponent capture
+/// available on `after_board`. If a clearly winning capture exists (victim
+/// undefended, or victim worth more than attacker), describe it in plain
+/// English. Returns `None` if no obvious material punishment is available.
+fn describe_material_loss(after_board: &Board) -> Option<String> {
+    let opponent = after_board.side_to_move;
+    let our_side = opponent.flip();
+    let moves = generate_legal_moves(after_board);
+
+    let mut best: Option<(Score, Move, Piece, Piece, Square)> = None;
+    for i in 0..moves.len() {
+        let mv = moves[i];
+        let from = mv.from_sq();
+        let to = mv.to_sq();
+
+        let attacker = match after_board.piece_type_on(from) {
+            Some(p) => p,
+            None => continue,
+        };
+        let victim = if matches!(mv.flag(), MoveFlag::EnPassant) {
+            Piece::Pawn
+        } else {
+            match after_board.piece_on(to) {
+                Some((c, p)) if c == our_side => p,
+                _ => continue,
+            }
+        };
+
+        let mut after_capture = after_board.clone();
+        make_move(&mut after_capture, mv);
+        let defended =
+            attacks::is_square_attacked(&after_capture, to, after_capture.side_to_move);
+        let attacker_val = piece_value(attacker);
+        let victim_val = piece_value(victim);
+        let net = if defended {
+            victim_val - attacker_val
+        } else {
+            victim_val
+        };
+
+        if net > 50
+            && best
+                .as_ref()
+                .map_or(true, |(prev_net, ..)| net > *prev_net)
+        {
+            best = Some((net, mv, attacker, victim, to));
+        }
+    }
+
+    let (_net, mv, _attacker, victim, sq) = best?;
+    let mv_san = crate::db::uci_to_san(after_board, &mv.to_uci());
+    Some(format!(
+        "Your {} on {} is hanging — {} wins it.",
+        piece_name(victim),
+        square_name(sq),
+        mv_san,
+    ))
 }
 
 #[cfg(test)]

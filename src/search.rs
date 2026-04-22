@@ -15,6 +15,9 @@ pub struct SearchResult {
     pub score: Score,
     pub depth: u32,
     pub nodes: u64,
+    /// Principal variation starting with `best_move`. Empty if no full
+    /// PV could be reconstructed (e.g. early termination).
+    pub pv: Vec<Move>,
 }
 
 const MAX_PLY: usize = 128;
@@ -36,6 +39,10 @@ pub struct Searcher {
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; Color::COUNT],
     countermoves: [[Move; 64]; 64],
+    /// Triangular PV table; `pv_table[ply][0..pv_length[ply]]` holds the PV
+    /// from this ply downward. Boxed to keep the searcher off the stack.
+    pv_table: Box<[[Move; MAX_PLY]; MAX_PLY]>,
+    pv_length: [u8; MAX_PLY],
     position_history: Vec<u64>,
     search_hashes: [u64; MAX_PLY],
     stop_time: Option<Instant>,
@@ -59,6 +66,8 @@ impl Searcher {
             killers: [[Move::NULL; 2]; MAX_PLY],
             history: [[[0i32; 64]; 64]; Color::COUNT],
             countermoves: [[Move::NULL; 64]; 64],
+            pv_table: Box::new([[Move::NULL; MAX_PLY]; MAX_PLY]),
+            pv_length: [0u8; MAX_PLY],
             position_history: Vec::new(),
             search_hashes: [0u64; MAX_PLY],
             stop_time: None,
@@ -169,6 +178,7 @@ impl Searcher {
             score: 0,
             depth: 0,
             nodes: 0,
+            pv: Vec::new(),
         };
 
         let mut prev_score = 0;
@@ -242,11 +252,21 @@ impl Searcher {
                     self.prev_best_move = mv;
                 }
 
+                let pv_len = self.pv_length[0] as usize;
+                let mut pv = Vec::with_capacity(pv_len);
+                for j in 0..pv_len {
+                    pv.push(self.pv_table[0][j]);
+                }
+                if pv.is_empty() {
+                    pv.push(mv);
+                }
+
                 best_result = SearchResult {
                     best_move: mv,
                     score,
                     depth,
                     nodes: total_nodes,
+                    pv,
                 };
             }
 
@@ -299,6 +319,9 @@ impl Searcher {
 
         let hash = board.hash;
         let ply_idx = (ply as usize).min(MAX_PLY - 1);
+
+        // Reset PV length at this ply; it will be filled as we improve alpha.
+        self.pv_length[ply_idx] = 0;
 
         // Record position for repetition detection
         self.search_hashes[ply_idx] = hash;
@@ -552,6 +575,16 @@ impl Searcher {
             if score > best_score {
                 best_score = score;
                 best_move = mv;
+                // Update PV: this move plus the child's PV.
+                if ply_idx + 1 < MAX_PLY {
+                    self.pv_table[ply_idx][0] = mv;
+                    let child_len = self.pv_length[ply_idx + 1] as usize;
+                    let copy_len = child_len.min(MAX_PLY - 1);
+                    for j in 0..copy_len {
+                        self.pv_table[ply_idx][j + 1] = self.pv_table[ply_idx + 1][j];
+                    }
+                    self.pv_length[ply_idx] = (copy_len + 1) as u8;
+                }
             }
 
             if score >= beta {
