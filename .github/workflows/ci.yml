@@ -21,7 +21,6 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
-          - macos-latest
 
     steps:
       - name: Checkout
@@ -49,10 +48,6 @@ jobs:
             artifact_name: focalors-linux-x86_64
             binary_path: target/release/focalors
             archive_name: focalors-linux-x86_64.tar.gz
-          - os: macos-latest
-            artifact_name: focalors-macos-aarch64
-            binary_path: target/release/focalors
-            archive_name: focalors-macos-aarch64.tar.gz
           - os: windows-latest
             artifact_name: focalors-windows-x86_64
             binary_path: target/release/focalors.exe
@@ -72,10 +67,6 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo rustc --release --locked --bin focalors -- -C target-cpu=x86-64
 
-      - name: Build portable release binary (macOS)
-        if: runner.os == 'macOS'
-        run: cargo rustc --release --locked --bin focalors
-
       - name: Build portable release binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -89,7 +80,6 @@ jobs:
           cp README.md dist/${{ matrix.artifact_name }}/
           cp CONTRIBUTING.md dist/${{ matrix.artifact_name }}/
           cp LICENSE dist/${{ matrix.artifact_name }}/
-          cp .env.example dist/${{ matrix.artifact_name }}/
           tar -czf ${{ matrix.archive_name }} -C dist ${{ matrix.artifact_name }}
 
       - name: Assemble release bundle (Windows)
@@ -101,7 +91,6 @@ jobs:
           Copy-Item README.md dist/${{ matrix.artifact_name }}/
           Copy-Item CONTRIBUTING.md dist/${{ matrix.artifact_name }}/
           Copy-Item LICENSE dist/${{ matrix.artifact_name }}/
-          Copy-Item .env.example dist/${{ matrix.artifact_name }}/
           Compress-Archive -Path dist/${{ matrix.artifact_name }} -DestinationPath ${{ matrix.archive_name }}
 
       - name: Upload workflow artifact
