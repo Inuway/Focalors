@@ -38,23 +38,6 @@ impl Default for EngineSettings {
 }
 
 #[derive(Clone)]
-pub struct LichessSettings {
-    pub token: String,
-    pub clock_minutes: u32,
-    pub clock_increment: u32,
-}
-
-impl Default for LichessSettings {
-    fn default() -> Self {
-        Self {
-            token: String::new(),
-            clock_minutes: 10,
-            clock_increment: 0,
-        }
-    }
-}
-
-#[derive(Clone)]
 struct SearchInfo {
     depth: u32,
     score: i32,
@@ -73,13 +56,6 @@ impl Default for SearchInfo {
             searching: false,
         }
     }
-}
-
-#[derive(Clone, PartialEq)]
-enum LichessStatus {
-    Disconnected,
-    Connected(String), // username
-    InGame(String),    // game ID
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -183,7 +159,6 @@ impl Default for LocalDifficulty {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HomePage {
     Overview,
-    Lichess,
     Import,
     Progress,
     Statistics,
@@ -478,11 +453,7 @@ struct SharedState {
     local_history_cursor: usize,
     local_search_generation: u64,
     engine_settings: EngineSettings,
-    lichess_settings: LichessSettings,
     search_info: SearchInfo,
-    lichess_status: LichessStatus,
-    lichess_username: String, // always stores the bot's username once connected
-    lichess_log: Vec<String>,
     local_game: LocalGameState,
     game_saved: bool,
     /// Persistent searcher for TT reuse across moves
@@ -499,11 +470,7 @@ impl Default for SharedState {
             local_history_cursor: 0,
             local_search_generation: 0,
             engine_settings: EngineSettings::default(),
-            lichess_settings: LichessSettings::default(),
             search_info: SearchInfo::default(),
-            lichess_status: LichessStatus::Disconnected,
-            lichess_username: String::new(),
-            lichess_log: Vec::new(),
             local_game: LocalGameState::default(),
             game_saved: false,
             persistent_searcher: {
@@ -511,7 +478,7 @@ impl Default for SharedState {
                 s.use_nnue = crate::nnue::network::get_network().is_some();
                 Arc::new(Mutex::new(s))
             },
-            status_message: "Idle. Choose local play or connect Lichess.".to_string(),
+            status_message: "Idle. Choose local play to begin.".to_string(),
         }
     }
 }
@@ -553,15 +520,11 @@ pub struct FocalorsApp {
     puzzle_message: Option<(String, egui::Color32, std::time::Instant)>,
     show_advanced_engine_settings: bool,
     pending_promotion: Option<PendingPromotion>,
-    stockfish_level: i32,
     piece_textures: HashMap<(Color, Piece), egui::TextureHandle>,
     pgn_import_text: String,
     pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
     pgn_import_error: Option<String>,
     pgn_import_user_color: Color,
-    /// When true, the GUI exposes developer-only surfaces (currently the
-    /// Lichess bot page). Set via the `FOCALORS_DEBUG=1` env var at startup.
-    show_dev_features: bool,
 }
 
 /// Replay the saved PGN once, building parallel `boards`/`moves` vectors so the
@@ -614,13 +577,7 @@ impl FocalorsApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_theme(&cc.egui_ctx, UiTheme::Light);
 
-        // Load token from environment if available
-        let token = std::env::var("LICHESS_TOKEN").unwrap_or_default();
         let state = Arc::new(Mutex::new(SharedState::default()));
-        {
-            let mut s = state.lock().unwrap();
-            s.lichess_settings.token = token;
-        }
 
         // Load piece textures from embedded PNGs
         let ctx = &cc.egui_ctx;
@@ -744,13 +701,11 @@ impl FocalorsApp {
             puzzle_message: None,
             show_advanced_engine_settings: false,
             pending_promotion: None,
-            stockfish_level: 1,
             piece_textures,
             pgn_import_text: String::new(),
             pgn_import_parsed: None,
             pgn_import_error: None,
             pgn_import_user_color: Color::White,
-            show_dev_features: std::env::var("FOCALORS_DEBUG").is_ok(),
         }
     }
 
@@ -772,7 +727,6 @@ impl FocalorsApp {
         let state = self.state.lock().unwrap();
         state.local_game.active
             && state.local_game.outcome.is_none()
-            && matches!(state.lichess_status, LichessStatus::Disconnected)
             && !state.search_info.searching
             && state.board.side_to_move == state.local_game.human_color
             && state
@@ -786,7 +740,6 @@ impl FocalorsApp {
         let state = self.state.lock().unwrap();
         state.local_game.active
             && state.local_game.outcome.is_none()
-            && matches!(state.lichess_status, LichessStatus::Disconnected)
             && state.local_game.time_control.active_since.is_some()
     }
 
@@ -2729,23 +2682,13 @@ impl FocalorsApp {
     }
 
     fn draw_idle_home(&mut self, ui: &mut egui::Ui) {
-        let (searching, token_set, lichess_status, status_message, lichess_log) = {
+        let (searching, status_message) = {
             let state = self.state.lock().unwrap();
-            (
-                state.search_info.searching,
-                !state.lichess_settings.token.is_empty(),
-                state.lichess_status.clone(),
-                state.status_message.clone(),
-                state.lichess_log.clone(),
-            )
+            (state.search_info.searching, state.status_message.clone())
         };
 
         let ctx = ui.ctx().clone();
-        let status_label = match &lichess_status {
-            LichessStatus::Disconnected => "Offline local play ready".to_string(),
-            LichessStatus::Connected(user) => format!("Lichess connected as {user}"),
-            LichessStatus::InGame(id) => format!("Lichess game active: {id}"),
-        };
+        let status_label = "Offline local play ready".to_string();
         let has_puzzles = self
             .db
             .as_ref()
@@ -2785,12 +2728,6 @@ impl FocalorsApp {
         ui.horizontal_wrapped(|ui| {
             if ui.add(home_nav_button(self.home_page == HomePage::Overview, "Overview")).clicked() {
                 self.home_page = HomePage::Overview;
-            }
-
-            if self.show_dev_features
-                && ui.add(home_nav_button(self.home_page == HomePage::Lichess, "Lichess")).clicked()
-            {
-                self.home_page = HomePage::Lichess;
             }
 
             if ui.add(home_nav_button(self.home_page == HomePage::Import, "Import")).clicked() {
@@ -2835,7 +2772,7 @@ impl FocalorsApp {
 
         match self.home_page {
             HomePage::Overview => {
-                self.draw_local_setup_card(ui, searching, &lichess_status);
+                self.draw_local_setup_card(ui, searching);
 
                 ui.add_space(12.0);
                 ui.label(
@@ -2863,30 +2800,6 @@ impl FocalorsApp {
                 if has_games {
                     ui.add_space(14.0);
                     self.draw_opening_stats(ui);
-                }
-            }
-            HomePage::Lichess => {
-                self.draw_lichess_setup_card(ui, &lichess_status, searching, token_set);
-
-                if !lichess_log.is_empty() {
-                    ui.add_space(12.0);
-                    hydra_card_frame().show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("Recent Activity")
-                                .size(13.0)
-                                .strong()
-                                .color(hydra_accent()),
-                        );
-                        ui.add_space(8.0);
-                        egui::ScrollArea::vertical()
-                            .max_height(220.0)
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                for log in lichess_log.iter().rev().take(40).rev() {
-                                    ui.label(egui::RichText::new(log).size(10.5).monospace().color(hydra_subtle_text()));
-                                }
-                            });
-                    });
                 }
             }
             HomePage::Import => self.draw_pgn_import(ui),
@@ -2943,12 +2856,7 @@ impl FocalorsApp {
         self.draw_home_engine_settings_popup(&ctx, searching);
     }
 
-    fn draw_local_setup_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        searching: bool,
-        lichess_status: &LichessStatus,
-    ) {
+    fn draw_local_setup_card(&mut self, ui: &mut egui::Ui, searching: bool) {
         hydra_card_frame().show(ui, |ui| {
             ui.label(
                 egui::RichText::new("Local Play")
@@ -3032,24 +2940,14 @@ impl FocalorsApp {
             );
 
             ui.add_space(10.0);
-            let can_start = !searching && matches!(lichess_status, LichessStatus::Disconnected);
             let start_clicked = ui
-                .add_enabled_ui(can_start, |ui| {
+                .add_enabled_ui(!searching, |ui| {
                     ui.add_sized([ui.available_width(), 38.0], primary_button("Start Local Game"))
                         .clicked()
                 })
                 .inner;
             if start_clicked {
                 self.begin_local_game(self.local_side_choice.resolve());
-            }
-
-            if !matches!(lichess_status, LichessStatus::Disconnected) {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("Disconnect Lichess before starting an offline local game.")
-                        .size(11.0)
-                        .color(hydra_warning()),
-                );
             }
         });
     }
@@ -3064,7 +2962,7 @@ impl FocalorsApp {
             );
             ui.label(
                 egui::RichText::new(
-                    "Paste a game exported from Lichess or Chess.com to run a full engine review.",
+                    "Paste a game's PGN to run a full engine review.",
                 )
                 .size(12.0)
                 .color(hydra_subtle_text()),
@@ -3236,154 +3134,6 @@ impl FocalorsApp {
         self.home_page = HomePage::History;
     }
 
-    fn draw_lichess_setup_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        lichess_status: &LichessStatus,
-        searching: bool,
-        token_set: bool,
-    ) {
-        hydra_card_frame().show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("Lichess")
-                    .strong()
-                    .size(16.0)
-                    .color(hydra_accent()),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "Use Focalors online only when you want bot games or API-driven testing against Lichess AI.",
-                )
-                .size(12.0)
-                .color(hydra_subtle_text()),
-            );
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let (label, tone) = match lichess_status {
-                    LichessStatus::Disconnected => ("Disconnected".to_string(), hydra_subtle_text()),
-                    LichessStatus::Connected(user) => (format!("Connected as {user}"), hydra_success()),
-                    LichessStatus::InGame(id) => (format!("In game {id}"), hydra_success()),
-                };
-                ui.label(
-                    egui::RichText::new("Status")
-                        .size(11.0)
-                        .strong()
-                        .color(hydra_subtle_text()),
-                );
-                ui.label(egui::RichText::new(label).size(12.0).strong().color(tone));
-            });
-
-            ui.add_space(12.0);
-            let mut token = self.state.lock().unwrap().lichess_settings.token.clone();
-            ui.label(
-                egui::RichText::new("API Token")
-                    .size(11.0)
-                    .strong()
-                    .color(hydra_subtle_text()),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut token)
-                    .password(true)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Paste your Lichess bot token"),
-            );
-            self.state.lock().unwrap().lichess_settings.token = token;
-
-            ui.add_space(10.0);
-            let connect_clicked = ui
-                .add_enabled_ui(!searching, |ui| {
-                    let button = match lichess_status {
-                        LichessStatus::Disconnected => primary_button("Connect to Lichess"),
-                        _ => danger_button("Disconnect Lichess"),
-                    };
-                    ui.add_sized([ui.available_width(), 38.0], button).clicked()
-                })
-                .inner;
-            if connect_clicked {
-                match lichess_status {
-                    LichessStatus::Disconnected => self.start_lichess(),
-                    _ => {
-                        let mut s = self.state.lock().unwrap();
-                        s.lichess_status = LichessStatus::Disconnected;
-                        s.lichess_log.push("Disconnected".to_string());
-                        s.status_message = "Disconnected from Lichess.".to_string();
-                    }
-                }
-            }
-
-            if matches!(lichess_status, LichessStatus::Connected(_)) {
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("Challenge Setup").strong().color(hydra_accent()));
-                ui.label(
-                    egui::RichText::new("Tune the AI level and clock before sending a challenge.")
-                        .size(11.0)
-                        .color(hydra_subtle_text()),
-                );
-
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Stockfish level")
-                        .size(11.0)
-                        .strong()
-                        .color(hydra_subtle_text()),
-                );
-                ui.add(egui::Slider::new(&mut self.stockfish_level, 1..=8));
-
-                let mut ls = self.state.lock().unwrap().lichess_settings.clone();
-                ui.add_space(6.0);
-                egui::Grid::new("lichess_challenge_form")
-                    .num_columns(2)
-                    .spacing([12.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("Minutes")
-                                .size(11.0)
-                                .strong()
-                                .color(hydra_subtle_text()),
-                        );
-                        let mut mins = ls.clock_minutes as i32;
-                        ui.add(egui::DragValue::new(&mut mins).range(1..=180).suffix(" min"));
-                        ls.clock_minutes = mins as u32;
-                        ui.end_row();
-
-                        ui.label(
-                            egui::RichText::new("Increment")
-                                .size(11.0)
-                                .strong()
-                                .color(hydra_subtle_text()),
-                        );
-                        let mut inc = ls.clock_increment as i32;
-                        ui.add(egui::DragValue::new(&mut inc).range(0..=60).suffix(" s"));
-                        ls.clock_increment = inc as u32;
-                        ui.end_row();
-                    });
-                self.state.lock().unwrap().lichess_settings = ls;
-
-                ui.add_space(8.0);
-                if ui
-                    .add_sized([ui.available_width(), 34.0], secondary_button("Challenge Stockfish"))
-                    .clicked()
-                {
-                    self.challenge_stockfish();
-                }
-            }
-
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new(if token_set {
-                    "Token detected and ready for online play."
-                } else {
-                    "No token loaded yet."
-                })
-                .size(11.0)
-                .color(hydra_subtle_text()),
-            );
-        });
-    }
-
     fn draw_home_engine_settings_popup(&mut self, ctx: &egui::Context, searching: bool) {
         if !self.show_advanced_engine_settings {
             return;
@@ -3401,7 +3151,7 @@ impl FocalorsApp {
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "Manual tuning for analysis runs and Lichess fallback. Timed local games still use the selected difficulty profile.",
+                        "Manual tuning for analysis runs. Timed local games still use the selected difficulty profile.",
                     )
                     .size(11.0)
                     .color(hydra_subtle_text()),
@@ -3522,15 +3272,8 @@ impl eframe::App for FocalorsApp {
 
         let (show_home_screen, mode_label, searching) = {
             let state = self.state.lock().unwrap();
-            let show_home_screen = !state.local_game.active
-                && !matches!(state.lichess_status, LichessStatus::InGame(_));
-            let mode_label = if show_home_screen {
-                "Home"
-            } else if state.local_game.active {
-                "Local Play"
-            } else {
-                "Lichess"
-            };
+            let show_home_screen = !state.local_game.active;
+            let mode_label = if show_home_screen { "Home" } else { "Local Play" };
             (show_home_screen, mode_label, state.search_info.searching)
         };
 
@@ -3925,7 +3668,6 @@ impl FocalorsApp {
             if !force {
                 if !s.local_game.active
                     || s.local_game.outcome.is_some()
-                    || !matches!(s.lichess_status, LichessStatus::Disconnected)
                     || s.board.side_to_move == s.local_game.human_color
                 {
                     return;
@@ -4167,15 +3909,10 @@ impl FocalorsApp {
     // ── Controls panel ─────────────────────────────────────────────────
 
     fn draw_controls(&mut self, ui: &mut egui::Ui) {
-        let (local_active, lichess_status) = {
-            let state = self.state.lock().unwrap();
-            (state.local_game.active, state.lichess_status.clone())
-        };
+        let local_active = self.state.lock().unwrap().local_game.active;
 
         if local_active {
             self.draw_local_game_controls(ui);
-        } else if matches!(lichess_status, LichessStatus::InGame(_)) {
-            self.draw_lichess_game_controls(ui);
         }
 
         // Eval explanation panel toggle + display
@@ -4412,187 +4149,6 @@ impl FocalorsApp {
         });
     }
 
-    fn draw_lichess_game_controls(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let (status, logs) = {
-                let state = self.state.lock().unwrap();
-                (state.lichess_status.clone(), state.lichess_log.clone())
-            };
-
-            hydra_card_frame().show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("Lichess Session")
-                        .strong()
-                        .size(16.0)
-                        .color(hydra_accent()),
-                );
-                ui.add_space(10.0);
-
-                match &status {
-                    LichessStatus::InGame(id) => {
-                        hydra_badge(ui, &format!("Current game: {id}"), hydra_success());
-                    }
-                    LichessStatus::Connected(user) => {
-                        hydra_badge(ui, &format!("Connected as {user}"), hydra_success());
-                    }
-                    LichessStatus::Disconnected => {
-                        hydra_badge(ui, "Disconnected", hydra_danger());
-                    }
-                }
-
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_sized([138.0, 34.0], secondary_button("Flip Board")).clicked() {
-                        self.flipped = !self.flipped;
-                    }
-                    if ui.add_sized([138.0, 34.0], danger_button("Disconnect")).clicked() {
-                        let mut s = self.state.lock().unwrap();
-                        s.lichess_status = LichessStatus::Disconnected;
-                        s.lichess_log.push("Disconnected".to_string());
-                        s.status_message = "Disconnected from Lichess.".to_string();
-                    }
-                });
-
-                if !logs.is_empty() {
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Log").strong().color(hydra_accent()));
-                    egui::ScrollArea::vertical()
-                        .max_height(180.0)
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for log in logs.iter().rev().take(20).rev() {
-                                ui.label(egui::RichText::new(log).size(10.0).monospace());
-                            }
-                        });
-                }
-            });
-        });
-    }
-
-    // ── Lichess integration ────────────────────────────────────────────
-
-    fn start_lichess(&mut self) {
-        let (state, token, local_before_connect) = {
-            let state = self.state.clone();
-            let s = self.state.lock().unwrap();
-            let mut paused_local_game = s.local_game.clone();
-            paused_local_game.time_control.clear_active();
-            (state, s.lichess_settings.token.clone(), paused_local_game)
-        };
-
-        if token.is_empty() {
-            let mut s = state.lock().unwrap();
-            s.lichess_log.push("Error: No token set".to_string());
-            return;
-        }
-
-        {
-            let mut s = self.state.lock().unwrap();
-            invalidate_local_search(&mut s, false);
-            s.local_game.time_control.clear_active();
-            s.local_game.active = false;
-            s.local_game.outcome = None;
-            s.status_message = "Connecting to Lichess... Local play paused.".to_string();
-        }
-        self.selected_square = None;
-        self.drag_state = None;
-        self.pending_promotion = None;
-
-        thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let client = reqwest::Client::new();
-
-                let resp = client
-                    .get("https://lichess.org/api/account")
-                    .bearer_auth(&token)
-                    .send()
-                    .await;
-
-                match resp {
-                    Ok(r) if r.status().is_success() => {
-                        let account: serde_json::Value = r.json().await.unwrap_or_default();
-                        let username = account["username"]
-                            .as_str()
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let mut s = state.lock().unwrap();
-                        s.lichess_username = username.to_lowercase();
-                        s.lichess_status = LichessStatus::Connected(username.clone());
-                        s.lichess_log.push(format!("Connected as {username}"));
-                    }
-                    Ok(r) => {
-                        let body = r.text().await.unwrap_or_default();
-                        let mut s = state.lock().unwrap();
-                        let mut resumed_game = local_before_connect.clone();
-                        if resumed_game.active && resumed_game.outcome.is_none() {
-                            resumed_game.time_control.start_turn_now();
-                        }
-                        s.local_game = resumed_game;
-                        s.status_message = "Lichess auth failed. Local play resumed.".to_string();
-                        s.lichess_log.push(format!("Auth failed: {body}"));
-                    }
-                    Err(e) => {
-                        let mut s = state.lock().unwrap();
-                        let mut resumed_game = local_before_connect.clone();
-                        if resumed_game.active && resumed_game.outcome.is_none() {
-                            resumed_game.time_control.start_turn_now();
-                        }
-                        s.local_game = resumed_game;
-                        s.status_message = "Lichess connection failed. Local play resumed.".to_string();
-                        s.lichess_log.push(format!("Connection failed: {e}"));
-                    }
-                }
-
-                lichess_event_loop(state.clone(), token.clone()).await;
-            });
-        });
-    }
-
-    fn challenge_stockfish(&self) {
-        let state = self.state.clone();
-        let token = self.state.lock().unwrap().lichess_settings.token.clone();
-        let level = self.stockfish_level;
-        let ls = self.state.lock().unwrap().lichess_settings.clone();
-
-        thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let client = reqwest::Client::new();
-                let resp = client
-                    .post(format!("https://lichess.org/api/challenge/ai"))
-                    .bearer_auth(&token)
-                    .form(&[
-                        ("level", level.to_string()),
-                        ("clock.limit", (ls.clock_minutes * 60).to_string()),
-                        ("clock.increment", ls.clock_increment.to_string()),
-                    ])
-                    .send()
-                    .await;
-
-                match resp {
-                    Ok(r) if r.status().is_success() => {
-                        let body: serde_json::Value = r.json().await.unwrap_or_default();
-                        let game_id = body["id"].as_str().unwrap_or("unknown");
-                        let mut s = state.lock().unwrap();
-                        s.lichess_log.push(format!("Challenge sent! Game: {game_id}"));
-                        s.lichess_status = LichessStatus::InGame(game_id.to_string());
-                    }
-                    Ok(r) => {
-                        let body = r.text().await.unwrap_or_default();
-                        let mut s = state.lock().unwrap();
-                        s.lichess_log.push(format!("Challenge failed: {body}"));
-                    }
-                    Err(e) => {
-                        let mut s = state.lock().unwrap();
-                        s.lichess_log.push(format!("Challenge error: {e}"));
-                    }
-                }
-            });
-        });
-    }
 }
 
 fn current_theme() -> UiTheme {
@@ -5271,347 +4827,6 @@ fn update_local_game_outcome(state: &mut SharedState) {
 
     if let Some(outcome) = detect_game_outcome(state) {
         set_local_game_outcome(state, outcome);
-    }
-}
-
-// ── Lichess event loop (runs in background) ────────────────────────────────
-
-async fn lichess_event_loop(state: Arc<Mutex<SharedState>>, token: String) {
-    use futures_util::StreamExt;
-
-    let client = reqwest::Client::new();
-    let resp = match client
-        .get("https://lichess.org/api/stream/event")
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            let mut s = state.lock().unwrap();
-            s.lichess_log.push(format!("Event stream error: {e}"));
-            s.lichess_status = LichessStatus::Disconnected;
-            return;
-        }
-    };
-
-    let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
-
-    while let Some(chunk) = stream.next().await {
-        // Check if we should disconnect
-        {
-            let s = state.lock().unwrap();
-            if matches!(s.lichess_status, LichessStatus::Disconnected) {
-                return;
-            }
-        }
-
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(pos) = buffer.find('\n') {
-            let line: String = buffer.drain(..=pos).collect();
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
-                let event_type = event["type"].as_str().unwrap_or("");
-
-                match event_type {
-                    "gameStart" => {
-                        let game_id = event["game"]["gameId"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        if !game_id.is_empty() {
-                            {
-                                let mut s = state.lock().unwrap();
-                                s.lichess_log
-                                    .push(format!("Game started: {game_id}"));
-                                s.lichess_status = LichessStatus::InGame(game_id.clone());
-                            }
-
-                            // Play the game in a separate task
-                            let state2 = state.clone();
-                            let token2 = token.clone();
-                            tokio::spawn(async move {
-                                play_lichess_game(state2, token2, game_id).await;
-                            });
-                        }
-                    }
-                    "gameFinish" => {
-                        let mut s = state.lock().unwrap();
-                        s.lichess_log.push("Game finished".to_string());
-                        let username = s.lichess_username.clone();
-                        s.lichess_status = LichessStatus::Connected(username);
-                    }
-                    "challenge" => {
-                        // Auto-accept challenges
-                        let challenge_id =
-                            event["challenge"]["id"].as_str().unwrap_or("").to_string();
-                        if !challenge_id.is_empty() {
-                            let mut s = state.lock().unwrap();
-                            s.lichess_log
-                                .push(format!("Accepting challenge: {challenge_id}"));
-                            drop(s);
-                            let _ = client
-                                .post(format!(
-                                    "https://lichess.org/api/challenge/{challenge_id}/accept"
-                                ))
-                                .bearer_auth(&token)
-                                .send()
-                                .await;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-}
-
-async fn play_lichess_game(
-    state: Arc<Mutex<SharedState>>,
-    token: String,
-    game_id: String,
-) {
-    use futures_util::StreamExt;
-
-    let client = reqwest::Client::new();
-    let resp = match client
-        .get(format!(
-            "https://lichess.org/api/bot/game/stream/{game_id}"
-        ))
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            let mut s = state.lock().unwrap();
-            s.lichess_log
-                .push(format!("Game stream error: {e}"));
-            return;
-        }
-    };
-
-    let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
-    let mut our_color: Option<Color> = None;
-    let bot_id = state.lock().unwrap().lichess_username.clone();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(pos) = buffer.find('\n') {
-            let line: String = buffer.drain(..=pos).collect();
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            let event: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let event_type = event["type"].as_str().unwrap_or("");
-
-            match event_type {
-                "gameFull" => {
-                    // Determine color
-                    let white_id = event["white"]["id"].as_str().unwrap_or("").to_lowercase();
-                    let black_id = event["black"]["id"].as_str().unwrap_or("").to_lowercase();
-                    if white_id == bot_id {
-                        our_color = Some(Color::White);
-                    } else if black_id == bot_id {
-                        our_color = Some(Color::Black);
-                    }
-
-                    let moves_str = event["state"]["moves"].as_str().unwrap_or("");
-                    let wtime = event["state"]["wtime"].as_u64();
-                    let btime = event["state"]["btime"].as_u64();
-
-                    {
-                        let mut s = state.lock().unwrap();
-                        s.lichess_log.push(format!(
-                            "Playing as {}",
-                            if our_color == Some(Color::White) { "White" } else { "Black" }
-                        ));
-                    }
-
-                    if should_move(moves_str, our_color) {
-                        let our_time = match our_color {
-                            Some(Color::White) => wtime,
-                            Some(Color::Black) => btime,
-                            None => None,
-                        };
-                        let best = calculate_and_play(
-                            &state, &client, &token, &game_id, moves_str, our_time,
-                        )
-                        .await;
-                        if let Some(mv) = best {
-                            let mut s = state.lock().unwrap();
-                            s.lichess_log.push(format!("Played: {mv}"));
-                        }
-                    }
-                }
-                "gameState" => {
-                    let status = event["status"].as_str().unwrap_or("started");
-                    if status != "started" {
-                        let mut s = state.lock().unwrap();
-                        s.lichess_log.push(format!("Game ended: {status}"));
-                        return;
-                    }
-
-                    let moves_str = event["moves"].as_str().unwrap_or("");
-                    let wtime = event["wtime"].as_u64();
-                    let btime = event["btime"].as_u64();
-
-                    if should_move(moves_str, our_color) {
-                        let our_time = match our_color {
-                            Some(Color::White) => wtime,
-                            Some(Color::Black) => btime,
-                            None => None,
-                        };
-                        let best = calculate_and_play(
-                            &state, &client, &token, &game_id, moves_str, our_time,
-                        )
-                        .await;
-                        if let Some(mv) = best {
-                            let mut s = state.lock().unwrap();
-                            s.lichess_log.push(format!("Played: {mv}"));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-fn should_move(moves_str: &str, our_color: Option<Color>) -> bool {
-    let count = if moves_str.is_empty() {
-        0
-    } else {
-        moves_str.split_whitespace().count()
-    };
-    match our_color {
-        Some(Color::White) => count % 2 == 0,
-        Some(Color::Black) => count % 2 == 1,
-        None => false,
-    }
-}
-
-async fn calculate_and_play(
-    state: &Arc<Mutex<SharedState>>,
-    client: &reqwest::Client,
-    token: &str,
-    game_id: &str,
-    moves_str: &str,
-    our_time: Option<u64>,
-) -> Option<String> {
-    let settings = state.lock().unwrap().engine_settings.clone();
-
-    // Build the board
-    let mut board = Board::startpos();
-    if !moves_str.is_empty() {
-        for mv_str in moves_str.split_whitespace() {
-            if let Some(mv) = uci::parse_move(&board, mv_str) {
-                make_move(&mut board, mv);
-            }
-        }
-    }
-
-    // Update the GUI board
-    {
-        let mut s = state.lock().unwrap();
-        s.board = board.clone();
-        s.move_history = moves_str.split_whitespace().map(|s| s.to_string()).collect();
-        s.search_info.searching = true;
-    }
-
-    // Calculate time
-    let time_for_move = match our_time {
-        Some(ms) if ms > 0 && ms < 2_000_000_000 => {
-            let base = ms / 30;
-            let safe = ms.saturating_sub(100);
-            base.min(safe).max(200).min(10000)
-        }
-        _ => settings.think_time_ms,
-    };
-
-    // Build position history for repetition detection
-    let mut position_hashes = vec![Board::startpos().hash];
-    {
-        let mut replay_board = Board::startpos();
-        if !moves_str.is_empty() {
-            for mv_str in moves_str.split_whitespace() {
-                if let Some(mv) = crate::uci::parse_move(&replay_board, mv_str) {
-                    make_move(&mut replay_board, mv);
-                    position_hashes.push(replay_board.hash);
-                }
-            }
-        }
-    }
-
-    // Search (run synchronously, then release lock before async GUI update)
-    let result = {
-        let searcher_arc = state.lock().unwrap().persistent_searcher.clone();
-        let mut searcher = searcher_arc.lock().unwrap();
-        searcher.set_position_history(position_hashes);
-        searcher.search_timed(&board, time_for_move)
-    };
-
-    // Update GUI
-    {
-        let mut s = state.lock().unwrap();
-        s.search_info.depth = result.depth;
-        s.search_info.score = result.score;
-        s.search_info.nodes = result.nodes;
-        s.search_info.best_move = result.best_move.to_uci();
-        s.search_info.searching = false;
-        make_move(&mut s.board, result.best_move);
-        s.move_history.push(result.best_move.to_uci());
-    }
-
-    // Send move to Lichess
-    let mv_str = result.best_move.to_uci();
-    let resp = client
-        .post(format!(
-            "https://lichess.org/api/bot/game/{game_id}/move/{mv_str}"
-        ))
-        .bearer_auth(token)
-        .send()
-        .await;
-
-    match resp {
-        Ok(r) if r.status().is_success() => Some(mv_str),
-        Ok(r) => {
-            let body = r.text().await.unwrap_or_default();
-            let mut s = state.lock().unwrap();
-            s.lichess_log
-                .push(format!("Move failed: {body}"));
-            None
-        }
-        Err(e) => {
-            let mut s = state.lock().unwrap();
-            s.lichess_log
-                .push(format!("Move error: {e}"));
-            None
-        }
     }
 }
 

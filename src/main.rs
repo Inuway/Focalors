@@ -4,7 +4,6 @@ mod board;
 mod db;
 mod eval;
 mod gui;
-mod lichess;
 mod movegen;
 mod moves;
 mod nnue;
@@ -22,35 +21,11 @@ mod uci;
 mod zobrist;
 
 fn main() {
-    // Load .env file if present (sets env vars like LICHESS_TOKEN)
-    if let Ok(contents) = std::fs::read_to_string(".env") {
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                // SAFETY: called at startup before any threads are spawned
-                unsafe { std::env::set_var(key.trim(), value.trim()) };
-            }
-        }
-    }
-
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("gui") => {
             // Desktop GUI mode
             gui::run_gui();
-        }
-        Some("lichess") => {
-            attacks::init();
-            // Initialize NNUE (will use embedded net or fall back to HCE)
-            match nnue::init(None) {
-                Ok(()) => eprintln!("info string NNUE initialized"),
-                Err(_) => eprintln!("info string NNUE not available, using HCE"),
-            }
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(lichess::run());
         }
         Some("tune") => {
             let dataset = args.get(2).expect("Usage: focalors tune <dataset_file>");
@@ -133,10 +108,9 @@ fn main() {
         }
         Some(other) => {
             eprintln!("Unknown mode: {other}");
-            eprintln!("Usage: focalors [uci|gui|lichess|tune|selfplay|train|promote]");
+            eprintln!("Usage: focalors [uci|gui|tune|selfplay|train|promote]");
             eprintln!("  uci                    — UCI protocol mode (default, for chess GUIs)");
-            eprintln!("  gui                    — Desktop GUI with board and Lichess controls");
-            eprintln!("  lichess                — Headless Lichess bot (needs LICHESS_TOKEN env var)");
+            eprintln!("  gui                    — Desktop GUI for local play, review, and stats");
             eprintln!("  tune <dataset>         — Texel tuning (HCE weight optimization)");
             eprintln!("  train <data> [opts]    — Train NNUE net from self-play data");
             eprintln!("  selfplay <games> <out> — Generate NNUE training data via self-play");
