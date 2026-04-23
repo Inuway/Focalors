@@ -24,7 +24,7 @@ Keep changes focused. If a patch touches the engine, the GUI, and the docs all a
 
 The GUI is intentionally compact rather than dashboard-heavy. New features land best when they fit the existing layout instead of adding new top-level surfaces.
 
-Don't commit `.env`, secrets, or anything under `target/`.
+Don't commit secrets or anything under `target/`.
 
 ## CI and releases
 
