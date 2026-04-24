@@ -24,6 +24,7 @@ pub struct EngineSettings {
     pub think_time_ms: u64,
     pub tt_size_mb: usize,
     pub use_time_limit: bool, // true = time-based, false = depth-based
+    pub analysis_depth: u32,
 }
 
 impl Default for EngineSettings {
@@ -33,6 +34,7 @@ impl Default for EngineSettings {
             think_time_ms: 5000,
             tt_size_mb: 64,
             use_time_limit: true,
+            analysis_depth: 14,
         }
     }
 }
@@ -104,15 +106,17 @@ enum LocalDifficulty {
     Tournament,
     Master,
     Adaptive,
+    Custom,
 }
 
 impl LocalDifficulty {
-    const ALL: [LocalDifficulty; 5] = [
+    const ALL: [LocalDifficulty; 6] = [
         LocalDifficulty::Beginner,
         LocalDifficulty::Club,
         LocalDifficulty::Tournament,
         LocalDifficulty::Master,
         LocalDifficulty::Adaptive,
+        LocalDifficulty::Custom,
     ];
 
     fn label(self) -> &'static str {
@@ -122,6 +126,7 @@ impl LocalDifficulty {
             LocalDifficulty::Tournament => "Tournament",
             LocalDifficulty::Master => "Master",
             LocalDifficulty::Adaptive => "Adaptive",
+            LocalDifficulty::Custom => "Custom",
         }
     }
 
@@ -132,6 +137,7 @@ impl LocalDifficulty {
             LocalDifficulty::Tournament => crate::strength::TOURNAMENT_LEVEL,
             LocalDifficulty::Master => crate::strength::MASTER_LEVEL,
             LocalDifficulty::Adaptive => adaptive_level,
+            LocalDifficulty::Custom => crate::strength::MASTER_LEVEL,
         }
     }
 
@@ -146,6 +152,7 @@ impl LocalDifficulty {
                 adaptive_level,
                 crate::strength::estimated_elo(adaptive_level),
             ),
+            LocalDifficulty::Custom => "Uses the values from Advanced engine settings (depth, time, TT).".into(),
         }
     }
 }
@@ -2364,6 +2371,7 @@ impl FocalorsApp {
         self.analysis_review_cursor = 0;
 
         let user_rating = self.profile.as_ref().map_or(1200, |p| p.rating);
+        let analysis_depth = self.state.lock().unwrap().engine_settings.analysis_depth;
 
         thread::spawn(move || {
             crate::attacks::init();
@@ -2371,7 +2379,7 @@ impl FocalorsApp {
             let result = crate::analysis::analyze_game(
                 &uci_moves,
                 user_color,
-                14, // analysis depth
+                analysis_depth,
                 use_nnue,
                 &mut |cur, tot| {
                     let mut a = analysis_state.lock().unwrap();
@@ -2913,6 +2921,7 @@ impl FocalorsApp {
                             .color(hydra_subtle_text()),
                     );
                     ui.horizontal(|ui| {
+                        let prev_difficulty = self.local_difficulty;
                         egui::ComboBox::from_id_salt("home_local_difficulty")
                             .selected_text(self.local_difficulty.label())
                             .width(180.0)
@@ -2925,7 +2934,14 @@ impl FocalorsApp {
                                     );
                                 }
                             });
-                        if ui.add(secondary_button("Advanced")).clicked() {
+                        if self.local_difficulty != prev_difficulty
+                            && self.local_difficulty == LocalDifficulty::Custom
+                        {
+                            self.show_advanced_engine_settings = true;
+                        }
+                        if self.local_difficulty == LocalDifficulty::Custom
+                            && ui.add(secondary_button("Advanced")).clicked()
+                        {
                             self.show_advanced_engine_settings = true;
                         }
                     });
@@ -3151,7 +3167,7 @@ impl FocalorsApp {
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "Manual tuning for analysis runs. Timed local games still use the selected difficulty profile.",
+                        "Active for analysis runs and the Custom local-game profile. Other difficulty profiles ignore these settings.",
                     )
                     .size(11.0)
                     .color(hydra_subtle_text()),
@@ -4369,6 +4385,16 @@ fn draw_engine_settings_controls(
         let mut mb = settings.tt_size_mb as i32;
         ui.add(egui::Slider::new(&mut mb, 1..=256).suffix(" MB"));
         settings.tt_size_mb = mb as usize;
+
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Analysis depth (game review)")
+                .size(11.0)
+                .color(hydra_subtle_text()),
+        );
+        let mut analysis_depth = settings.analysis_depth as i32;
+        ui.add(egui::Slider::new(&mut analysis_depth, 1..=30));
+        settings.analysis_depth = analysis_depth as u32;
     });
 }
 
@@ -4644,6 +4670,22 @@ fn local_engine_search_request(
         .local_game
         .time_control
         .displayed_remaining_ms(side_to_move, Some(side_to_move));
+    let safe_max_ms = remaining_ms.saturating_sub(50).max(1);
+
+    if state.local_game.difficulty == LocalDifficulty::Custom {
+        let settings = &state.engine_settings;
+        let (time_limit_ms, depth_cap) = if settings.use_time_limit {
+            (settings.think_time_ms.min(safe_max_ms), None)
+        } else {
+            (safe_max_ms, Some(settings.max_depth))
+        };
+        return Some(LocalSearchRequest {
+            time_limit_ms,
+            depth_cap,
+            generation: state.local_search_generation,
+            strength_config: strength_config.clone(),
+        });
+    }
 
     let (base_time_ms, _) = uci::allocate_time(
         remaining_ms,
@@ -4651,7 +4693,6 @@ fn local_engine_search_request(
         None,
     );
     let scaled_time_ms = ((base_time_ms as f32) * strength_config.time_scale).round() as u64;
-    let safe_max_ms = remaining_ms.saturating_sub(50).max(1);
     let min_time_ms = safe_max_ms.min(80);
     let time_limit_ms = scaled_time_ms
         .max(min_time_ms)
