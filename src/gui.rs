@@ -397,7 +397,8 @@ struct DragState {
 
 #[derive(Clone)]
 struct LocalSearchRequest {
-    time_limit_ms: u64,
+    soft_time_ms: u64,
+    hard_time_ms: u64,
     depth_cap: Option<u32>,
     generation: u64,
     strength_config: crate::strength::StrengthConfig,
@@ -3727,11 +3728,12 @@ impl FocalorsApp {
             searcher.set_position_history(position_hashes);
 
             let result = if let Some(ref request) = local_request {
-                if let Some(depth_cap) = request.depth_cap {
-                    searcher.search_timed_with_depth_cap(&board, request.time_limit_ms, depth_cap)
-                } else {
-                    searcher.search_timed(&board, request.time_limit_ms)
-                }
+                searcher.search_with_time_management_capped(
+                    &board,
+                    request.soft_time_ms,
+                    request.hard_time_ms,
+                    request.depth_cap,
+                )
             } else if settings.use_time_limit {
                 searcher.search_timed(&board, settings.think_time_ms)
             } else {
@@ -4674,13 +4676,16 @@ fn local_engine_search_request(
 
     if state.local_game.difficulty == LocalDifficulty::Custom {
         let settings = &state.engine_settings;
-        let (time_limit_ms, depth_cap) = if settings.use_time_limit {
-            (settings.think_time_ms.min(safe_max_ms), None)
+        let (soft_time_ms, hard_time_ms, depth_cap) = if settings.use_time_limit {
+            let hard = settings.think_time_ms.min(safe_max_ms);
+            let soft = (hard / 2).max(1);
+            (soft, hard, None)
         } else {
-            (safe_max_ms, Some(settings.max_depth))
+            (safe_max_ms, safe_max_ms, Some(settings.max_depth))
         };
         return Some(LocalSearchRequest {
-            time_limit_ms,
+            soft_time_ms,
+            hard_time_ms,
             depth_cap,
             generation: state.local_search_generation,
             strength_config: strength_config.clone(),
@@ -4694,13 +4699,15 @@ fn local_engine_search_request(
     );
     let scaled_time_ms = ((base_time_ms as f32) * strength_config.time_scale).round() as u64;
     let min_time_ms = safe_max_ms.min(80);
-    let time_limit_ms = scaled_time_ms
+    let hard_time_ms = scaled_time_ms
         .max(min_time_ms)
         .max(strength_config.min_think_ms)
         .min(safe_max_ms);
+    let soft_time_ms = (hard_time_ms * 4 / 10).max(min_time_ms.min(hard_time_ms));
 
     Some(LocalSearchRequest {
-        time_limit_ms,
+        soft_time_ms,
+        hard_time_ms,
         depth_cap: strength_config.max_depth,
         generation: state.local_search_generation,
         strength_config: strength_config.clone(),

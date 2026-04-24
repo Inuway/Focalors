@@ -109,23 +109,25 @@ impl Searcher {
         soft_ms: u64,
         hard_ms: u64,
     ) -> SearchResult {
+        self.search_with_time_management_capped(board, soft_ms, hard_ms, None)
+    }
+
+    /// Search with soft/hard time limits and an optional depth cap. The soft
+    /// limit enables best-move stability early-exit; the hard limit is the
+    /// absolute stop. `max_depth = None` means unlimited (up to MAX_DEPTH).
+    pub fn search_with_time_management_capped(
+        &mut self,
+        board: &Board,
+        soft_ms: u64,
+        hard_ms: u64,
+        max_depth: Option<u32>,
+    ) -> SearchResult {
         let now = Instant::now();
         self.soft_limit = Some(now + Duration::from_millis(soft_ms));
         self.stop_time = Some(now + Duration::from_millis(hard_ms));
         self.stopped = false;
-        self.search_internal(board, MAX_DEPTH)
-    }
-
-    pub fn search_timed_with_depth_cap(
-        &mut self,
-        board: &Board,
-        time_ms: u64,
-        max_depth: u32,
-    ) -> SearchResult {
-        self.stop_time = Some(Instant::now() + Duration::from_millis(time_ms));
-        self.soft_limit = None;
-        self.stopped = false;
-        self.search_internal(board, max_depth.min(MAX_DEPTH))
+        let depth = max_depth.unwrap_or(MAX_DEPTH).min(MAX_DEPTH);
+        self.search_internal(board, depth)
     }
 
     fn check_time(&mut self) {
@@ -283,17 +285,31 @@ impl Searcher {
                 break;
             }
 
-            // Smart early termination: stable best move + past soft limit
+            // Smart early termination: stable best move + past soft limit.
+            // Two tiers — strict at soft, lenient halfway from soft to hard,
+            // so positions with naturally shallow stability (e.g. opening)
+            // still get early-exit benefit.
             if let Some(soft) = self.soft_limit {
-                if self.best_move_stability >= 3 && Instant::now() >= soft {
-                    break;
-                }
-                // If score is swinging wildly, don't stop at soft limit
-                if (score - prev_score).abs() <= 30
-                    && self.best_move_stability >= 2
-                    && Instant::now() >= soft
-                {
-                    break;
+                let now = Instant::now();
+                if now >= soft {
+                    if self.best_move_stability >= 3 {
+                        break;
+                    }
+                    if (score - prev_score).abs() <= 30 && self.best_move_stability >= 2 {
+                        break;
+                    }
+                    if let Some(hard) = self.stop_time {
+                        let window = hard.saturating_duration_since(soft);
+                        let elapsed_in_window = now.saturating_duration_since(soft);
+                        if elapsed_in_window * 2 >= window {
+                            if self.best_move_stability >= 1 {
+                                break;
+                            }
+                            if (score - prev_score).abs() <= 60 {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -974,6 +990,17 @@ mod tests {
         // Should stop well before the hard limit due to move stability.
         // The generous threshold accounts for unoptimized debug builds on slow CI runners.
         assert!(elapsed < Duration::from_millis(3000), "Should use smart early stop: {:?}", elapsed);
+    }
+
+    #[test]
+    fn capped_time_management_respects_depth_cap() {
+        attacks::init();
+        let board = Board::startpos();
+        let mut searcher = Searcher::new(16);
+        // Generous time bounds, tight depth cap — depth must dominate.
+        let result = searcher.search_with_time_management_capped(&board, 5000, 10000, Some(3));
+        assert!(!result.best_move.is_null());
+        assert!(result.depth <= 3, "Depth cap not respected: got {}", result.depth);
     }
 
     #[test]
