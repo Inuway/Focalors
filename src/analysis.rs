@@ -1,9 +1,14 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
+
 use crate::attacks;
 use crate::board::Board;
 use crate::eval::{self, EvalBreakdown, Score};
 use crate::movegen::{generate_legal_moves, make_move};
 use crate::moves::{Move, MoveFlag};
-use crate::search::Searcher;
+use crate::search::{SearchResult, Searcher};
 use crate::types::*;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -106,8 +111,29 @@ pub struct GameAnalysis {
 // Analysis runner
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Analyze a complete game. Calls `progress_fn` with (current_move, total_moves)
-/// after each position is analyzed.
+/// Per-position state collected sequentially before parallel search.
+struct PreparedPosition {
+    board: Board,
+    board_after: Board,
+    played_mv: Move,
+    is_forced: bool,
+    move_number: usize,
+    side: Color,
+    san: String,
+    eval_before: Score,
+    eval_after: Score,
+}
+
+/// Per-thread TT size for parallel analysis. Total memory grows linearly with
+/// thread count; 16 MB per worker is enough for high TT hit rates within a
+/// single position search and keeps a 16-thread machine under 256 MB total.
+const ANALYSIS_TT_MB_PER_THREAD: usize = 16;
+
+/// Analyze a complete game. Searches positions in parallel across worker
+/// threads (one `Searcher` per worker, no shared mutable state). The
+/// `progress_fn` callback is invoked from the main thread after each
+/// completion — the `current` count is monotonic, but the underlying
+/// positions may finish out of order.
 pub fn analyze_game(
     uci_moves: &[String],
     user_color: Color,
@@ -116,82 +142,138 @@ pub fn analyze_game(
     progress_fn: &mut dyn FnMut(usize, usize),
 ) -> GameAnalysis {
     let total = uci_moves.len();
-    let mut searcher = Searcher::new(64); // reuse TT across all positions
-    searcher.use_nnue = use_nnue;
     let mut board = Board::startpos();
-    let mut analysis = Vec::with_capacity(total);
     let mut eval_history = Vec::with_capacity(total + 1);
+    eval_history.push(eval::evaluate(&board));
 
-    // Initial position eval
-    let init_eval = eval::evaluate(&board);
-    eval_history.push(init_eval);
-
-    for (i, uci_move) in uci_moves.iter().enumerate() {
+    // ── Phase 1: sequential pre-pass — collect everything cheap ────────
+    let mut prepared: Vec<Option<PreparedPosition>> = Vec::with_capacity(total);
+    for uci_move in uci_moves.iter() {
         let side = board.side_to_move;
-        let move_number = i / 2 + 1;
+        let move_number = prepared.len() / 2 + 1;
 
         let legal_moves = generate_legal_moves(&board);
-
-        // Parse the played move
         let played_mv = match crate::uci::parse_move(&board, uci_move) {
             Some(m) => m,
             None => {
-                // Can't parse move — skip
-                progress_fn(i + 1, total);
+                prepared.push(None);
                 continue;
             }
         };
 
-        // Check if forced (only one legal move)
         let is_forced = legal_moves.len() == 1;
-
-        // Eval before this move (from White's perspective)
         let eval_before = to_white_perspective(eval::evaluate(&board), side);
-
-        // Find engine's best move and eval
-        let search_result = searcher.search(&board, depth);
-        let best_eval = to_white_perspective(search_result.score, side);
-        let best_move_uci = search_result.best_move.to_uci();
-
-        // Apply the played move and get eval after
         let san = crate::db::uci_to_san(&board, uci_move);
         let mut board_after = board.clone();
         make_move(&mut board_after, played_mv);
         let eval_after = to_white_perspective(eval::evaluate(&board_after), board_after.side_to_move);
-
         eval_history.push(eval_after);
 
-        // Centipawn loss: how much worse was the played move vs the best?
-        // From the moving side's perspective
-        let played_eval_for_side = to_side_perspective(eval_after, side);
-        let best_eval_for_side = to_side_perspective(best_eval, side);
+        prepared.push(Some(PreparedPosition {
+            board: board.clone(),
+            board_after: board_after.clone(),
+            played_mv,
+            is_forced,
+            move_number,
+            side,
+            san,
+            eval_before,
+            eval_after,
+        }));
+
+        board = board_after;
+    }
+
+    // ── Phase 2: parallel search ───────────────────────────────────────
+    let work_count = prepared.iter().filter(|p| p.is_some()).count();
+    let n_workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(work_count.max(1));
+
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let prepared_arc: Arc<Vec<Option<PreparedPosition>>> = Arc::new(prepared);
+    let mut search_results: Vec<Option<SearchResult>> = (0..total).map(|_| None).collect();
+    let (tx, rx) = mpsc::channel::<(usize, Option<SearchResult>)>();
+
+    thread::scope(|s| {
+        for _ in 0..n_workers {
+            let cursor = Arc::clone(&cursor);
+            let prepared = Arc::clone(&prepared_arc);
+            let tx = tx.clone();
+            s.spawn(move || {
+                let mut searcher = Searcher::new(ANALYSIS_TT_MB_PER_THREAD);
+                searcher.use_nnue = use_nnue;
+                searcher.silent = true;
+                loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= prepared.len() {
+                        break;
+                    }
+                    let result = prepared[i]
+                        .as_ref()
+                        .map(|p| searcher.search(&p.board, depth));
+                    if tx.send((i, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx); // close the original sender so rx terminates when workers exit
+
+        let mut completed = 0usize;
+        while let Ok((i, result)) = rx.recv() {
+            search_results[i] = result;
+            completed += 1;
+            progress_fn(completed, total);
+        }
+    });
+
+    let prepared = Arc::into_inner(prepared_arc)
+        .expect("worker threads should have dropped all Arc clones before scope exit");
+
+    // ── Phase 3: sequential post-processing ────────────────────────────
+    let mut analysis = Vec::with_capacity(total);
+    for (i, prep_opt) in prepared.into_iter().enumerate() {
+        let prep = match prep_opt {
+            Some(p) => p,
+            None => continue,
+        };
+        let search_result = match search_results[i].take() {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let best_eval = to_white_perspective(search_result.score, prep.side);
+        let best_move_uci = search_result.best_move.to_uci();
+
+        let played_eval_for_side = to_side_perspective(prep.eval_after, prep.side);
+        let best_eval_for_side = to_side_perspective(best_eval, prep.side);
         let cpl = (best_eval_for_side - played_eval_for_side).max(0);
 
-        // Detect sacrifice: material went down but eval stayed stable
-        let mat_before = material_count(&board, side);
-        let mat_after = material_count(&board_after, side);
+        let mat_before = material_count(&prep.board, prep.side);
+        let mat_after = material_count(&prep.board_after, prep.side);
         let was_sacrifice = mat_after < mat_before - 100 && cpl <= 20;
 
-        let classification = if is_forced {
+        let classification = if prep.is_forced {
             MoveClass::Forced
         } else {
             MoveClass::from_cpl(cpl, was_sacrifice)
         };
 
-        // Compute explanation for every meaningful classification.
         let explanation = if matches!(classification, MoveClass::Best | MoveClass::Forced) {
             None
         } else {
-            let bb = eval::eval_components(&board);
-            let ba = eval::eval_components(&board_after);
+            let bb = eval::eval_components(&prep.board);
+            let ba = eval::eval_components(&prep.board_after);
             Some(generate_explanation(
-                &board,
-                &board_after,
+                &prep.board,
+                &prep.board_after,
                 &bb,
                 &ba,
-                side,
-                &san,
-                played_mv,
+                prep.side,
+                &prep.san,
+                prep.played_mv,
                 &best_move_uci,
                 &search_result.pv,
                 cpl,
@@ -200,21 +282,17 @@ pub fn analyze_game(
         };
 
         analysis.push(MoveAnalysis {
-            move_number,
-            side,
-            move_san: san,
-            eval_before,
-            eval_after,
+            move_number: prep.move_number,
+            side: prep.side,
+            move_san: prep.san,
+            eval_before: prep.eval_before,
+            eval_after: prep.eval_after,
             best_move_uci,
             best_eval,
             cpl,
             classification,
             explanation,
         });
-
-        // Advance the board
-        board = board_after;
-        progress_fn(i + 1, total);
     }
 
     // Compute accuracy
