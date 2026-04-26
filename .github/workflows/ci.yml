@@ -70,7 +70,7 @@ jobs:
 
       - name: Build portable release binary (Linux)
         if: runner.os == 'Linux'
-        run: cargo rustc --release --locked --bin focalors -- -C target-cpu=x86-64
+        run: cargo rustc --release --locked --bin focalors -- -C target-cpu=x86-64-v3
 
       - name: Build portable release binary (macOS)
         if: runner.os == 'macOS'
@@ -79,7 +79,7 @@ jobs:
       - name: Build portable release binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: cargo rustc --release --locked --bin focalors -- -C target-cpu=x86-64
+        run: cargo rustc --release --locked --bin focalors -- -C target-cpu=x86-64-v3
 
       - name: Assemble release bundle (Unix)
         if: runner.os != 'Windows'

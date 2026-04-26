@@ -12,7 +12,7 @@ cargo build --release
 ./target/release/focalors gui
 ```
 
-The repo's `.cargo/config.toml` sets `target-cpu=native` for local builds — handy when iterating but not portable. The GitHub Actions release workflow builds with `target-cpu=x86-64` for the binaries it attaches to releases, so distributed builds run on any 64-bit machine.
+The repo's `.cargo/config.toml` sets `target-cpu=native` for local builds — handy when iterating but not portable. The GitHub Actions release workflow builds Linux/Windows binaries with `target-cpu=x86-64-v3` (AVX2 baseline, supported by every Intel/AMD x86 CPU from 2013 onward). macOS builds default to Apple Silicon. Pre-2013 x86 hardware can compile from source instead.
 
 ## Engine development
 

@@ -237,6 +237,35 @@ mod tests {
         let _ = init_random();
     }
 
+    /// Times the NNUE forward pass. Run with:
+    ///   cargo test --release bench_nnue_forward -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_nnue_forward() {
+        crate::attacks::init();
+        init_test_net();
+
+        let board = Board::startpos();
+        let mut state = NnueState::new();
+        state.refresh(&board, 0);
+
+        // Warmup — let CPU caches settle
+        for _ in 0..10_000 {
+            std::hint::black_box(state.evaluate_at_ply(&board, 0));
+        }
+
+        let n = 1_000_000;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(state.evaluate_at_ply(&board, 0));
+        }
+        let elapsed = start.elapsed();
+        let per_call_ns = elapsed.as_nanos() / n as u128;
+        let evals_per_sec = n as f64 / elapsed.as_secs_f64();
+
+        println!("forward pass: {per_call_ns} ns/call ({evals_per_sec:.0} evals/sec)");
+    }
+
     #[test]
     fn evaluate_startpos_does_not_crash() {
         crate::attacks::init();
