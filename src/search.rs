@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::attacks;
@@ -31,7 +33,7 @@ const SEE_VALUE: [Score; Piece::COUNT] = [100, 320, 330, 500, 900, 20000];
 
 pub struct Searcher {
     pub nodes: u64,
-    pub tt: TranspositionTable,
+    pub tt: Arc<TranspositionTable>,
     pawn_ht: crate::eval::PawnHashTable,
     nnue: nnue::NnueState,
     pub use_nnue: bool,
@@ -52,13 +54,32 @@ pub struct Searcher {
     best_move_stability: u32,
     search_start: Option<Instant>,
     pub silent: bool,
+    /// Iterative deepening starting depth. Default 1. Lazy SMP helper
+    /// threads use 2 to skip the trivial first iteration and reach deeper
+    /// faster, contributing more useful TT entries.
+    pub start_depth: u32,
+    /// Initial aspiration window half-width in centipawns. Default 25.
+    /// Lazy SMP threads vary this so they probe different score ranges.
+    pub aspiration_delta: i32,
+    /// External stop flag for Lazy SMP. When set, every thread checking
+    /// time also observes this flag and exits. None for single-thread
+    /// search.
+    pub external_stop: Option<Arc<AtomicBool>>,
 }
 
 impl Searcher {
+    /// Build a Searcher with its own freshly-allocated TT. Used by single-
+    /// thread callers (UCI, selfplay, GUI's persistent searcher, tests).
     pub fn new(tt_size_mb: usize) -> Self {
+        Self::with_shared_tt(Arc::new(TranspositionTable::new(tt_size_mb)))
+    }
+
+    /// Build a Searcher that shares an existing TT with other Searchers.
+    /// Used by Lazy SMP so all worker threads cooperate via one TT.
+    pub fn with_shared_tt(tt: Arc<TranspositionTable>) -> Self {
         Searcher {
             nodes: 0,
-            tt: TranspositionTable::new(tt_size_mb),
+            tt,
             pawn_ht: crate::eval::PawnHashTable::new(1024), // 1MB pawn hash
             nnue: nnue::NnueState::new(),
             use_nnue: false,
@@ -77,6 +98,9 @@ impl Searcher {
             best_move_stability: 0,
             search_start: None,
             silent: false,
+            start_depth: 1,
+            aspiration_delta: 25,
+            external_stop: None,
         }
     }
 
@@ -134,6 +158,11 @@ impl Searcher {
         if self.nodes & 2047 == 0 {
             if let Some(deadline) = self.stop_time {
                 if Instant::now() >= deadline {
+                    self.stopped = true;
+                }
+            }
+            if let Some(ref flag) = self.external_stop {
+                if flag.load(Ordering::Relaxed) {
                     self.stopped = true;
                 }
             }
@@ -204,13 +233,20 @@ impl Searcher {
 
         let mut total_nodes = 0u64;
 
-        for depth in 1..=max_depth {
+        for depth in self.start_depth.max(1)..=max_depth {
             self.nodes = 0;
             self.stopped = false;
 
-            // Check time between iterations
+            // Check time between iterations (and the external Lazy SMP
+            // stop flag, so a sibling thread that finished early can pull
+            // the rest down with it).
             if let Some(deadline) = self.stop_time {
                 if Instant::now() >= deadline {
+                    break;
+                }
+            }
+            if let Some(ref flag) = self.external_stop {
+                if flag.load(Ordering::Relaxed) {
                     break;
                 }
             }
@@ -218,7 +254,7 @@ impl Searcher {
             let (score, mv) = if depth <= 3 {
                 self.negamax(board, depth, -INFINITY, INFINITY, 0, Move::NULL, Move::NULL)
             } else {
-                let mut delta = 25;
+                let mut delta = self.aspiration_delta.max(1);
                 let mut alpha = prev_score - delta;
                 let mut beta = prev_score + delta;
                 loop {
@@ -693,6 +729,103 @@ impl Searcher {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Lazy SMP entry point
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Search a single position with N parallel threads sharing one TT.
+///
+/// Each thread runs its own iterative deepening with the same time bounds.
+/// They cooperate implicitly through the shared TT — entries one thread
+/// computes seed cache hits for the others, and the union of their work
+/// is what makes the multi-thread version reach deeper than single-thread.
+///
+/// All threads return their own `SearchResult`; we pick the deepest one
+/// (ties broken by score) as the move to play. `nodes` reflects the sum
+/// across all threads.
+pub fn search_lazy_smp(
+    tt: Arc<TranspositionTable>,
+    board: &Board,
+    use_nnue: bool,
+    n_threads: usize,
+    soft_ms: u64,
+    hard_ms: u64,
+    max_depth: Option<u32>,
+    position_history: Vec<u64>,
+) -> SearchResult {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
+
+    let n_threads = n_threads.max(1);
+    let total_nodes = Arc::new(AtomicU64::new(0));
+    // Shared stop flag: when any thread finishes its search (via stable
+    // early-exit, depth cap, mate, or hard deadline) it sets this flag
+    // and all other threads exit at the next time check. Without this,
+    // wall-clock time would be the slowest thread's time, not the fastest.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<SearchResult>();
+
+    std::thread::scope(|scope| {
+        for thread_id in 0..n_threads {
+            let tt = Arc::clone(&tt);
+            let total_nodes = Arc::clone(&total_nodes);
+            let stop_flag = Arc::clone(&stop_flag);
+            let position_history = position_history.clone();
+            let board = board.clone();
+            let tx = tx.clone();
+
+            // Per-thread variation: even threads start at depth 1 (normal),
+            // odd threads skip ahead to depth 2 to reach deeper iterations
+            // sooner. Aspiration delta widens for higher thread indices so
+            // different threads probe different score ranges.
+            let start_depth: u32 = if thread_id % 2 == 0 { 1 } else { 2 };
+            let aspiration_delta: i32 = 25 * (1 + thread_id as i32 / 4);
+
+            scope.spawn(move || {
+                let mut searcher = Searcher::with_shared_tt(tt);
+                searcher.use_nnue = use_nnue;
+                searcher.silent = true;
+                searcher.start_depth = start_depth;
+                searcher.aspiration_delta = aspiration_delta;
+                searcher.external_stop = Some(Arc::clone(&stop_flag));
+                searcher.set_position_history(position_history);
+
+                let result = searcher.search_with_time_management_capped(
+                    &board,
+                    soft_ms,
+                    hard_ms,
+                    max_depth,
+                );
+                total_nodes.fetch_add(result.nodes, Ordering::Relaxed);
+                // Tell siblings to wrap up — first finisher wins the wall clock.
+                stop_flag.store(true, Ordering::Relaxed);
+                let _ = tx.send(result);
+            });
+        }
+        drop(tx); // close the original sender so rx terminates after workers exit
+    });
+
+    let mut best: Option<SearchResult> = None;
+    while let Ok(result) = rx.recv() {
+        best = Some(match best {
+            None => result,
+            Some(prev) => {
+                if result.depth > prev.depth
+                    || (result.depth == prev.depth && result.score > prev.score)
+                {
+                    result
+                } else {
+                    prev
+                }
+            }
+        });
+    }
+
+    let mut best = best.expect("at least one worker must produce a result");
+    best.nodes = total_nodes.load(Ordering::Relaxed);
+    best
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Static Exchange Evaluation (SEE)
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1013,5 +1146,29 @@ mod tests {
         let result = searcher.search(&board, 4);
         assert!(!result.best_move.is_null(), "Should find a move with NNUE");
         assert!(result.nodes > 0, "Should search some nodes");
+    }
+
+    #[test]
+    fn lazy_smp_single_thread_returns_legal_move() {
+        attacks::init();
+        let tt = Arc::new(TranspositionTable::new(16));
+        let board = Board::startpos();
+        let result = search_lazy_smp(tt, &board, false, 1, 100, 500, Some(6), Vec::new());
+        assert!(!result.best_move.is_null(), "Should find a move");
+        assert!(result.depth >= 1, "Should reach at least depth 1");
+        assert!(result.nodes > 0, "Should report some nodes");
+    }
+
+    #[test]
+    fn lazy_smp_multi_thread_returns_legal_move() {
+        attacks::init();
+        let tt = Arc::new(TranspositionTable::new(16));
+        let board = Board::startpos();
+        let result = search_lazy_smp(tt, &board, false, 4, 100, 500, Some(6), Vec::new());
+        assert!(!result.best_move.is_null(), "Should find a move");
+        assert!(result.depth >= 1, "Should reach at least depth 1");
+        // Total nodes across all threads should be more than a single-thread search
+        // would do in roughly the same time (sanity check, not strict).
+        assert!(result.nodes > 0, "Should report aggregated nodes");
     }
 }

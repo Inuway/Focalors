@@ -3725,15 +3725,38 @@ impl FocalorsApp {
             // Use persistent searcher for TT reuse across moves
             let searcher_arc = state.lock().unwrap().persistent_searcher.clone();
             let mut searcher = searcher_arc.lock().unwrap();
-            searcher.set_position_history(position_hashes);
+            searcher.set_position_history(position_hashes.clone());
 
             let result = if let Some(ref request) = local_request {
-                searcher.search_with_time_management_capped(
-                    &board,
-                    request.soft_time_ms,
-                    request.hard_time_ms,
-                    request.depth_cap,
-                )
+                if request.depth_cap.is_none() {
+                    // Master / time-bound Custom: Lazy SMP across all cores.
+                    // The TT is shared with the persistent searcher so cross-
+                    // move TT reuse still works.
+                    let tt = searcher.tt.clone();
+                    let use_nnue = searcher.use_nnue;
+                    let n_threads = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1);
+                    crate::search::search_lazy_smp(
+                        tt,
+                        &board,
+                        use_nnue,
+                        n_threads,
+                        request.soft_time_ms,
+                        request.hard_time_ms,
+                        request.depth_cap,
+                        position_hashes,
+                    )
+                } else {
+                    // Beginner / Club / Tournament / depth-bound Custom:
+                    // single-thread is more efficient for shallow depth caps.
+                    searcher.search_with_time_management_capped(
+                        &board,
+                        request.soft_time_ms,
+                        request.hard_time_ms,
+                        request.depth_cap,
+                    )
+                }
             } else if settings.use_time_limit {
                 searcher.search_timed(&board, settings.think_time_ms)
             } else {

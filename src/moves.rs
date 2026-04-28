@@ -77,6 +77,10 @@ impl Move {
         self.0
     }
 
+    pub const fn from_raw(raw: u16) -> Move {
+        Move(raw)
+    }
+
     pub const fn is_null(self) -> bool {
         self.0 == 0
     }
