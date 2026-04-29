@@ -2423,11 +2423,24 @@ impl FocalorsApp {
 
         ui.add_space(8.0);
 
-        // ── Two-column body ────────────────────────────────────────────
+        // ── Two-column body, centered horizontally ─────────────────────
         ui.horizontal_top(|ui| {
+            // Center the board+sidebar block on wide screens by padding the
+            // start of the horizontal layout. Left-pad alone shifts the
+            // whole row right; combined with the fixed widths below it
+            // produces visual centering.
+            let board_w: f32 = 760.0;
+            let gap_w: f32 = 12.0;
+            let right_w: f32 = 420.0;
+            let total = board_w + gap_w + right_w;
+            let avail = ui.available_width();
+            if avail > total {
+                ui.add_space((avail - total) / 2.0);
+            }
+
             // Left: big read-only board
             ui.vertical(|ui| {
-                ui.set_max_width(560.0);
+                ui.set_max_width(board_w);
                 let view = BoardView {
                     board: &board,
                     last_move,
@@ -2458,8 +2471,11 @@ impl FocalorsApp {
 
             ui.add_space(12.0);
 
-            // Right: eval graph + move list + per-move detail
+            // Right: eval graph + move list + per-move detail. Capped so
+            // it doesn't take over on wide screens — the board stays the
+            // visual focus.
             ui.vertical(|ui| {
+                ui.set_max_width(420.0);
                 if let Some(ref ga) = analysis_for_this_game {
                     let points: Vec<[f64; 2]> = ga
                         .eval_history
@@ -2525,88 +2541,101 @@ impl FocalorsApp {
                 }
 
                 ui.label(egui::RichText::new("Moves").size(12.0).strong());
+                ui.add_space(2.0);
+
+                // Grid-based move list: one row per full move, three columns
+                // (number, white move, black move). Each move is a clickable
+                // selectable label, color-coded by classification.
+                let n_pairs = (num_plies + 1) / 2;
+                let render_ply = |ui: &mut egui::Ui, ply: usize, new_cursor: &mut usize| {
+                    if ply >= num_plies {
+                        ui.label("");
+                        return;
+                    }
+                    let san_or_uci = analysis_for_this_game
+                        .as_ref()
+                        .and_then(|ga| ga.moves.get(ply))
+                        .map(|m| m.move_san.clone())
+                        .unwrap_or_else(|| uci_moves.get(ply).cloned().unwrap_or_default());
+                    let class_color = analysis_for_this_game
+                        .as_ref()
+                        .and_then(|ga| ga.moves.get(ply))
+                        .map(|m| classification_color(m.classification))
+                        .unwrap_or_else(hydra_text);
+                    let symbol = analysis_for_this_game
+                        .as_ref()
+                        .and_then(|ga| ga.moves.get(ply))
+                        .map(|m| m.classification.symbol())
+                        .unwrap_or("");
+                    let label = format!("{san_or_uci}{symbol}");
+                    let selected = *new_cursor == ply + 1;
+                    let resp = ui.selectable_label(
+                        selected,
+                        egui::RichText::new(label)
+                            .size(12.0)
+                            .color(class_color)
+                            .monospace(),
+                    );
+                    if resp.clicked() {
+                        *new_cursor = ply + 1;
+                    }
+                };
+
                 egui::ScrollArea::vertical()
                     .id_salt("analyze_move_list")
                     .auto_shrink([false, false])
+                    .max_height(360.0)
                     .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            for ply in 0..num_plies {
-                                let move_no = ply / 2 + 1;
-                                let is_white = ply % 2 == 0;
-                                let san_or_uci = analysis_for_this_game
-                                    .as_ref()
-                                    .and_then(|ga| ga.moves.get(ply))
-                                    .map(|m| m.move_san.clone())
-                                    .unwrap_or_else(|| {
-                                        uci_moves.get(ply).cloned().unwrap_or_default()
-                                    });
-
-                                if is_white {
+                        egui::Grid::new("analyze_moves_grid")
+                            .num_columns(3)
+                            .spacing([10.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for pair_idx in 0..n_pairs {
                                     ui.label(
-                                        egui::RichText::new(format!("{move_no}."))
+                                        egui::RichText::new(format!("{}.", pair_idx + 1))
                                             .size(11.0)
                                             .color(hydra_subtle_text())
                                             .monospace(),
                                     );
+                                    render_ply(ui, pair_idx * 2, &mut new_cursor);
+                                    render_ply(ui, pair_idx * 2 + 1, &mut new_cursor);
+                                    ui.end_row();
                                 }
+                            });
+                    });
 
-                                let class_color = analysis_for_this_game
-                                    .as_ref()
-                                    .and_then(|ga| ga.moves.get(ply))
-                                    .map(|m| classification_color(m.classification))
-                                    .unwrap_or_else(hydra_text);
-                                let symbol = analysis_for_this_game
-                                    .as_ref()
-                                    .and_then(|ga| ga.moves.get(ply))
-                                    .map(|m| m.classification.symbol())
-                                    .unwrap_or("");
-
-                                let label = format!("{san_or_uci}{symbol}");
-                                let selected = new_cursor == ply + 1;
-                                let resp = ui.selectable_label(
-                                    selected,
-                                    egui::RichText::new(label)
-                                        .size(12.0)
-                                        .color(class_color)
-                                        .monospace(),
-                                );
-                                if resp.clicked() {
-                                    new_cursor = ply + 1;
-                                }
-                            }
-                        });
-
-                        // Inline detail for the move that landed us at this cursor
-                        if new_cursor > 0
-                            && let Some(ga) = analysis_for_this_game.as_ref()
-                            && let Some(ma) = ga.moves.get(new_cursor - 1)
-                        {
-                            ui.add_space(8.0);
-                            ui.separator();
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} — CPL {} | Eval {:.2} → {:.2} | Best: {} ({:.2})",
-                                    ma.classification.label(),
-                                    ma.cpl,
-                                    ma.eval_before as f64 / 100.0,
-                                    ma.eval_after as f64 / 100.0,
-                                    ma.best_move_uci,
-                                    ma.best_eval as f64 / 100.0,
-                                ))
+                // Per-move detail, OUTSIDE the scroll area so it stays
+                // visible when the move list scrolls.
+                if new_cursor > 0
+                    && let Some(ga) = analysis_for_this_game.as_ref()
+                    && let Some(ma) = ga.moves.get(new_cursor - 1)
+                {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} — CPL {} | Eval {:.2} → {:.2} | Best: {} ({:.2})",
+                            ma.classification.label(),
+                            ma.cpl,
+                            ma.eval_before as f64 / 100.0,
+                            ma.eval_after as f64 / 100.0,
+                            ma.best_move_uci,
+                            ma.best_eval as f64 / 100.0,
+                        ))
+                        .size(11.0)
+                        .color(hydra_subtle_text()),
+                    );
+                    if let Some(ref expl) = ma.explanation {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(expl)
                                 .size(11.0)
                                 .color(hydra_subtle_text()),
-                            );
-                            if let Some(ref expl) = ma.explanation {
-                                ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new(expl)
-                                        .size(11.0)
-                                        .color(hydra_subtle_text()),
-                                );
-                            }
-                        }
-                    });
+                        );
+                    }
+                }
             });
         });
 
@@ -2652,29 +2681,34 @@ impl FocalorsApp {
             .map_or(false, |h| !h.is_empty());
         let has_games = !self.recent_games.is_empty();
 
-        ui.add_space(12.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("Focalors")
-                        .size(28.0)
-                        .strong()
-                        .color(hydra_accent()),
-                );
-                ui.label(
-                    egui::RichText::new("Train, play, and review chess in one focused workspace.")
-                        .size(13.0)
-                        .color(hydra_subtle_text()),
-                );
+        // Title strip + profile card only on Overview — they're orientation
+        // material, not always-on chrome. Other pages reclaim that vertical
+        // space for their actual content (board, move list, etc.).
+        if self.home_page == HomePage::Overview {
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("Focalors")
+                            .size(28.0)
+                            .strong()
+                            .color(hydra_accent()),
+                    );
+                    ui.label(
+                        egui::RichText::new("Train, play, and review chess in one focused workspace.")
+                            .size(13.0)
+                            .color(hydra_subtle_text()),
+                    );
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    hydra_badge(ui, &status_label, hydra_panel_alt_fill());
+                });
             });
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                hydra_badge(ui, &status_label, hydra_panel_alt_fill());
-            });
-        });
-
-        ui.add_space(12.0);
-        self.draw_profile_card(ui);
+            ui.add_space(12.0);
+            self.draw_profile_card(ui);
+        }
         ui.add_space(14.0);
         ui.horizontal_wrapped(|ui| {
             if ui.add(home_nav_button(self.home_page == HomePage::Overview, "Overview")).clicked() {
