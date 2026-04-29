@@ -63,6 +63,19 @@ impl MoveClass {
         }
     }
 
+    pub fn from_db_str(s: &str) -> Option<MoveClass> {
+        match s {
+            "best" => Some(MoveClass::Best),
+            "good" => Some(MoveClass::Good),
+            "inaccuracy" => Some(MoveClass::Inaccuracy),
+            "mistake" => Some(MoveClass::Mistake),
+            "blunder" => Some(MoveClass::Blunder),
+            "brilliant" => Some(MoveClass::Brilliant),
+            "forced" => Some(MoveClass::Forced),
+            _ => None,
+        }
+    }
+
     pub fn from_cpl(cpl: Score, was_sacrifice: bool) -> Self {
         if was_sacrifice && cpl <= 20 {
             return MoveClass::Brilliant;

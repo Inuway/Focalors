@@ -500,6 +500,68 @@ impl Database {
         Ok(())
     }
 
+    /// Get the saved accuracy for a game, or None if it hasn't been
+    /// analyzed yet.
+    pub fn get_game_accuracy(&self, game_id: i64) -> SqlResult<Option<f64>> {
+        self.conn
+            .query_row(
+                "SELECT user_accuracy FROM games WHERE id = ?1",
+                params![game_id],
+                |row| row.get::<_, Option<f64>>(0),
+            )
+    }
+
+    /// Load saved per-move analysis for a game. Returns an empty Vec if the
+    /// game has never been analyzed (no rows in move_analysis). Rows are
+    /// returned in move order. Explanation is left as `None` — explanations
+    /// are not persisted; callers that want them can regenerate from the
+    /// board state.
+    pub fn get_move_analysis(
+        &self,
+        game_id: i64,
+    ) -> SqlResult<Vec<crate::analysis::MoveAnalysis>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT move_number, side, move_san, eval_before, eval_after,
+                    best_move, best_eval, classification
+             FROM move_analysis
+             WHERE game_id = ?1
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![game_id], |row| {
+            let side_str: String = row.get(1)?;
+            let class_str: String = row.get(7)?;
+            let side = if side_str == "white" {
+                crate::types::Color::White
+            } else {
+                crate::types::Color::Black
+            };
+            let classification = crate::analysis::MoveClass::from_db_str(&class_str)
+                .unwrap_or(crate::analysis::MoveClass::Good);
+            let eval_before: i32 = row.get(3)?;
+            let eval_after: i32 = row.get(4)?;
+            let best_eval: i32 = row.get(6)?;
+            // CPL = max(0, best_eval - played_eval) from the moving side's
+            // perspective. Since stored evals are White-perspective, flip
+            // for Black before comparing.
+            let played_for_side = if side == crate::types::Color::White { eval_after } else { -eval_after };
+            let best_for_side = if side == crate::types::Color::White { best_eval } else { -best_eval };
+            let cpl = (best_for_side - played_for_side).max(0);
+            Ok(crate::analysis::MoveAnalysis {
+                move_number: row.get::<_, i32>(0)? as usize,
+                side,
+                move_san: row.get(2)?,
+                eval_before,
+                eval_after,
+                best_move_uci: row.get(5)?,
+                best_eval,
+                cpl,
+                classification,
+                explanation: None,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Update the user_accuracy field on a game after analysis completes.
     pub fn update_game_accuracy(&self, game_id: i64, accuracy: f64) -> SqlResult<()> {
         self.conn.execute(
