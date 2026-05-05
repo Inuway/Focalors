@@ -23,8 +23,9 @@ mod zobrist;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
-        Some("gui") => {
-            // Desktop GUI mode
+        Some("gui") | None => {
+            // Desktop GUI mode (default when launched with no arguments,
+            // e.g. double-clicking the released binary)
             gui::run_gui();
         }
         Some("tune") => {
@@ -97,7 +98,7 @@ fn main() {
 
             selfplay::run_selfplay(num_games, output, nnue_path, depth, threads, random_plies);
         }
-        Some("uci") | None => {
+        Some("uci") => {
             attacks::init();
             // Initialize NNUE (will use embedded net or fall back to HCE)
             match nnue::init(None) {
@@ -108,9 +109,9 @@ fn main() {
         }
         Some(other) => {
             eprintln!("Unknown mode: {other}");
-            eprintln!("Usage: focalors [uci|gui|tune|selfplay|train|promote]");
-            eprintln!("  uci                    — UCI protocol mode (default, for chess GUIs)");
-            eprintln!("  gui                    — Desktop GUI for local play, review, and stats");
+            eprintln!("Usage: focalors [gui|uci|tune|selfplay|train|promote]");
+            eprintln!("  gui                    — Desktop GUI for local play, review, and stats (default)");
+            eprintln!("  uci                    — UCI protocol mode (for chess GUIs)");
             eprintln!("  tune <dataset>         — Texel tuning (HCE weight optimization)");
             eprintln!("  train <data> [opts]    — Train NNUE net from self-play data");
             eprintln!("  selfplay <games> <out> — Generate NNUE training data via self-play");
