@@ -4,7 +4,7 @@
 //! via `is_x86_feature_detected!` and dispatches to scalar fallback
 //! on non-AVX2 CPUs.
 
-use super::network::{L1_INPUT, L1_SIZE, QA, QB, Network};
+use super::network::{L1_INPUT, L1_SIZE, L2_SIZE, QA, QB, Network};
 
 /// Cached result of CPU feature detection.
 use std::sync::OnceLock;
@@ -133,6 +133,175 @@ pub fn l1_forward(
     l1_forward_scalar(l1_input, net, l1_out);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Layer 2: 32 i32 inputs → 32 i32 outputs, i8 weights, clamp to [0, QB].
+// No division (unlike L1); the QA scaling already happened at L1.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Scalar L2:
+///   l2_out[j] = clamp(bias[j] + sum_i(l1_out[i] * w[i][j]), 0, QB)
+#[inline]
+pub fn l2_forward_scalar(
+    l1_out: &[i32; L1_SIZE],
+    net: &Network,
+    l2_out: &mut [i32; L2_SIZE],
+) {
+    for j in 0..L2_SIZE {
+        let mut sum = net.l2_biases[j];
+        for i in 0..L1_SIZE {
+            sum += l1_out[i] * net.l2_weight(i, j) as i32;
+        }
+        l2_out[j] = sum.clamp(0, QB);
+    }
+}
+
+/// AVX2 L2 — bit-exact equivalent to `l2_forward_scalar`. Same row-major
+/// `[L1_SIZE][L2_SIZE]` weight layout as L1, so the same broadcast-and-
+/// accumulate pattern applies, just with one less inner dimension.
+///
+/// # Safety
+/// Caller must ensure AVX2 support. Enforced by `#[target_feature]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn l2_forward_avx2(
+    l1_out: &[i32; L1_SIZE],
+    net: &Network,
+    l2_out: &mut [i32; L2_SIZE],
+) { unsafe {
+    use std::arch::x86_64::*;
+
+    // 4 accumulators initialized with the 32 i32 biases.
+    let bias_ptr = net.l2_biases.as_ptr() as *const __m256i;
+    let mut acc0 = _mm256_loadu_si256(bias_ptr.add(0));
+    let mut acc1 = _mm256_loadu_si256(bias_ptr.add(1));
+    let mut acc2 = _mm256_loadu_si256(bias_ptr.add(2));
+    let mut acc3 = _mm256_loadu_si256(bias_ptr.add(3));
+
+    let weights_ptr = net.l2_weights.as_ptr();
+
+    for i in 0..L1_SIZE {
+        let x = _mm256_set1_epi32(l1_out[i]);
+
+        // Load 32 i8 weights for input row i.
+        let w_i8 = _mm256_loadu_si256(weights_ptr.add(i * L2_SIZE) as *const __m256i);
+
+        // Sign-extend i8 → i32 (same dance as L1).
+        let lo_i8 = _mm256_extracti128_si256::<0>(w_i8);
+        let hi_i8 = _mm256_extracti128_si256::<1>(w_i8);
+        let lo_i16 = _mm256_cvtepi8_epi16(lo_i8);
+        let hi_i16 = _mm256_cvtepi8_epi16(hi_i8);
+        let w0 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<0>(lo_i16));
+        let w1 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(lo_i16));
+        let w2 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<0>(hi_i16));
+        let w3 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(hi_i16));
+
+        acc0 = _mm256_add_epi32(acc0, _mm256_mullo_epi32(x, w0));
+        acc1 = _mm256_add_epi32(acc1, _mm256_mullo_epi32(x, w1));
+        acc2 = _mm256_add_epi32(acc2, _mm256_mullo_epi32(x, w2));
+        acc3 = _mm256_add_epi32(acc3, _mm256_mullo_epi32(x, w3));
+    }
+
+    // Store sums and clamp scalar (no division for L2).
+    let mut tmp = [0i32; L2_SIZE];
+    let tmp_ptr = tmp.as_mut_ptr() as *mut __m256i;
+    _mm256_storeu_si256(tmp_ptr.add(0), acc0);
+    _mm256_storeu_si256(tmp_ptr.add(1), acc1);
+    _mm256_storeu_si256(tmp_ptr.add(2), acc2);
+    _mm256_storeu_si256(tmp_ptr.add(3), acc3);
+
+    for j in 0..L2_SIZE {
+        l2_out[j] = tmp[j].clamp(0, QB);
+    }
+}}
+
+/// Dispatch to the best available L2 implementation.
+#[inline]
+pub fn l2_forward(
+    l1_out: &[i32; L1_SIZE],
+    net: &Network,
+    l2_out: &mut [i32; L2_SIZE],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            unsafe { l2_forward_avx2(l1_out, net, l2_out); }
+            return;
+        }
+    }
+    l2_forward_scalar(l1_out, net, l2_out);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Layer 3: 32 i32 inputs → 1 i32 output, i8 weights, divide by QB.
+// Single dot product, no per-output broadcast needed.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Scalar L3:
+///   l3_out = (bias + sum_j(l2_out[j] * w[j])) / QB
+#[inline]
+pub fn l3_forward_scalar(l2_out: &[i32; L2_SIZE], net: &Network) -> i32 {
+    let mut output = net.l3_bias;
+    for j in 0..L2_SIZE {
+        output += l2_out[j] * net.l3_weights[j] as i32;
+    }
+    output / QB
+}
+
+/// AVX2 L3 — bit-exact equivalent to `l3_forward_scalar`. Loads all 32 i32
+/// inputs and 32 i8 weights, sign-extends weights to i32, multiplies pairwise,
+/// and reduces horizontally to one scalar.
+///
+/// # Safety
+/// Caller must ensure AVX2 support. Enforced by `#[target_feature]`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn l3_forward_avx2(l2_out: &[i32; L2_SIZE], net: &Network) -> i32 { unsafe {
+    use std::arch::x86_64::*;
+
+    // Load l2_out: 32 i32 = 4 × __m256i.
+    let l2_ptr = l2_out.as_ptr() as *const __m256i;
+    let l2_0 = _mm256_loadu_si256(l2_ptr.add(0));
+    let l2_1 = _mm256_loadu_si256(l2_ptr.add(1));
+    let l2_2 = _mm256_loadu_si256(l2_ptr.add(2));
+    let l2_3 = _mm256_loadu_si256(l2_ptr.add(3));
+
+    // Load 32 i8 weights, sign-extend to 4 × i32 vectors.
+    let w_i8 = _mm256_loadu_si256(net.l3_weights.as_ptr() as *const __m256i);
+    let lo_i8 = _mm256_extracti128_si256::<0>(w_i8);
+    let hi_i8 = _mm256_extracti128_si256::<1>(w_i8);
+    let lo_i16 = _mm256_cvtepi8_epi16(lo_i8);
+    let hi_i16 = _mm256_cvtepi8_epi16(hi_i8);
+    let w0 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<0>(lo_i16));
+    let w1 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(lo_i16));
+    let w2 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<0>(hi_i16));
+    let w3 = _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(hi_i16));
+
+    // Pairwise multiply, then sum the 4 product vectors into one.
+    let s = _mm256_add_epi32(
+        _mm256_add_epi32(_mm256_mullo_epi32(l2_0, w0), _mm256_mullo_epi32(l2_1, w1)),
+        _mm256_add_epi32(_mm256_mullo_epi32(l2_2, w2), _mm256_mullo_epi32(l2_3, w3)),
+    );
+
+    // Horizontal sum of 8 i32 lanes — store and reduce in scalar (cheap for 8 elems).
+    let mut tmp = [0i32; 8];
+    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, s);
+    let sum = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+
+    (net.l3_bias + sum) / QB
+}}
+
+/// Dispatch to the best available L3 implementation.
+#[inline]
+pub fn l3_forward(l2_out: &[i32; L2_SIZE], net: &Network) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2() {
+            return unsafe { l3_forward_avx2(l2_out, net) };
+        }
+    }
+    l3_forward_scalar(l2_out, net)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +353,73 @@ mod tests {
         // Should not panic; outputs are clamped to [0, QB]
         for &v in &out {
             assert!(v >= 0 && v <= QB);
+        }
+    }
+
+    /// Ensures the AVX2 L2 implementation is bit-exactly equivalent to the scalar code.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn l2_avx2_matches_scalar() {
+        if !has_avx2() {
+            eprintln!("Skipping: AVX2 not available on this CPU");
+            return;
+        }
+
+        let net = Network::random_for_test();
+
+        let mut state = 0xCAFEBABE_u64;
+        for trial in 0..100 {
+            // L1 outputs are post-clamp, so they live in [0, QB].
+            let mut l1_out = [0i32; L1_SIZE];
+            for v in &mut l1_out {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *v = (state % (QB as u64 + 1)) as i32;
+            }
+
+            let mut out_scalar = [0i32; L2_SIZE];
+            let mut out_simd = [0i32; L2_SIZE];
+
+            l2_forward_scalar(&l1_out, &net, &mut out_scalar);
+            unsafe { l2_forward_avx2(&l1_out, &net, &mut out_simd); }
+
+            assert_eq!(
+                out_scalar, out_simd,
+                "Trial {trial}: L2 AVX2 output diverges from scalar"
+            );
+        }
+    }
+
+    /// Ensures the AVX2 L3 implementation is bit-exactly equivalent to the scalar code.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn l3_avx2_matches_scalar() {
+        if !has_avx2() {
+            eprintln!("Skipping: AVX2 not available on this CPU");
+            return;
+        }
+
+        let net = Network::random_for_test();
+
+        let mut state = 0xDEADBEEF_u64;
+        for trial in 0..100 {
+            // L2 outputs are post-clamp, so they live in [0, QB].
+            let mut l2_out = [0i32; L2_SIZE];
+            for v in &mut l2_out {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *v = (state % (QB as u64 + 1)) as i32;
+            }
+
+            let out_scalar = l3_forward_scalar(&l2_out, &net);
+            let out_simd = unsafe { l3_forward_avx2(&l2_out, &net) };
+
+            assert_eq!(
+                out_scalar, out_simd,
+                "Trial {trial}: L3 AVX2 output diverges from scalar"
+            );
         }
     }
 }

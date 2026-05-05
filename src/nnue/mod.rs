@@ -174,26 +174,13 @@ fn forward(acc: &Accumulator, side_to_move: Color, net: &Network) -> Score {
     simd::l1_forward(&l1_input, net, &mut l1_out);
 
     // Step 4: Layer 2 — l1_out[32] * l2_weights[32][32] + l2_biases[32]
+    // Dispatches to AVX2 implementation when available; bit-exact equivalent.
     let mut l2_out = [0i32; L2_SIZE];
-    for j in 0..L2_SIZE {
-        let mut sum = net.l2_biases[j];
-        for i in 0..L1_SIZE {
-            sum += l1_out[i] * net.l2_weight(i, j) as i32;
-        }
-        l2_out[j] = sum.clamp(0, QB);
-    }
+    simd::l2_forward(&l1_out, net, &mut l2_out);
 
-    // Step 5: Output layer — dot product + bias
-    let mut output = net.l3_bias;
-    for j in 0..L2_SIZE {
-        output += l2_out[j] * net.l3_weights[j] as i32;
-    }
-
-    // Scale to centipawns.
-    // The network output is in internal quantized units.
-    // Divide by QB to account for hidden layer quantization.
-    // The result is roughly in centipawn-ish units depending on training.
-    output / QB
+    // Step 5: Output layer — dot product + bias, scaled to centipawn-ish units.
+    // Dispatches to AVX2 implementation when available; bit-exact equivalent.
+    simd::l3_forward(&l2_out, net)
 }
 
 /// The default net shipped with the binary. Embedded at compile time.

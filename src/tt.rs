@@ -164,6 +164,30 @@ impl TranspositionTable {
         }
     }
 
+    /// Hint to the CPU that we're about to probe this slot. Cheap enough to
+    /// call speculatively after we know the child position's hash but before
+    /// we recurse. By the time the child probes the slot the line is warm.
+    /// No-op on architectures without a usable prefetch intrinsic on stable.
+    #[inline(always)]
+    pub fn prefetch(&self, key: u64) {
+        let idx = self.index(key);
+        // Bounds-safe — `index()` masks to a valid range.
+        let slot = &self.entries[idx] as *const AtomicTTEntry;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                slot as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // aarch64 has solid hardware prefetchers; skipping the hint here
+            // avoids a stable-Rust dependency on inline asm or unstable intrinsics.
+            let _ = slot;
+        }
+    }
+
     /// Clear the table. Safe to call from any thread holding a reference,
     /// but should be called when no concurrent searches are in flight.
     pub fn clear(&self) {

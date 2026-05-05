@@ -485,6 +485,7 @@ impl Searcher {
             }
             let mut null_board = board.clone();
             null_board.make_null_move();
+            self.tt.prefetch(null_board.hash);
 
             let null_depth = effective_depth.saturating_sub(1 + NULL_MOVE_REDUCTION);
             let (null_score, _) = self.negamax(
@@ -589,6 +590,7 @@ impl Searcher {
             }
             let mut new_board = board.clone();
             make_move(&mut new_board, mv);
+            self.tt.prefetch(new_board.hash);
 
             // Extension for the TT/singular move
             let ext = if i == 0 && singular_extension > 0 {
@@ -716,8 +718,11 @@ impl Searcher {
 
         let moves = generate_legal_moves(board);
 
-        // Collect and order captures by SEE
-        let mut captures: Vec<(Move, Score)> = Vec::new();
+        // Collect and order captures by SEE — stack-bounded, no heap alloc
+        // in the quiescence hot path. 256 = MoveList's upper bound, so the
+        // bound is always satisfied by construction.
+        let mut captures: [(Move, Score); 256] = [(Move::NULL, 0); 256];
+        let mut cap_len = 0usize;
         for i in 0..moves.len() {
             let mv = moves[i];
             if !is_capture(board, mv) && !matches!(mv.flag(), MoveFlag::Promotion) {
@@ -725,11 +730,12 @@ impl Searcher {
             }
             let see_val = see(board, mv);
             if see_val < 0 { continue; } // SEE pruning: skip losing captures
-            captures.push((mv, see_val));
+            captures[cap_len] = (mv, see_val);
+            cap_len += 1;
         }
-        captures.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        captures[..cap_len].sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-        for (mv, _) in captures {
+        for &(mv, _) in &captures[..cap_len] {
             if self.use_nnue {
                 self.nnue.push_and_update(board, mv, ply as usize);
             }
@@ -986,14 +992,22 @@ fn order_moves(
     killers: &[Move; 2],
     countermove: Move,
     history: &[[[i32; 64]; 64]; Color::COUNT],
-) -> Vec<Move> {
-    let mut scored: Vec<(Move, Score)> = Vec::with_capacity(moves.len());
-    for i in 0..moves.len() {
+) -> MoveList {
+    // Score moves on a stack-bounded scratch array, sort, then fill the
+    // output MoveList. Avoids the per-node heap allocations the previous
+    // Vec<(Move, Score)> + Vec<Move> pair caused.
+    let n = moves.len();
+    let mut scored: [(Move, Score); 256] = [(Move::NULL, 0); 256];
+    for i in 0..n {
         let mv = moves[i];
-        scored.push((mv, score_move(board, mv, tt_move, killers, countermove, history)));
+        scored[i] = (mv, score_move(board, mv, tt_move, killers, countermove, history));
     }
-    scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    scored.into_iter().map(|(mv, _)| mv).collect()
+    scored[..n].sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    let mut ordered = MoveList::new();
+    for i in 0..n {
+        ordered.push(scored[i].0);
+    }
+    ordered
 }
 
 fn score_move(
