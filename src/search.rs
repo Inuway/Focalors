@@ -31,6 +31,28 @@ const LMP_THRESHOLD: [usize; 5] = [0, 5, 8, 12, 16];
 /// SEE piece values (king = high to avoid capturing it as "cheapest")
 const SEE_VALUE: [Score; Piece::COUNT] = [100, 320, 330, 500, 900, 20000];
 
+/// Anything with `|score| >= MATE_BOUND` is treated as a mate score.
+/// Matches the threshold used by the iterative-deepening early break.
+const MATE_BOUND: Score = MATE_SCORE - 100;
+
+/// Convert a search-context mate score to a position-relative one for TT
+/// storage. Without this, a mate score stored at one ply and later probed
+/// at a different ply (e.g. across moves with a persistent TT) reports the
+/// wrong distance. No-op for non-mate scores.
+fn score_to_tt(score: Score, ply: u32) -> Score {
+    if score >= MATE_BOUND { score + ply as Score }
+    else if score <= -MATE_BOUND { score - ply as Score }
+    else { score }
+}
+
+/// Inverse of `score_to_tt`: rebase a position-relative mate score to the
+/// probing search's current ply. No-op for non-mate scores.
+fn score_from_tt(score: Score, ply: u32) -> Score {
+    if score >= MATE_BOUND { score - ply as Score }
+    else if score <= -MATE_BOUND { score + ply as Score }
+    else { score }
+}
+
 pub struct Searcher {
     pub nodes: u64,
     pub tt: Arc<TranspositionTable>,
@@ -396,7 +418,7 @@ impl Searcher {
             if let Some(entry) = self.tt.probe(hash) {
                 tt_move = entry.best_move;
                 if entry.depth as u32 >= depth && ply > 0 {
-                    let tt_score = entry.score;
+                    let tt_score = score_from_tt(entry.score, ply);
                     match entry.flag {
                         TTFlag::Exact => return (tt_score, entry.best_move),
                         TTFlag::LowerBound => {
@@ -654,7 +676,7 @@ impl Searcher {
                     }
                 }
 
-                self.tt.store(hash, depth as u8, TTFlag::LowerBound, score, mv);
+                self.tt.store(hash, depth as u8, TTFlag::LowerBound, score_to_tt(score, ply), mv);
                 return (score, mv);
             }
 
@@ -668,7 +690,7 @@ impl Searcher {
         }
 
         let flag = if alpha > orig_alpha { TTFlag::Exact } else { TTFlag::UpperBound };
-        self.tt.store(hash, depth as u8, flag, best_score, best_move);
+        self.tt.store(hash, depth as u8, flag, score_to_tt(best_score, ply), best_move);
 
         (best_score, best_move)
     }
@@ -1170,5 +1192,54 @@ mod tests {
         // Total nodes across all threads should be more than a single-thread search
         // would do in roughly the same time (sanity check, not strict).
         assert!(result.nodes > 0, "Should report aggregated nodes");
+    }
+
+    #[test]
+    fn tt_mate_score_helpers_roundtrip() {
+        // Mate-in-3 found at absolute ply 8 (so leaf at ply 8, position at ply 5).
+        let raw = MATE_SCORE - 8;
+        let stored = score_to_tt(raw, 5);
+        assert_eq!(stored, MATE_SCORE - 3, "stored value should be position-relative");
+
+        // Probing at the same ply round-trips.
+        assert_eq!(score_from_tt(stored, 5), raw);
+
+        // Probing the same position at a different absolute ply rebases.
+        let probed_at_7 = score_from_tt(stored, 7);
+        assert_eq!(probed_at_7, MATE_SCORE - 10);
+
+        // Negative mate (being mated) follows the symmetric rule.
+        let losing = -MATE_SCORE + 8;
+        let stored_loss = score_to_tt(losing, 5);
+        assert_eq!(stored_loss, -MATE_SCORE + 3);
+        assert_eq!(score_from_tt(stored_loss, 7), -MATE_SCORE + 10);
+
+        // Non-mate scores are pass-through.
+        assert_eq!(score_to_tt(123, 5), 123);
+        assert_eq!(score_from_tt(-456, 5), -456);
+        assert_eq!(score_to_tt(0, 7), 0);
+
+        // At ply 0 the helpers are no-ops even for mate scores.
+        assert_eq!(score_to_tt(MATE_SCORE - 4, 0), MATE_SCORE - 4);
+        assert_eq!(score_from_tt(MATE_SCORE - 4, 0), MATE_SCORE - 4);
+    }
+
+    #[test]
+    fn mate_still_found_with_persistent_tt() {
+        // Smoke test: re-running a search on the same position with the same
+        // searcher (and thus the same TT) must still find the mate. Catches
+        // any regression where the TT-adjusted score breaks mate detection.
+        attacks::init();
+        let _ = crate::nnue::init(None);
+        let board = Board::from_fen(
+            "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+        ).unwrap();
+
+        let mut searcher = Searcher::new(16);
+        let r1 = searcher.search(&board, 4);
+        assert!(r1.score > MATE_SCORE - 10, "first search should find mate, got {}", r1.score);
+
+        let r2 = searcher.search(&board, 4);
+        assert!(r2.score > MATE_SCORE - 10, "second search must still find mate, got {}", r2.score);
     }
 }
