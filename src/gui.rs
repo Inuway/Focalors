@@ -2095,6 +2095,30 @@ impl FocalorsApp {
         let analysis_depth = self.state.lock().unwrap().engine_settings.analysis_depth;
 
         thread::spawn(move || {
+            // RAII guard: if this worker exits via panic before the Complete
+            // assignment below, AnalysisState would stay Running forever and
+            // the UI spinner would hang. The guard runs on any unwind and
+            // resets state to Idle so the user can retry. On the success path
+            // the state has already moved to Complete, so the guard sees a
+            // non-Running state and does nothing.
+            struct ResetGuard(Arc<Mutex<AnalysisState>>);
+            impl Drop for ResetGuard {
+                fn drop(&mut self) {
+                    let mut a = match self.0.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if matches!(*a, AnalysisState::Running { .. }) {
+                        *a = AnalysisState::Idle;
+                        eprintln!(
+                            "focalors: analysis worker exited unexpectedly; \
+                             UI reset to Idle"
+                        );
+                    }
+                }
+            }
+            let _reset_guard = ResetGuard(analysis_state.clone());
+
             crate::attacks::init();
             let use_nnue = crate::nnue::network::get_network().is_some();
             let result = crate::analysis::analyze_game(
@@ -3675,6 +3699,47 @@ impl FocalorsApp {
         };
 
         thread::spawn(move || {
+            // RAII guard: if this worker exits via panic, search_info.searching
+            // would stay `true` forever and the GUI would show the "thinking"
+            // state with no way to recover except restart. On unwind the guard
+            // clears the flag and surfaces a status message — but ONLY if we
+            // are still the active search (generation match). If a newer
+            // search has taken over (e.g. invalidate_local_search bumped the
+            // generation and started another search), our state belongs to
+            // that newer search and we leave it alone. On the success path
+            // the worker explicitly sets searching=false at the end, so the
+            // guard sees a cleared flag and does nothing.
+            struct SearchGuard {
+                state: Arc<Mutex<SharedState>>,
+                our_generation: Option<u64>,
+            }
+            impl Drop for SearchGuard {
+                fn drop(&mut self) {
+                    let mut s = match self.state.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    let still_current = match self.our_generation {
+                        Some(our) => s.local_search_generation == our,
+                        None => true,
+                    };
+                    if !still_current { return; }
+                    if s.search_info.searching {
+                        s.search_info.searching = false;
+                        s.status_message =
+                            "Search failed unexpectedly. Make your move or restart.".to_string();
+                        eprintln!(
+                            "focalors: search worker exited unexpectedly; \
+                             UI reset"
+                        );
+                    }
+                }
+            }
+            let _search_guard = SearchGuard {
+                state: state.clone(),
+                our_generation: local_request.as_ref().map(|r| r.generation),
+            };
+
             let (board, settings) = {
                 let mut s = state.lock().unwrap();
                 s.search_info.searching = true;
