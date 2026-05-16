@@ -1,5 +1,14 @@
-# Build for the local CPU architecture (enables AVX2/BMI2/FMA on Ryzen, etc.)
-# Note: this produces a non-portable binary optimized for the dev's CPU.
-# For distribution, override with --target or build without these flags.
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Local builds use the same target-cpu the CI release workflow uses, so the
+# dev binary has the same instruction set as the binaries users download.
+#
+#   x86_64  (Linux / Windows / Intel Mac): target-cpu=x86-64-v3
+#       AVX2 / BMI1 / BMI2 / FMA baseline, supported by every Intel/AMD CPU
+#       from 2013 onward. Matches the published Linux/Windows release.
+#   aarch64 (Apple Silicon): no override, inherit rustc defaults — matches
+#       the published macOS release, which also sets no target-cpu.
+#
+# Pre-2013 x86 hardware: override this `target-cpu` value (e.g. to
+# `x86-64-v2` or remove the flag entirely) and build from source.
+
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
