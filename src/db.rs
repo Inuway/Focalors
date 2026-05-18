@@ -279,6 +279,31 @@ impl Database {
             "ALTER TABLE games ADD COLUMN rating_after INTEGER",
             [],
         );
+        // UI preferences — added so dark/light mode survives restarts.
+        let _ = self.conn.execute(
+            "ALTER TABLE user_profile ADD COLUMN ui_theme TEXT NOT NULL DEFAULT 'light'",
+            [],
+        );
+        Ok(())
+    }
+
+    /// Read the persisted UI theme preference ('light' or 'dark'). Falls back
+    /// to 'light' if anything goes wrong (missing column on a stale DB, etc.)
+    /// so the GUI always has a usable default.
+    pub fn get_ui_theme(&self) -> SqlResult<String> {
+        self.conn.query_row(
+            "SELECT ui_theme FROM user_profile WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// Persist the UI theme preference.
+    pub fn set_ui_theme(&self, theme: &str) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE user_profile SET ui_theme = ?1, updated_at = datetime('now') WHERE id = 1",
+            params![theme],
+        )?;
         Ok(())
     }
 

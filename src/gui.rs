@@ -193,6 +193,23 @@ impl UiTheme {
             UiTheme::Light => 1,
         }
     }
+
+    /// String form persisted to the SQLite user_profile.ui_theme column.
+    fn as_db_str(self) -> &'static str {
+        match self {
+            UiTheme::Dark => "dark",
+            UiTheme::Light => "light",
+        }
+    }
+
+    /// Inverse of `as_db_str`. Unknown values fall back to Light so a
+    /// corrupted or older DB row doesn't break startup.
+    fn from_db_str(s: &str) -> Self {
+        match s {
+            "dark" => UiTheme::Dark,
+            _ => UiTheme::Light,
+        }
+    }
 }
 
 static ACTIVE_THEME: AtomicU8 = AtomicU8::new(0);
@@ -587,7 +604,9 @@ fn load_piece_texture(
 
 impl FocalorsApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        configure_theme(&cc.egui_ctx, UiTheme::Light);
+        // Theme is configured below once the DB has been opened and the
+        // persisted preference loaded — so the very first frame already
+        // reflects the user's saved choice instead of always being Light.
 
         let state = Arc::new(Mutex::new(SharedState::default()));
 
@@ -679,6 +698,15 @@ impl FocalorsApp {
             .and_then(|db| db.get_adaptive_level().ok())
             .unwrap_or(10);
 
+        // Load the persisted theme (falls back to Light if absent / unparsable)
+        // and apply it to egui's visuals before the first frame.
+        let ui_theme = db
+            .as_ref()
+            .and_then(|db| db.get_ui_theme().ok())
+            .map(|s| UiTheme::from_db_str(&s))
+            .unwrap_or(UiTheme::Light);
+        configure_theme(&cc.egui_ctx, ui_theme);
+
         let session_start_rating = profile.as_ref().map_or(1200, |p| p.rating);
         let session_start_games = profile.as_ref().map_or(0, |p| p.games_played);
 
@@ -692,7 +720,7 @@ impl FocalorsApp {
             welcome_name: String::new(),
             welcome_rating_choice: 1200,
             home_page: HomePage::Overview,
-            ui_theme: UiTheme::Light,
+            ui_theme,
             replay_game: None,
             analysis_state: Arc::new(Mutex::new(AnalysisState::Idle)),
             analysis_review_cursor: 0,
@@ -725,6 +753,11 @@ impl FocalorsApp {
     fn set_ui_theme(&mut self, ctx: &egui::Context, theme: UiTheme) {
         self.ui_theme = theme;
         configure_theme(ctx, theme);
+        // Persist so the choice survives restart. Best-effort: ignore DB
+        // write errors so a transient I/O hiccup never breaks the toggle.
+        if let Some(ref db) = self.db {
+            let _ = db.set_ui_theme(theme.as_db_str());
+        }
     }
 
     fn local_input_enabled(&self) -> bool {
@@ -1681,6 +1714,16 @@ impl FocalorsApp {
         }
         if next_clicked {
             self.start_puzzle_trainer();
+        }
+
+        // Render the chess board below the metadata card. The board reads
+        // self.state.board, which load_puzzle / handle_puzzle_move keep in
+        // sync with the puzzle's current position. Skip on the exit frame
+        // since puzzle_trainer was just cleared and the user is leaving
+        // this surface anyway.
+        if !exit_clicked {
+            ui.add_space(12.0);
+            self.draw_board(ui, None);
         }
     }
 
