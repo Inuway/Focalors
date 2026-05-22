@@ -18,6 +18,7 @@ src/
 ├── nnue/          NNUE inference (incremental accumulators, AVX2)
 ├── trainer.rs     NNUE training loop
 ├── selfplay.rs    self-play data generation
+├── selfmatch.rs   engine-vs-engine match runner for strength benchmarking
 ├── tuning.rs      HCE weight tuning
 ├── db.rs          SQLite persistence
 ├── pgn.rs         PGN import/export
@@ -81,3 +82,59 @@ The HCE side has its own tuner, used independently:
 ```bash
 cargo run --release -- tune dataset.txt
 ```
+
+## Measuring engine strength
+
+After training a new net the obvious question is: did it actually get stronger? A low training loss is a necessary but not sufficient condition — wrong-sign targets, overfitting, or mode collapse can produce a net that fits the dataset well but plays worse. The `selfmatch` subcommand answers the question directly: play N games between two engine configurations and report W/L/D, elo delta vs the standard logistic, a 95% confidence interval, and LOS (likelihood of superiority).
+
+```bash
+./target/release/focalors selfmatch 100 --challenger-net nets/gen2v2.nnue
+```
+
+This loads the embedded default net into Engine A and `nets/gen2v2.nnue` into Engine B (via an alternate-net slot in `nnue/network.rs`), then plays 100 games at fixed depth. All elo numbers are reported from Engine A's perspective — **positive elo means Engine A (the embedded default) is stronger; negative means the challenger is stronger**.
+
+Options:
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--depth N` | `8` | Fixed search depth per move. Higher depth ⇒ stronger play ⇒ more meaningful signal, at the cost of time. ~1 min/100 games at depth 6, a few minutes at depth 8, ~10 min at depth 10. |
+| `--challenger-net PATH` | (none) | NNUE file to load into Engine B. If omitted, both sides use the embedded default — useful only as an infrastructure smoke test. |
+| `--seed N` | wall-clock | Reproducible openings. Pass the same seed to replay the exact same set of games. |
+| `--random-plies N` | `8` | Random plies played at the start of each game from startpos to diversify openings. |
+| `--max-moves N` | `200` | Cap on game length. Reached games are scored as draws. |
+
+The match uses **matched-pair openings**: each random opening is played twice with the engines swapping colors. This is the standard variance-reduction trick used by cutechess-cli / fastchess — any positional imbalance from the random walk cancels across the pair, so the resulting WLD reflects engine strength rather than which side got the better opening.
+
+Interpreting the output:
+
+- **Elo delta** — magnitude tells you the strength gap; sign tells you who's ahead.
+- **95% CI** — the noise floor. A 100-game match at depth 8 typically gives a half-width around ±30–50 elo. If your delta is inside the CI, the match didn't prove anything either way.
+- **LOS** — probability that Engine A is *truly* stronger given the observed WLD. >95% is solid evidence, 80–95% is suggestive, below 80% means you need more games (or the engines are genuinely close).
+
+Game-termination handling mirrors the GUI's: checkmate, stalemate, 50-move rule, insufficient material, threefold repetition, and the max-moves cap.
+
+## Full retraining workflow
+
+The end-to-end loop with validation:
+
+```bash
+# 1. Generate self-play training data with the current net
+cargo run --release -- selfplay 100000 nets/genN-data.bin --nnue nets/current.nnue
+
+# 2. Train, warm-starting from the current net
+cargo run --release -- train nets/genN-data.bin \
+  --resume nets/current.nnue \
+  --epochs 30 \
+  --output nets/genN.nnue
+
+# 3. Validate: does the candidate beat the current embedded net?
+#    Engine A = embedded default (current);  Engine B = candidate (challenger).
+#    NEGATIVE elo + high LOS for B ⇒ candidate is stronger.
+./target/release/focalors selfmatch 100 --challenger-net nets/genN.nnue
+
+# 4. Promote only if the validation match says the candidate is stronger.
+cargo run --release -- promote nets/genN.nnue
+cargo build --release
+```
+
+Step 3 is the safety net: it catches regressions that low training loss alone would miss. Without it, a bad net can sit as the default until you notice the engine playing weaker in actual games. With it, you only promote nets that demonstrably beat the previous default at the depth you tested.

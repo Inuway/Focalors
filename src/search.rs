@@ -96,6 +96,15 @@ impl Searcher {
         Self::with_shared_tt(Arc::new(TranspositionTable::new(tt_size_mb)))
     }
 
+    /// Build a Searcher that reads NNUE evaluations from the alternate
+    /// network slot (set via `nnue::init_alt`). Used by `selfmatch` to run
+    /// two engines with different nets in the same process.
+    pub fn with_alt_nnue(tt_size_mb: usize) -> Self {
+        let mut s = Self::new(tt_size_mb);
+        s.nnue = nnue::NnueState::new_alt();
+        s
+    }
+
     /// Build a Searcher that shares an existing TT with other Searchers.
     /// Used by Lazy SMP so all worker threads cooperate via one TT.
     pub fn with_shared_tt(tt: Arc<TranspositionTable>) -> Self {

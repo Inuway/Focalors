@@ -11,6 +11,7 @@ mod search;
 mod openings;
 mod pgn;
 mod puzzles;
+mod selfmatch;
 mod selfplay;
 mod strength;
 mod trainer;
@@ -98,6 +99,37 @@ fn main() {
 
             selfplay::run_selfplay(num_games, output, nnue_path, depth, threads, random_plies);
         }
+        Some("selfmatch") => {
+            let num_games: usize = args.get(2)
+                .expect("Usage: focalors selfmatch <games> [--depth N] [--challenger-net PATH] [--seed N] [--random-plies N] [--max-moves N]")
+                .parse()
+                .expect("games must be a number");
+
+            let challenger_net: Option<&str> = args.iter().position(|a| a == "--challenger-net")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.as_str());
+
+            let depth: u32 = args.iter().position(|a| a == "--depth")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
+
+            let seed: Option<u64> = args.iter().position(|a| a == "--seed")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok());
+
+            let random_plies: u32 = args.iter().position(|a| a == "--random-plies")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
+
+            let max_moves: usize = args.iter().position(|a| a == "--max-moves")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(200);
+
+            selfmatch::run_selfmatch(num_games, depth, challenger_net, seed, random_plies, max_moves);
+        }
         Some("uci") => {
             attacks::init();
             // Initialize NNUE (will use embedded net or fall back to HCE)
@@ -109,12 +141,13 @@ fn main() {
         }
         Some(other) => {
             eprintln!("Unknown mode: {other}");
-            eprintln!("Usage: focalors [gui|uci|tune|selfplay|train|promote]");
+            eprintln!("Usage: focalors [gui|uci|tune|selfplay|selfmatch|train|promote]");
             eprintln!("  gui                    — Desktop GUI for local play, review, and stats (default)");
             eprintln!("  uci                    — UCI protocol mode (for chess GUIs)");
             eprintln!("  tune <dataset>         — Texel tuning (HCE weight optimization)");
             eprintln!("  train <data> [opts]    — Train NNUE net from self-play data");
             eprintln!("  selfplay <games> <out> — Generate NNUE training data via self-play");
+            eprintln!("  selfmatch <games> [opts] — Run focalors-vs-focalors match (elo delta + LOS)");
             eprintln!("  promote <net.nnue>     — Set a .nnue file as the shipped default");
             std::process::exit(1);
         }

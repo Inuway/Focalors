@@ -24,20 +24,47 @@ const MAX_PLY: usize = 128;
 /// NNUE state for a search: pre-allocated accumulator stack.
 pub struct NnueState {
     accumulators: Vec<Accumulator>,
+    /// When true, consults the alternate network slot (`get_alt_network`).
+    /// Private and set only at construction (`new_alt`) — must not be mutated
+    /// during the Searcher's lifetime, because accumulator state is tied to
+    /// the specific network whose weights produced it.
+    use_alt_net: bool,
 }
 
 impl NnueState {
     pub fn new() -> Self {
+        Self::with_alt(false)
+    }
+
+    /// Construct an NnueState that reads from the alternate network slot.
+    /// Used by self-match to run two engines with different nets in one
+    /// process. The caller must have initialized the alt slot via
+    /// `nnue::init_alt(...)` before any search is performed.
+    pub fn new_alt() -> Self {
+        Self::with_alt(true)
+    }
+
+    fn with_alt(use_alt_net: bool) -> Self {
         let mut accumulators = Vec::with_capacity(MAX_PLY);
         for _ in 0..MAX_PLY {
             accumulators.push(Accumulator::default());
         }
-        NnueState { accumulators }
+        NnueState { accumulators, use_alt_net }
+    }
+
+    /// Resolve which network this state should consult.
+    #[inline]
+    fn net(&self) -> &'static Network {
+        if self.use_alt_net {
+            get_alt_network().expect("NNUE alt network not initialized")
+        } else {
+            get_network().expect("NNUE network not initialized")
+        }
     }
 
     /// Full refresh at the given ply from a board position.
     pub fn refresh(&mut self, board: &Board, ply: usize) {
-        let net = get_network().expect("NNUE network not initialized");
+        let net = self.net();
         self.accumulators[ply].refresh(board, net);
     }
 
@@ -46,7 +73,7 @@ impl NnueState {
     ///
     /// `board` is the position BEFORE the move is made.
     pub fn push_and_update(&mut self, board: &Board, mv: Move, ply: usize) {
-        let net = get_network().expect("NNUE network not initialized");
+        let net = self.net();
         let us = board.side_to_move;
         let them = us.flip();
         let from = mv.from_sq();
@@ -137,7 +164,7 @@ impl NnueState {
 
     /// Evaluate at a specific ply.
     pub fn evaluate_at_ply(&self, board: &Board, ply: usize) -> Score {
-        let net = get_network().expect("NNUE network not initialized");
+        let net = self.net();
         forward(&self.accumulators[ply], board.side_to_move, net)
     }
 }
@@ -203,6 +230,19 @@ pub fn init(path: Option<&str>) -> Result<(), String> {
         // Load the embedded default net
         init_from_bytes(DEFAULT_NET)
     }
+}
+
+/// Initialize the alternate NNUE network slot from a file path. Used by
+/// `focalors selfmatch --challenger-net <path>` so two engines can run
+/// different nets in one process. No DEFAULT_NET fallback — the alt slot
+/// only exists when the user explicitly asks for a challenger.
+pub fn init_alt(path: &str) -> Result<(), String> {
+    if get_alt_network().is_some() {
+        return Ok(()); // already initialized
+    }
+    let data = std::fs::read(path)
+        .map_err(|e| format!("Failed to read alt NNUE net file '{}': {}", path, e))?;
+    init_alt_from_bytes(&data)
 }
 
 /// Evaluate a board position from scratch (no incremental updates).
@@ -449,5 +489,56 @@ mod tests {
         // Accumulators at ply 0 and 1 should be identical
         assert_eq!(state.accumulators[0].white, state.accumulators[1].white);
         assert_eq!(state.accumulators[0].black, state.accumulators[1].black);
+    }
+
+    /// The alt slot must route through ALT_NETWORK, not the primary, so a
+    /// Searcher built with `with_alt_nnue` evaluates with the challenger net.
+    #[test]
+    fn alt_slot_routes_to_alt_network() {
+        crate::attacks::init();
+        init_test_net();
+        let _ = network::init_random_alt();
+
+        let board = Board::startpos();
+
+        let mut default_state = NnueState::new();
+        default_state.refresh(&board, 0);
+        let default_score = default_state.evaluate_at_ply(&board, 0);
+
+        let mut alt_state = NnueState::new_alt();
+        alt_state.refresh(&board, 0);
+        let alt_score = alt_state.evaluate_at_ply(&board, 0);
+
+        // Different seeds → different weights → different scores (with extremely
+        // high probability). If this fires, the alt slot isn't actually routing.
+        assert_ne!(
+            default_score, alt_score,
+            "Alt slot should produce a different score than the primary slot when seeded differently"
+        );
+    }
+
+    /// After initializing the alt slot, the default path must still consult
+    /// the primary network. This guards against the branching helper
+    /// accidentally always returning the alt net.
+    #[test]
+    fn default_path_unchanged_after_alt_init() {
+        crate::attacks::init();
+        init_test_net();
+        let _ = network::init_random_alt();
+
+        let board = Board::startpos();
+
+        // Compute the expected primary-net score using the test helper
+        // (which is hard-wired to `get_network()`).
+        let expected = evaluate_from_board(&board);
+
+        let mut state = NnueState::new();
+        state.refresh(&board, 0);
+        let actual = state.evaluate_at_ply(&board, 0);
+
+        assert_eq!(
+            actual, expected,
+            "Default NnueState must read the primary network even after the alt slot is initialized"
+        );
     }
 }

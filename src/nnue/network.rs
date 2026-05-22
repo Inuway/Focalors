@@ -44,27 +44,51 @@ pub struct Network {
     pub l3_bias: i32,
 }
 
-/// Global network instance.
+/// Primary network instance (loaded once at startup).
 static NETWORK: OnceLock<Network> = OnceLock::new();
 
-/// Get a reference to the loaded network.
+/// Alternate network slot for engine-vs-engine self-match.
+/// Only used when a Searcher opts in via `NnueState::new_alt()`.
+static ALT_NETWORK: OnceLock<Network> = OnceLock::new();
+
+/// Get a reference to the primary network.
 pub fn get_network() -> Option<&'static Network> {
     NETWORK.get()
 }
 
-/// Initialize the network from raw bytes. Returns error if already initialized
-/// or if the data is malformed.
+/// Get a reference to the alternate network (used by selfmatch).
+pub fn get_alt_network() -> Option<&'static Network> {
+    ALT_NETWORK.get()
+}
+
+/// Initialize the primary network from raw bytes. Returns error if already
+/// initialized or if the data is malformed.
 pub fn init_from_bytes(data: &[u8]) -> Result<(), String> {
     let net = Network::from_bytes(data)?;
     NETWORK.set(net).map_err(|_| "Network already initialized".into())
 }
 
-/// Generate a randomly-initialized network for testing.
+/// Initialize the alternate network from raw bytes. Mirror of
+/// `init_from_bytes` for the ALT_NETWORK slot.
+pub fn init_alt_from_bytes(data: &[u8]) -> Result<(), String> {
+    let net = Network::from_bytes(data)?;
+    ALT_NETWORK.set(net).map_err(|_| "Alt network already initialized".into())
+}
+
+/// Generate a randomly-initialized primary network for testing.
 /// Uses a simple deterministic PRNG so results are reproducible.
 #[cfg(test)]
 pub fn init_random() -> Result<(), String> {
     let net = Network::random();
     NETWORK.set(net).map_err(|_| "Network already initialized".into())
+}
+
+/// Generate a randomly-initialized alternate network for testing.
+/// Uses a different seed than `init_random` so the two slots diverge.
+#[cfg(test)]
+pub fn init_random_alt() -> Result<(), String> {
+    let net = Network::random_with_seed(0xA17B_5EED_F00D_C0DE);
+    ALT_NETWORK.set(net).map_err(|_| "Alt network already initialized".into())
 }
 
 impl Network {
@@ -109,7 +133,14 @@ impl Network {
     /// Create a randomly-initialized network for testing.
     #[cfg(test)]
     fn random() -> Self {
-        let mut rng = SimpleRng::new(0xDEAD_BEEF);
+        Self::random_with_seed(0xDEAD_BEEF)
+    }
+
+    /// Create a randomly-initialized network from a specific seed.
+    /// Used by `init_random_alt` so the primary and alt slots diverge.
+    #[cfg(test)]
+    pub fn random_with_seed(seed: u64) -> Self {
+        let mut rng = SimpleRng::new(seed);
 
         let ft_biases: Vec<i16> = (0..FT_SIZE).map(|_| rng.next_i16_small()).collect();
         let ft_weights: Vec<i16> = (0..NUM_FEATURES * FT_SIZE)
