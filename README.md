@@ -31,4 +31,4 @@ If you want to plug Focalors into another chess GUI, `focalors uci` runs the sta
 
 ## License
 
-GPL-3.0-or-later.
+GPL-3.0-or-later. The chess piece graphics in [`assets/pieces/`](assets/pieces/) are CC BY-SA 3.0 by Colin M.L. Burnett — see [CREDITS.md](CREDITS.md) for the full attribution.
