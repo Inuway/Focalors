@@ -31,7 +31,10 @@ pub fn run_selfmatch(
     seed: Option<u64>,
     random_plies: u32,
     max_moves: usize,
+    threads: usize,
 ) {
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
     if num_games == 0 {
         eprintln!("No games requested (use a positive integer).");
         return;
@@ -53,29 +56,15 @@ pub fn run_selfmatch(
         }
     }
 
-    let mut a = Searcher::new(8);
-    a.silent = true;
-    a.use_nnue = true;
-
-    let mut b = if has_challenger {
-        let mut s = Searcher::with_alt_nnue(8);
-        s.silent = true;
-        s.use_nnue = true;
-        s
-    } else {
-        let mut s = Searcher::new(8);
-        s.silent = true;
-        s.use_nnue = true;
-        s
-    };
-
-    let seed = seed.unwrap_or_else(time_seed);
-    let mut rng = ThreadRng::new(seed);
-    let mut stats = MatchStats::default();
+    let master_seed = seed.unwrap_or_else(time_seed);
+    let pairs = num_games / 2;
+    let leftover = num_games % 2;
+    let threads_used = threads.max(1).min(pairs.max(1));
 
     eprintln!("Self-match");
     eprintln!("  Games:    {num_games}");
     eprintln!("  Depth:    {search_depth}");
+    eprintln!("  Threads:  {threads_used}");
     eprintln!(
         "  Engine A: current (embedded default net)"
     );
@@ -87,33 +76,120 @@ pub fn run_selfmatch(
             "current (embedded default net)".to_string()
         }
     );
-    eprintln!("  Seed:     {seed}");
+    eprintln!("  Seed:     {master_seed}");
     eprintln!("  Openings: {random_plies} random plies, max {max_moves} moves/game");
     eprintln!();
 
-    let pairs = num_games / 2;
-    let leftover = num_games % 2;
+    // Atomic counters: workers fetch_add to claim work and report results.
+    let next_pair = AtomicUsize::new(0);
+    let games_done = AtomicU32::new(0);
+    let wins = AtomicU32::new(0);
+    let losses = AtomicU32::new(0);
+    let draws = AtomicU32::new(0);
 
-    for pair_idx in 0..pairs {
-        let opening = generate_opening(&mut rng, random_plies);
-        let r1 = play_one_game(&mut a, &mut b, true, &opening, search_depth, max_moves);
-        stats.record(r1);
-        print_progress(&stats, (2 * pair_idx + 1) as u32, num_games as u32);
+    let record = |r: GameResult| match r {
+        GameResult::EngineAWin => { wins.fetch_add(1, Ordering::Relaxed); }
+        GameResult::EngineBWin => { losses.fetch_add(1, Ordering::Relaxed); }
+        GameResult::Draw => { draws.fetch_add(1, Ordering::Relaxed); }
+    };
 
-        let r2 = play_one_game(&mut a, &mut b, false, &opening, search_depth, max_moves);
-        stats.record(r2);
-        print_progress(&stats, (2 * pair_idx + 2) as u32, num_games as u32);
-    }
+    let snapshot = || MatchStats {
+        wins: wins.load(Ordering::Relaxed),
+        losses: losses.load(Ordering::Relaxed),
+        draws: draws.load(Ordering::Relaxed),
+    };
+
+    std::thread::scope(|scope| {
+        for thread_id in 0..threads_used {
+            let next_pair = &next_pair;
+            let games_done = &games_done;
+            let record = &record;
+            let snapshot = &snapshot;
+            let thread_seed = master_seed
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(thread_id as u64 * 0xDEAD_C0DE_1234_5678);
+
+            scope.spawn(move || {
+                // Each worker has its own Searchers — CH/history/killers
+                // are per-instance and don't share across threads.
+                let mut a = Searcher::new(8);
+                a.silent = true;
+                a.use_nnue = true;
+
+                let mut b = if has_challenger {
+                    let mut s = Searcher::with_alt_nnue(8);
+                    s.silent = true;
+                    s.use_nnue = true;
+                    s
+                } else {
+                    let mut s = Searcher::new(8);
+                    s.silent = true;
+                    s.use_nnue = true;
+                    s
+                };
+
+                let mut rng = ThreadRng::new(thread_seed);
+
+                loop {
+                    let p = next_pair.fetch_add(1, Ordering::Relaxed);
+                    if p >= pairs { break; }
+
+                    let opening = generate_opening(&mut rng, random_plies);
+
+                    let r1 = play_one_game(
+                        &mut a, &mut b, true, &opening, search_depth, max_moves,
+                    );
+                    record(r1);
+                    let done = games_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if thread_id == 0 {
+                        print_progress(&snapshot(), done, num_games as u32);
+                    }
+
+                    let r2 = play_one_game(
+                        &mut a, &mut b, false, &opening, search_depth, max_moves,
+                    );
+                    record(r2);
+                    let done = games_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if thread_id == 0 {
+                        print_progress(&snapshot(), done, num_games as u32);
+                    }
+                }
+            });
+        }
+    });
+
+    // Odd-game-out: play one extra solo game on the main thread so the
+    // result count exactly matches num_games. Rare path (only when caller
+    // asks for an odd number of games).
     if leftover == 1 {
+        let mut a = Searcher::new(8);
+        a.silent = true;
+        a.use_nnue = true;
+        let mut b = if has_challenger {
+            let mut s = Searcher::with_alt_nnue(8);
+            s.silent = true;
+            s.use_nnue = true;
+            s
+        } else {
+            let mut s = Searcher::new(8);
+            s.silent = true;
+            s.use_nnue = true;
+            s
+        };
+
+        let mut rng = ThreadRng::new(
+            master_seed.wrapping_mul(0xCAFE_F00D_1234_5678),
+        );
         let opening = generate_opening(&mut rng, random_plies);
         let r = play_one_game(&mut a, &mut b, true, &opening, search_depth, max_moves);
-        stats.record(r);
-        print_progress(&stats, num_games as u32, num_games as u32);
+        record(r);
+        let done = games_done.fetch_add(1, Ordering::Relaxed) + 1;
+        print_progress(&snapshot(), done, num_games as u32);
     }
 
     eprintln!();
     eprintln!();
-    print_final_results(&stats, challenger_net, num_games);
+    print_final_results(&snapshot(), challenger_net, num_games);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -194,13 +270,6 @@ impl MatchStats {
         0.5 * (1.0 + erf(z / std::f64::consts::SQRT_2))
     }
 
-    fn record(&mut self, r: GameResult) {
-        match r {
-            GameResult::EngineAWin => self.wins += 1,
-            GameResult::EngineBWin => self.losses += 1,
-            GameResult::Draw => self.draws += 1,
-        }
-    }
 }
 
 /// Abramowitz & Stegun 7.1.26 approximation of the error function.

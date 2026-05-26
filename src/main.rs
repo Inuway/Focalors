@@ -101,7 +101,7 @@ fn main() {
         }
         Some("selfmatch") => {
             let num_games: usize = args.get(2)
-                .expect("Usage: focalors selfmatch <games> [--depth N] [--challenger-net PATH] [--seed N] [--random-plies N] [--max-moves N]")
+                .expect("Usage: focalors selfmatch <games> [--depth N] [--challenger-net PATH] [--seed N] [--random-plies N] [--max-moves N] [--threads N]")
                 .parse()
                 .expect("games must be a number");
 
@@ -128,7 +128,16 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(200);
 
-            selfmatch::run_selfmatch(num_games, depth, challenger_net, seed, random_plies, max_moves);
+            let threads: usize = args.iter().position(|a| a == "--threads")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                });
+
+            selfmatch::run_selfmatch(num_games, depth, challenger_net, seed, random_plies, max_moves, threads);
         }
         Some("uci") => {
             attacks::init();
