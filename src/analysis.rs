@@ -80,14 +80,36 @@ impl MoveClass {
         if was_sacrifice && cpl <= 20 {
             return MoveClass::Brilliant;
         }
+        // Industry-standard bands (close to chess.com / lichess). The previous
+        // thresholds (Mistake at 51 cp) were absurdly tight — a 76-cp opening
+        // move like c4 vs Nc3 would get flagged as a mistake when it's a
+        // perfectly normal alternative.
         match cpl {
-            0 => MoveClass::Best,
-            1..=20 => MoveClass::Good,
-            21..=50 => MoveClass::Inaccuracy,
-            51..=150 => MoveClass::Mistake,
-            _ => MoveClass::Blunder,
+            0..=15 => MoveClass::Best,         // 0-15 cp: nailed it (or within noise)
+            16..=50 => MoveClass::Good,        // 16-50 cp: fine move, small loss
+            51..=120 => MoveClass::Inaccuracy, // 51-120 cp: noticeable but recoverable
+            121..=250 => MoveClass::Mistake,   // 121-250 cp: clear error
+            _ => MoveClass::Blunder,           // 251+ cp: catastrophic
         }
     }
+}
+
+/// Convert a centipawn eval (white's perspective) to white's winning
+/// percentage in [0, 100]. Uses the lichess sigmoid mapping.
+fn win_percentage(cp: Score) -> f64 {
+    // Clamp to avoid numerical issues at extreme mate scores. ±2000 cp
+    // already maps to >99.96% / <0.04% so the cap is invisible in practice.
+    let cp = cp.clamp(-2000, 2000) as f64;
+    100.0 / (1.0 + (-0.004 * cp).exp())
+}
+
+/// Lichess per-move accuracy formula. Takes win-percentage loss (from the
+/// player's perspective, in [0, 100]) and returns accuracy in [0, 100].
+/// A 0% loss → 100% accuracy; 50% loss → ~8.5% accuracy. Saturates near
+/// zero for catastrophic moves rather than going linearly to zero.
+fn accuracy_from_wp_loss(wp_loss: f64) -> f64 {
+    let acc = 103.1668 * (-0.04354 * wp_loss).exp() - 3.1669;
+    acc.clamp(0.0, 100.0)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -314,12 +336,30 @@ pub fn analyze_game(
         .filter(|m| m.side == user_color && !matches!(m.classification, MoveClass::Forced))
         .collect();
 
+    // Accuracy: per-move win-percentage loss → lichess sigmoid → mean.
+    // Replaces the previous `100 - avg_cpl` linear formula which produced
+    // absurdly low numbers (e.g. ~5% accuracy on a normal game) because it
+    // treated every centipawn loss as equally costly regardless of position.
     let user_accuracy = if user_moves.is_empty() {
         100.0
     } else {
-        let avg_cpl: f64 =
-            user_moves.iter().map(|m| m.cpl as f64).sum::<f64>() / user_moves.len() as f64;
-        (100.0 - avg_cpl).max(0.0).min(100.0)
+        let total: f64 = user_moves
+            .iter()
+            .map(|m| {
+                let wp_before_white = win_percentage(m.eval_before);
+                let wp_after_white  = win_percentage(m.eval_after);
+                // Convert to player POV: black's win % is the complement.
+                let (wp_before, wp_after) = match m.side {
+                    Color::White => (wp_before_white, wp_after_white),
+                    Color::Black => (100.0 - wp_before_white, 100.0 - wp_after_white),
+                };
+                // Negative wp_loss (the move "improved" win chances per the
+                // analysis search) clamps to 0 — i.e. counts as 100% accurate.
+                let wp_loss = (wp_before - wp_after).max(0.0);
+                accuracy_from_wp_loss(wp_loss)
+            })
+            .sum();
+        total / user_moves.len() as f64
     };
 
     GameAnalysis {
@@ -557,19 +597,49 @@ mod tests {
 
     #[test]
     fn classification_ranges() {
+        // Industry-standard bands (close to chess.com/lichess).
         assert_eq!(MoveClass::from_cpl(0, false), MoveClass::Best);
-        assert_eq!(MoveClass::from_cpl(10, false), MoveClass::Good);
-        assert_eq!(MoveClass::from_cpl(35, false), MoveClass::Inaccuracy);
-        assert_eq!(MoveClass::from_cpl(100, false), MoveClass::Mistake);
-        assert_eq!(MoveClass::from_cpl(200, false), MoveClass::Blunder);
+        assert_eq!(MoveClass::from_cpl(15, false), MoveClass::Best);
+        assert_eq!(MoveClass::from_cpl(30, false), MoveClass::Good);
+        assert_eq!(MoveClass::from_cpl(50, false), MoveClass::Good);
+        assert_eq!(MoveClass::from_cpl(80, false), MoveClass::Inaccuracy);
+        assert_eq!(MoveClass::from_cpl(120, false), MoveClass::Inaccuracy);
+        assert_eq!(MoveClass::from_cpl(180, false), MoveClass::Mistake);
+        assert_eq!(MoveClass::from_cpl(250, false), MoveClass::Mistake);
+        assert_eq!(MoveClass::from_cpl(400, false), MoveClass::Blunder);
     }
 
     #[test]
     fn brilliant_sacrifice_detection() {
         // Low CPL + sacrifice = brilliant
         assert_eq!(MoveClass::from_cpl(5, true), MoveClass::Brilliant);
-        // High CPL + sacrifice = still a blunder
-        assert_eq!(MoveClass::from_cpl(200, true), MoveClass::Blunder);
+        assert_eq!(MoveClass::from_cpl(20, true), MoveClass::Brilliant);
+        // Above the sacrifice threshold, the cpl falls through to the normal
+        // ranking. 200 cp is a Mistake (121..=250); 400 cp is a Blunder.
+        assert_eq!(MoveClass::from_cpl(200, true), MoveClass::Mistake);
+        assert_eq!(MoveClass::from_cpl(400, true), MoveClass::Blunder);
+    }
+
+    #[test]
+    fn win_percentage_known_values() {
+        // Sigmoid maps cp → win %.
+        assert!((win_percentage(0) - 50.0).abs() < 0.01, "0 cp = 50% win");
+        assert!(win_percentage(2000) > 99.0, "2000 cp = >99% win");
+        assert!(win_percentage(-2000) < 1.0, "-2000 cp = <1% win");
+        // 100 cp (one pawn) corresponds to ~60% win.
+        let p = win_percentage(100);
+        assert!(p > 55.0 && p < 65.0, "100 cp win % should be ~60%, got {p}");
+    }
+
+    #[test]
+    fn accuracy_from_wp_loss_known_values() {
+        // 0% loss → ~100% accurate (formula peaks at ~100).
+        assert!(accuracy_from_wp_loss(0.0) > 99.0);
+        // ~50% loss → very low accuracy (~8.5%).
+        let a = accuracy_from_wp_loss(50.0);
+        assert!(a > 5.0 && a < 15.0, "50% wp loss should give ~8.5% accuracy, got {a}");
+        // Catastrophic losses clamp to 0.
+        assert!(accuracy_from_wp_loss(100.0) < 5.0);
     }
 
     #[test]
