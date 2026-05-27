@@ -3631,15 +3631,6 @@ impl FocalorsApp {
                 .get(&(drag_state.piece_color, drag_state.piece))
             {
                 let piece_size = sq_size * 0.94;
-                let shadow_rect = egui::Rect::from_center_size(
-                    egui::pos2(drag_state.pointer_pos.x + 3.0, drag_state.pointer_pos.y + 5.0),
-                    egui::vec2(piece_size, piece_size),
-                );
-                painter.rect_filled(
-                    shadow_rect,
-                    6.0,
-                    egui::Color32::from_rgba_premultiplied(0, 0, 0, 70),
-                );
                 let piece_rect = egui::Rect::from_center_size(
                     drag_state.pointer_pos,
                     egui::vec2(piece_size, piece_size),
