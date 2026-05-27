@@ -412,6 +412,51 @@ struct DragState {
     pointer_pos: egui::Pos2,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnnotationColor {
+    Green,
+    Red,
+    Yellow,
+    Blue,
+}
+
+impl AnnotationColor {
+    fn from_modifiers(m: egui::Modifiers) -> Self {
+        // Shift > command/ctrl > alt > plain. Matches lichess/chess.com convention.
+        if m.shift { Self::Red }
+        else if m.command { Self::Yellow }
+        else if m.alt { Self::Blue }
+        else { Self::Green }
+    }
+
+    fn fill(self) -> egui::Color32 {
+        // ~63% alpha — visible over both light and dark squares without
+        // obliterating the piece beneath.
+        match self {
+            Self::Green  => egui::Color32::from_rgba_premultiplied(70, 150, 70, 160),
+            Self::Red    => egui::Color32::from_rgba_premultiplied(200, 70, 70, 160),
+            Self::Yellow => egui::Color32::from_rgba_premultiplied(210, 165, 60, 160),
+            Self::Blue   => egui::Color32::from_rgba_premultiplied(70, 130, 200, 160),
+        }
+    }
+
+    fn arrow(self) -> egui::Color32 {
+        // Slightly more opaque for arrows so the shape reads cleanly over pieces.
+        match self {
+            Self::Green  => egui::Color32::from_rgba_premultiplied(70, 150, 70, 210),
+            Self::Red    => egui::Color32::from_rgba_premultiplied(200, 70, 70, 210),
+            Self::Yellow => egui::Color32::from_rgba_premultiplied(210, 165, 60, 210),
+            Self::Blue   => egui::Color32::from_rgba_premultiplied(70, 130, 200, 210),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Annotation {
+    Highlight { sq: u8, color: AnnotationColor },
+    Arrow { from: u8, to: u8, color: AnnotationColor },
+}
+
 #[derive(Clone)]
 struct LocalSearchRequest {
     soft_time_ms: u64,
@@ -535,6 +580,15 @@ pub struct FocalorsApp {
     history_thumbnails: std::collections::HashMap<i64, Option<Board>>,
     selected_square: Option<u8>,
     drag_state: Option<DragState>,
+    /// User-drawn annotations (right-click highlights + arrows for tactical
+    /// thinking). Cleared on left-click, on move played, and on board change.
+    annotations: Vec<Annotation>,
+    /// Square where a right-click drag began. Some while the right button is
+    /// held down; resolved into an annotation on release.
+    right_drag_origin: Option<u8>,
+    /// Last-seen board hash. When this changes between frames, annotations
+    /// are wiped (a new position invalidates whatever the user drew before).
+    last_annotation_board_hash: Option<u64>,
     flipped: bool,
     local_side_choice: SideChoice,
     local_time_preset: TimePreset,
@@ -728,6 +782,9 @@ impl FocalorsApp {
             history_thumbnails: std::collections::HashMap::new(),
             selected_square: None,
             drag_state: None,
+            annotations: Vec::new(),
+            right_drag_origin: None,
+            last_annotation_board_hash: None,
             flipped: false,
             local_side_choice: SideChoice::White,
             local_time_preset: TimePreset::Rapid10_0,
@@ -780,6 +837,36 @@ impl FocalorsApp {
                 .time_control
                 .displayed_remaining_ms(state.board.side_to_move, Some(state.board.side_to_move))
                 > 0
+    }
+
+    /// Toggle/replace an annotation. If the exact same annotation (same
+    /// color + shape) already exists, remove it. If a same-shape annotation
+    /// exists with a different color, replace it. Otherwise add.
+    fn toggle_annotation(&mut self, new_annot: Annotation) {
+        let existing_idx = self.annotations.iter().position(|&a| {
+            match (a, new_annot) {
+                (Annotation::Highlight { sq: s1, .. }, Annotation::Highlight { sq: s2, .. }) => {
+                    s1 == s2
+                }
+                (
+                    Annotation::Arrow { from: f1, to: t1, .. },
+                    Annotation::Arrow { from: f2, to: t2, .. },
+                ) => f1 == f2 && t1 == t2,
+                _ => false,
+            }
+        });
+
+        match existing_idx {
+            Some(idx) if self.annotations[idx] == new_annot => {
+                self.annotations.remove(idx);
+            }
+            Some(idx) => {
+                self.annotations[idx] = new_annot;
+            }
+            None => {
+                self.annotations.push(new_annot);
+            }
+        }
     }
 
     fn has_running_local_clock(&self) -> bool {
@@ -3418,6 +3505,17 @@ impl FocalorsApp {
             Some(v) => v.board.clone(),
             None => self.state.lock().unwrap().board.clone(),
         };
+
+        // Clear annotations when the (main) board changes. Covers move played,
+        // engine reply, move-list navigation, new game — anything that shifts
+        // the position invalidates user-drawn arrows/highlights.
+        if interactive {
+            if self.last_annotation_board_hash != Some(board.hash) {
+                self.annotations.clear();
+                self.right_drag_origin = None;
+                self.last_annotation_board_hash = Some(board.hash);
+            }
+        }
         let last_move_squares: Option<(u8, u8)> = override_pos
             .and_then(|v| v.last_move)
             .filter(|m| !m.is_null())
@@ -3517,6 +3615,17 @@ impl FocalorsApp {
 
                 painter.rect_filled(rect, 0.0, color);
 
+                // User-drawn square highlight (right-click annotation)
+                if interactive {
+                    for annot in &self.annotations {
+                        if let Annotation::Highlight { sq: h_sq, color: h_color } = *annot
+                            && h_sq == sq_idx
+                        {
+                            painter.rect_filled(rect, 0.0, h_color.fill());
+                        }
+                    }
+                }
+
                 // Draw piece
                 if let Some((piece_color, piece)) = board.piece_on(Square(sq_idx)) {
                     if dragged_from_sq == Some(sq_idx) {
@@ -3571,6 +3680,49 @@ impl FocalorsApp {
             );
         }
 
+        // User-drawn arrows (right-click annotations) — rendered last so they
+        // sit on top of pieces. Highlights were drawn earlier under the pieces.
+        if interactive {
+            for annot in &self.annotations {
+                if let Annotation::Arrow { from, to, color } = *annot {
+                    let from_pos = board_square_center(board_rect, sq_size, self.flipped, from);
+                    let to_pos   = board_square_center(board_rect, sq_size, self.flipped, to);
+                    draw_annotation_arrow(&painter, from_pos, to_pos, color.arrow(), sq_size);
+                }
+            }
+        }
+
+        // Right-click annotation handling — press records origin square,
+        // release resolves into a highlight (no drag) or arrow (drag), with
+        // modifier keys selecting the color.
+        if interactive {
+            let secondary_pressed = ui.ctx().input(|i| i.pointer.secondary_pressed());
+            let secondary_released = ui.ctx().input(|i| i.pointer.secondary_released());
+            let pointer_pos = ui.ctx().input(|i| i.pointer.interact_pos());
+            let modifiers = ui.ctx().input(|i| i.modifiers);
+
+            if secondary_pressed
+                && let Some(pos) = pointer_pos
+                && let Some(sq) = board_square_from_pos(board_rect, sq_size, self.flipped, pos)
+            {
+                self.right_drag_origin = Some(sq);
+            }
+
+            if secondary_released
+                && let Some(from_sq) = self.right_drag_origin.take()
+                && let Some(pos) = pointer_pos
+                && let Some(to_sq) = board_square_from_pos(board_rect, sq_size, self.flipped, pos)
+            {
+                let color = AnnotationColor::from_modifiers(modifiers);
+                let new_annot = if from_sq == to_sq {
+                    Annotation::Highlight { sq: from_sq, color }
+                } else {
+                    Annotation::Arrow { from: from_sq, to: to_sq, color }
+                };
+                self.toggle_annotation(new_annot);
+            }
+        }
+
         if response.drag_started() && allow_input && self.pending_promotion.is_none() {
             if let Some(pos) = response.interact_pointer_pos() {
                 if let Some(from_sq) = board_square_from_pos(board_rect, sq_size, self.flipped, pos)
@@ -3596,6 +3748,14 @@ impl FocalorsApp {
             if let Some(pos) = response.interact_pointer_pos() {
                 drag_state.pointer_pos = pos;
             }
+        }
+
+        // A left-click anywhere on the board also clears annotations (matches
+        // lichess/chess.com convention — you click to commit to the plan, the
+        // arrows you drew while thinking go away). Fires even if `allow_input`
+        // is false so reviewing the board still respects the clear.
+        if interactive && response.clicked() {
+            self.annotations.clear();
         }
 
         // Handle clicks
@@ -4586,6 +4746,66 @@ fn configure_theme(ctx: &egui::Context, theme: UiTheme) {
         egui::FontId::proportional(11.5),
     );
     ctx.set_global_style(style);
+}
+
+/// Inverse of `board_square_from_pos` — center of a square in screen coords.
+fn board_square_center(
+    board_rect: egui::Rect,
+    sq_size: f32,
+    flipped: bool,
+    sq_idx: u8,
+) -> egui::Pos2 {
+    let display_rank = sq_idx / 8;
+    let display_file = sq_idx % 8;
+    let rank = if flipped { display_rank } else { 7 - display_rank };
+    let file = if flipped { 7 - display_file } else { display_file };
+    egui::pos2(
+        board_rect.min.x + (file as f32 + 0.5) * sq_size,
+        board_rect.min.y + (rank as f32 + 0.5) * sq_size,
+    )
+}
+
+/// Draw a thick colored arrow with a triangular arrowhead, used for annotations.
+fn draw_annotation_arrow(
+    painter: &egui::Painter,
+    from: egui::Pos2,
+    to: egui::Pos2,
+    color: egui::Color32,
+    sq_size: f32,
+) {
+    let dir = to - from;
+    let len = dir.length();
+    if len < 1.0 {
+        return;
+    }
+    let unit = dir / len;
+    let perp = egui::vec2(-unit.y, unit.x);
+
+    let shaft_width = sq_size * 0.18;
+    let head_len = sq_size * 0.36;
+    let head_half_width = sq_size * 0.26;
+
+    // Pull both endpoints in so the arrow sits inside the squares, not flush
+    // against the edges (looks better visually).
+    let from_inset = from + unit * (sq_size * 0.18);
+    let to_inset   = to   - unit * (sq_size * 0.10);
+
+    // Shaft stops short of the arrowhead tip so the join looks clean.
+    let shaft_end = to_inset - unit * head_len * 0.6;
+
+    painter.line_segment(
+        [from_inset, shaft_end],
+        egui::Stroke::new(shaft_width, color),
+    );
+
+    let tip = to_inset;
+    let base_left  = to_inset - unit * head_len + perp * head_half_width;
+    let base_right = to_inset - unit * head_len - perp * head_half_width;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, base_left, base_right],
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 fn board_square_from_pos(
