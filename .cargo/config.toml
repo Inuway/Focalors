@@ -12,3 +12,11 @@
 
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# Windows-MSVC: statically link the Microsoft C Runtime so focalors.exe runs
+# on fresh Windows installs without the VC++ Redistributable. Without this,
+# the binary fails at launch with "VCRUNTIME140.dll was not found" on machines
+# that don't already have Visual C++ apps installed. Cargo appends these
+# rustflags to the target-cpu flag above, so both apply on Windows.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
