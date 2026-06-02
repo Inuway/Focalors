@@ -1377,7 +1377,7 @@ impl FocalorsApp {
                         let color = if *count == max_count {
                             class_blunder()
                         } else {
-                            hydra_accent_soft()
+                            hydra_accent()
                         };
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
@@ -1794,7 +1794,7 @@ impl FocalorsApp {
                         let color = if *count == max_count && max_count > 0 {
                             class_blunder()
                         } else {
-                            hydra_accent_soft()
+                            hydra_accent()
                         };
                         let phase_tile = egui::Frame::new()
                             .fill(color.gamma_multiply(0.10))
@@ -4118,7 +4118,19 @@ impl eframe::App for FocalorsApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.draw_idle_home(ui);
+                        // Outer gutter: keeps dashboard content away from
+                        // the window edge and the scrollbar so charts and
+                        // bars don't run flush against the right side.
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin {
+                                left: 24,
+                                right: 24,
+                                top: 0,
+                                bottom: 0,
+                            })
+                            .show(ui, |ui| {
+                                self.draw_idle_home(ui);
+                            });
                     });
             } else {
                 ui.add_space(6.0);
@@ -5209,11 +5221,13 @@ fn draw_radial_gauge(ui: &mut egui::Ui, size: f32, percentage: f64, color: egui:
     let radius = size / 2.0 - stroke_w - 2.0;
     let painter = ui.painter();
 
-    // Background ring — full circle in a muted color.
+    // Background ring — uses hydra_border so it has enough contrast
+    // against both the dark and the light page bg. hydra_panel_alt_fill
+    // was too close to the light-mode bg and the ring disappeared.
     painter.circle_stroke(
         center,
         radius,
-        egui::Stroke::new(stroke_w, hydra_panel_alt_fill()),
+        egui::Stroke::new(stroke_w, hydra_border()),
     );
 
     // Foreground arc — starts at the top (12 o'clock), sweeps clockwise.
