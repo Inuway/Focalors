@@ -206,7 +206,8 @@ impl Searcher {
     #[inline]
     fn eval(&mut self, board: &Board, ply: u32) -> Score {
         let base = if self.use_nnue {
-            self.nnue.evaluate_at_ply(board, ply as usize)
+            let ply_idx = (ply as usize).min(MAX_PLY - 1);
+            self.nnue.evaluate_at_ply(board, ply_idx)
         } else {
             evaluate_with_pht(board, &mut self.pawn_ht)
         };
@@ -456,6 +457,13 @@ impl Searcher {
         let king_sq = board.piece_bb(board.side_to_move, Piece::King).lsb();
         let in_check = attacks::is_square_attacked(board, king_sq, board.side_to_move.flip());
         let effective_depth = if in_check { depth + 1 } else { depth };
+
+        // Fixed-size search/NNUE stacks can evaluate the last slot, but cannot
+        // push another child accumulator at ply + 1. Treat this as a hard
+        // horizon instead of risking an out-of-bounds NNUE update.
+        if ply_idx >= MAX_PLY - 1 {
+            return (self.eval(board, ply_idx as u32), Move::NULL);
+        }
 
         // ── Pruning (not in check, not root, not singular search) ──────
         if !in_check && ply > 0 && excluded_move.is_null() {
@@ -712,12 +720,16 @@ impl Searcher {
         self.check_time();
         if self.stopped { return 0; }
 
-        let stand_pat = self.eval(board, ply);
+        let ply_idx = (ply as usize).min(MAX_PLY - 1);
+        let stand_pat = self.eval(board, ply_idx as u32);
         if stand_pat >= beta {
             return beta;
         }
         if stand_pat > alpha {
             alpha = stand_pat;
+        }
+        if ply_idx >= MAX_PLY - 1 {
+            return alpha;
         }
 
         let delta = 1000;
@@ -1191,6 +1203,28 @@ mod tests {
         let result = searcher.search(&board, 4);
         assert!(!result.best_move.is_null(), "Should find a move with NNUE");
         assert!(result.nodes > 0, "Should search some nodes");
+    }
+
+    #[test]
+    fn nnue_search_max_ply_returns_without_stack_overflow() {
+        attacks::init();
+        let _ = crate::nnue::init(None);
+        let board = Board::startpos();
+        let mut searcher = Searcher::new(16);
+        searcher.use_nnue = true;
+        searcher.nnue.refresh(&board, MAX_PLY - 1);
+
+        let (_score, mv) = searcher.negamax(
+            &board,
+            8,
+            -INFINITY,
+            INFINITY,
+            (MAX_PLY - 1) as u32,
+            Move::NULL,
+            Move::NULL,
+        );
+
+        assert!(mv.is_null(), "max-ply guard should return without searching children");
     }
 
     #[test]
