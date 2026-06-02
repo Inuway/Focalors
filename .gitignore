@@ -1,8 +1,17 @@
 /target
 .env
 
-# NNUE training artifacts
-nets/*-data.bin
-nets/*-epoch*.nnue
+# Local training and benchmark artifacts
+data/
+logs/
+ratings/
+chess-tools/
+*.slurm
 training*.log
 
+# Generated NNUE training artifacts
+nets/*-data.bin
+nets/*-epoch*.nnue
+nets/gen[0-9][0-9][0-9][0-9].nnue
+nets/previous_gen*.nnue
+nets/generation.txt
