@@ -19,3 +19,10 @@ license.
 
 These piece images retain their original CC BY-SA 3.0 license; the rest of
 Focalors is licensed under GPL-3.0-or-later (see [`LICENSE`](LICENSE)).
+
+## NNUE network
+
+The current shipping NNUE network ([`nets/current.nnue`](nets/current.nnue), `gen10`)
+was trained by **Luc Vedrenne** ([@ListIndexOutOfRange](https://github.com/ListIndexOutOfRange))
+through 10 generations of self-play fine-tuning, contributed via
+[PR #2](https://github.com/Inuway/Focalors/pull/2).
