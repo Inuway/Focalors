@@ -103,16 +103,16 @@ struct TrainConfig {
 // PRNG (deterministic, no external crate)
 // ════════════════════════════════════════════════════════════════════════════
 
-struct Rng {
+pub(crate) struct Rng {
     state: u64,
 }
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Rng { state: seed }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.state ^= self.state << 13;
         self.state ^= self.state >> 7;
         self.state ^= self.state << 17;
@@ -124,13 +124,13 @@ impl Rng {
     }
 
     /// Box-Muller transform for Gaussian samples.
-    fn next_gaussian(&mut self) -> f32 {
+    pub(crate) fn next_gaussian(&mut self) -> f32 {
         let u1 = self.next_f32().max(1e-10);
         let u2 = self.next_f32();
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
     }
 
-    fn shuffle<T>(&mut self, data: &mut [T]) {
+    pub(crate) fn shuffle<T>(&mut self, data: &mut [T]) {
         for i in (1..data.len()).rev() {
             let j = (self.next_u64() as usize) % (i + 1);
             data.swap(i, j);
@@ -207,14 +207,10 @@ impl TrainNet {
     /// Build a TrainNet from raw f32 weight vectors. Validates that every
     /// slice has the exact length the on-disk `.nnue` format requires.
     ///
-    /// Used by alternate trainers (e.g. the GPU/Burn trainer on the
-    /// `gpu-training` branch) to hand quantization back to [`quantize`]
-    /// without depending on the private field layout.
-    //
-    // dead_code allowed: this is the forward-looking handoff point for
-    // the Burn trainer. Once the gpu-training Phase 2 lands and calls
-    // this from a non-test code path, the allow can be removed.
-    #[allow(dead_code)]
+    /// Used by the GPU/Burn trainer in [`crate::trainer_gpu`] to hand
+    /// quantization back to [`quantize`] without depending on the
+    /// private field layout. Only exists when that trainer is compiled.
+    #[cfg(feature = "gpu-training")]
     pub fn from_f32_weights(
         ft_weights: Vec<f32>,
         ft_biases: Vec<f32>,
@@ -375,7 +371,7 @@ pub fn load_data(path: &str) -> Vec<Sample> {
 /// Load multiple files and combine according to weights.
 /// Weights are normalized; each file contributes positions proportional to its weight,
 /// scaled so total = sum of all loaded positions (no truncation when possible).
-fn load_data_multi(paths: &[String], weights: &[f32], rng: &mut Rng) -> Vec<Sample> {
+pub(crate) fn load_data_multi(paths: &[String], weights: &[f32], rng: &mut Rng) -> Vec<Sample> {
     assert_eq!(paths.len(), weights.len(), "data paths and weights must match");
 
     let mut per_file: Vec<Vec<Sample>> = Vec::with_capacity(paths.len());
@@ -483,16 +479,12 @@ pub fn parse_record(data: &[u8]) -> Option<Sample> {
 // Forward pass (f32, mirrors quantized inference)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Run the CPU forward and return only the scalar output. Thin
-/// `pub(crate)` shim used by the Burn numerical-match test in
-/// [`crate::trainer_gpu`] (on the `gpu-training` branch) so it can
-/// compare the Burn forward to the CPU forward without exposing
-/// `forward` or `ForwardState` directly.
-//
-// dead_code allowed: only the trainer_gpu test module calls this. When
-// Phase 3 lands a real GPU training loop, additional non-test consumers
-// will appear and the allow can be removed.
-#[allow(dead_code)]
+/// Run the CPU forward and return only the scalar output. Test-only
+/// shim used by the Burn numerical-match test in
+/// [`crate::trainer_gpu`] so it can compare the Burn forward to the
+/// CPU forward without exposing `forward` or `ForwardState` outside
+/// the trainer module. Exists only when that test is being compiled.
+#[cfg(all(test, feature = "gpu-training"))]
 pub(crate) fn forward_output(net: &TrainNet, sample: &Sample) -> f32 {
     forward(net, sample).output
 }
