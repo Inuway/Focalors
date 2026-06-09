@@ -8,6 +8,13 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
+[features]
+default = []
+# Experimental GPU NNUE training backend, branch `gpu-training` only.
+# Pulls in Burn (Apache-2.0/MIT) + wgpu. Off by default — the shipping
+# binary on main is untouched. See BRANCH.md.
+gpu-training = ["dep:burn"]
+
 [dependencies]
 bitflags = "2.11.0"
 dirs = "6.0.0"
@@ -19,3 +26,8 @@ egui = "0.34.1"
 egui_plot = "0.35.0"
 image = { version = "0.25.10", features = ["png"] }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+
+# Optional: Burn ML framework for GPU NNUE training. Pulled in only
+# when the `gpu-training` feature is enabled. Apache-2.0/MIT (both
+# GPL-compatible). Credit: CREDITS.md.
+burn = { version = "0.21", default-features = false, features = ["wgpu", "autodiff", "train", "ndarray", "std"], optional = true }

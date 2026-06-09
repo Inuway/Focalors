@@ -15,6 +15,8 @@ mod selfmatch;
 mod selfplay;
 mod strength;
 mod trainer;
+#[cfg(feature = "gpu-training")]
+mod trainer_gpu;
 mod tt;
 mod tuning;
 mod types;
@@ -36,6 +38,11 @@ fn main() {
         Some("train") => {
             let data_path = args.get(2).expect("Usage: focalors train <data_file> [options]");
             trainer::run_training(data_path, &args[3..]);
+        }
+        #[cfg(feature = "gpu-training")]
+        Some("train-gpu") => {
+            let data_path = args.get(2).expect("Usage: focalors train-gpu <data_file> [options]");
+            trainer_gpu::run_training_gpu(data_path, &args[3..]);
         }
         Some("promote") => {
             let source = args.get(2).expect("Usage: focalors promote <path-to-net.nnue>");
@@ -158,6 +165,8 @@ fn main() {
             eprintln!("  selfplay <games> <out> — Generate NNUE training data via self-play");
             eprintln!("  selfmatch <games> [opts] — Run focalors-vs-focalors match (elo delta + LOS)");
             eprintln!("  promote <net.nnue>     — Set a .nnue file as the shipped default");
+            #[cfg(feature = "gpu-training")]
+            eprintln!("  train-gpu <data> [opts] — Experimental GPU NNUE training (see BRANCH.md)");
             std::process::exit(1);
         }
     }
