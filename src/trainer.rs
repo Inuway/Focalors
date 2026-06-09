@@ -9,23 +9,35 @@
 use crate::nnue::network::{FT_SIZE, L1_INPUT, L1_SIZE, L2_SIZE, QA, QB};
 use crate::nnue::features::NUM_FEATURES;
 
-const SIGMOID_SCALE: f32 = 400.0;
+/// Sigmoid scaling used by the loss function. Centipawn evals divided by
+/// this value before passing through sigmoid; same scale is used by every
+/// trainer that targets this engine's nets.
+pub const SIGMOID_SCALE: f32 = 400.0;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Data structures
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Training sample parsed from a ChessBoard record.
-struct Sample {
-    stm_features: Vec<usize>,
-    opp_features: Vec<usize>,
-    score: f32,
-    result: f32,
+/// Training sample parsed from a ChessBoard record. Public so the GPU
+/// trainer ([`crate::trainer_gpu`] on the `gpu-training` branch) consumes
+/// the same data format and can feed Burn tensors that mirror the CPU
+/// path.
+#[derive(Clone)]
+pub struct Sample {
+    pub stm_features: Vec<usize>,
+    pub opp_features: Vec<usize>,
+    pub score: f32,
+    pub result: f32,
 }
 
-/// f32 network weights for training.
+/// f32 network weights for training. Public so alternate trainers (e.g.
+/// the Burn-based GPU trainer on the `gpu-training` branch) can fill one
+/// in and hand it to [`quantize`] for a byte-identical `.nnue` output.
+///
+/// Construct via [`TrainNet::from_f32_weights`] — fields stay private so
+/// internal layout can change without breaking the GPU trainer.
 #[derive(Clone)]
-struct TrainNet {
+pub struct TrainNet {
     ft_weights: Vec<f32>,
     ft_biases: Vec<f32>,
     l1_weights: Vec<f32>,
@@ -191,6 +203,42 @@ impl TrainNet {
             l3_bias: net.l3_bias as f32,
         }
     }
+
+    /// Build a TrainNet from raw f32 weight vectors. Validates that every
+    /// slice has the exact length the on-disk `.nnue` format requires.
+    ///
+    /// Used by alternate trainers (e.g. the GPU/Burn trainer on the
+    /// `gpu-training` branch) to hand quantization back to [`quantize`]
+    /// without depending on the private field layout.
+    //
+    // dead_code allowed: this is the forward-looking handoff point for
+    // the Burn trainer. Once the gpu-training Phase 2 lands and calls
+    // this from a non-test code path, the allow can be removed.
+    #[allow(dead_code)]
+    pub fn from_f32_weights(
+        ft_weights: Vec<f32>,
+        ft_biases: Vec<f32>,
+        l1_weights: Vec<f32>,
+        l1_biases: Vec<f32>,
+        l2_weights: Vec<f32>,
+        l2_biases: Vec<f32>,
+        l3_weights: Vec<f32>,
+        l3_bias: f32,
+    ) -> Self {
+        assert_eq!(ft_weights.len(), NUM_FEATURES * FT_SIZE, "ft_weights size mismatch");
+        assert_eq!(ft_biases.len(), FT_SIZE, "ft_biases size mismatch");
+        assert_eq!(l1_weights.len(), L1_INPUT * L1_SIZE, "l1_weights size mismatch");
+        assert_eq!(l1_biases.len(), L1_SIZE, "l1_biases size mismatch");
+        assert_eq!(l2_weights.len(), L1_SIZE * L2_SIZE, "l2_weights size mismatch");
+        assert_eq!(l2_biases.len(), L2_SIZE, "l2_biases size mismatch");
+        assert_eq!(l3_weights.len(), L2_SIZE, "l3_weights size mismatch");
+        TrainNet {
+            ft_weights, ft_biases,
+            l1_weights, l1_biases,
+            l2_weights, l2_biases,
+            l3_weights, l3_bias,
+        }
+    }
 }
 
 impl Gradients {
@@ -299,7 +347,11 @@ impl Adam {
 // Data loading
 // ════════════════════════════════════════════════════════════════════════════
 
-fn load_data(path: &str) -> Vec<Sample> {
+/// Load training samples from a single binary data file. The file format
+/// is a sequence of 32-byte ChessBoard records produced by
+/// [`crate::selfplay`]. Records with extreme evals (`|score| > 10000 cp`)
+/// are filtered out.
+pub fn load_data(path: &str) -> Vec<Sample> {
     let data = std::fs::read(path)
         .unwrap_or_else(|e| panic!("Failed to read data file '{path}': {e}"));
 
@@ -376,7 +428,9 @@ fn load_data_multi(paths: &[String], weights: &[f32], rng: &mut Rng) -> Vec<Samp
     combined
 }
 
-fn parse_record(data: &[u8]) -> Option<Sample> {
+/// Parse a single 32-byte ChessBoard record into a [`Sample`]. Returns
+/// `None` if the record's score is filtered out (|score| > 10000 cp).
+pub fn parse_record(data: &[u8]) -> Option<Sample> {
     let occ = u64::from_le_bytes([
         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
     ]);
@@ -503,11 +557,20 @@ fn forward(net: &TrainNet, sample: &Sample) -> ForwardState {
 // Loss function
 // ════════════════════════════════════════════════════════════════════════════
 
-fn sigmoid(x: f32) -> f32 {
+/// Sigmoid of `x / SIGMOID_SCALE`. Centipawn-domain evals go through this
+/// before MSE — squashes the unbounded eval range into [0, 1] so the loss
+/// matches the WDL target.
+pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x / SIGMOID_SCALE).exp())
 }
 
-fn loss_and_gradient(predicted_cp: f32, score_cp: f32, result: f32, wdl_weight: f32) -> (f32, f32) {
+/// MSE loss + its derivative w.r.t. `predicted_cp`. Target is the
+/// `wdl_weight`-weighted blend of the game result and the
+/// sigmoid(score_cp) eval target — same blend the shipping nets use.
+///
+/// Returns `(loss, d_loss/d_predicted_cp)`. The GPU trainer should use
+/// this same formulation so the two paths converge to comparable nets.
+pub fn loss_and_gradient(predicted_cp: f32, score_cp: f32, result: f32, wdl_weight: f32) -> (f32, f32) {
     let pred_sig = sigmoid(predicted_cp);
     let target_sig = sigmoid(score_cp);
     let target = wdl_weight * result + (1.0 - wdl_weight) * target_sig;
@@ -631,7 +694,15 @@ fn backward(
 // Quantization
 // ════════════════════════════════════════════════════════════════════════════
 
-fn quantize(net: &TrainNet) -> Vec<u8> {
+/// Quantize a [`TrainNet`] to the on-disk `.nnue` byte layout. Output is
+/// exactly the format [`crate::nnue::network::Network::from_bytes`]
+/// expects (411428 bytes for the current architecture).
+///
+/// Quantization is pure round + clamp: i16 for feature transformer
+/// weights/biases, i8 for hidden weights, i32 for hidden biases. Both
+/// CPU and GPU trainers MUST go through this function so shipped nets
+/// stay byte-identical regardless of which trainer produced them.
+pub fn quantize(net: &TrainNet) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(412_000);
 
     // FT biases [FT_SIZE] as i16
