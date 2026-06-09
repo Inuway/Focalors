@@ -483,6 +483,20 @@ pub fn parse_record(data: &[u8]) -> Option<Sample> {
 // Forward pass (f32, mirrors quantized inference)
 // ════════════════════════════════════════════════════════════════════════════
 
+/// Run the CPU forward and return only the scalar output. Thin
+/// `pub(crate)` shim used by the Burn numerical-match test in
+/// [`crate::trainer_gpu`] (on the `gpu-training` branch) so it can
+/// compare the Burn forward to the CPU forward without exposing
+/// `forward` or `ForwardState` directly.
+//
+// dead_code allowed: only the trainer_gpu test module calls this. When
+// Phase 3 lands a real GPU training loop, additional non-test consumers
+// will appear and the allow can be removed.
+#[allow(dead_code)]
+pub(crate) fn forward_output(net: &TrainNet, sample: &Sample) -> f32 {
+    forward(net, sample).output
+}
+
 fn forward(net: &TrainNet, sample: &Sample) -> ForwardState {
     let qa = QA as f32;
     let qb = QB as f32;
