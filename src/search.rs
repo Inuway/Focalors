@@ -953,7 +953,7 @@ pub fn search_lazy_smp(
 
 /// Evaluate a capture sequence on the target square without searching.
 /// Returns the material gain/loss from the moving side's perspective.
-fn see(board: &Board, mv: Move) -> Score {
+pub(crate) fn see(board: &Board, mv: Move) -> Score {
     let from = mv.from_sq();
     let to = mv.to_sq();
 

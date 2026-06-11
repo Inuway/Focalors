@@ -8,7 +8,8 @@ use crate::board::Board;
 use crate::eval::{self, EvalBreakdown, Score};
 use crate::movegen::{generate_legal_moves, make_move};
 use crate::moves::{Move, MoveFlag};
-use crate::search::{SearchResult, Searcher};
+use crate::eval::MATE_SCORE;
+use crate::search::{SearchResult, Searcher, see};
 use crate::types::*;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -155,7 +156,8 @@ struct PreparedPosition {
     move_number: usize,
     side: Color,
     san: String,
-    eval_before: Score,
+    /// Static eval of board_after (white POV) — fallback only; the real
+    /// played-eval comes from the next position's depth-N search.
     eval_after: Score,
 }
 
@@ -178,8 +180,6 @@ pub fn analyze_game(
 ) -> GameAnalysis {
     let total = uci_moves.len();
     let mut board = Board::startpos();
-    let mut eval_history = Vec::with_capacity(total + 1);
-    eval_history.push(eval::evaluate(&board));
 
     // ── Phase 1: sequential pre-pass — collect everything cheap ────────
     let mut prepared: Vec<Option<PreparedPosition>> = Vec::with_capacity(total);
@@ -197,12 +197,12 @@ pub fn analyze_game(
         };
 
         let is_forced = legal_moves.len() == 1;
-        let eval_before = to_white_perspective(eval::evaluate(&board), side);
         let san = crate::db::uci_to_san(&board, uci_move);
         let mut board_after = board.clone();
         make_move(&mut board_after, played_mv);
+        // Static eval kept only as a FALLBACK — the real played-eval is
+        // the depth-N search of the next position (phase 3).
         let eval_after = to_white_perspective(eval::evaluate(&board_after), board_after.side_to_move);
-        eval_history.push(eval_after);
 
         prepared.push(Some(PreparedPosition {
             board: board.clone(),
@@ -212,7 +212,6 @@ pub fn analyze_game(
             move_number,
             side,
             san,
-            eval_before,
             eval_after,
         }));
 
@@ -267,6 +266,43 @@ pub fn analyze_game(
     let prepared = Arc::into_inner(prepared_arc)
         .expect("worker threads should have dropped all Arc clones before scope exit");
 
+    // White-POV searched eval of each PRE-move position. For move i the
+    // position after the played move is prepared[i+1].board, so
+    // searched_white[i+1] doubles as move i's searched played-eval —
+    // comparing depth-N best against depth-N played instead of the old
+    // depth-N-vs-static mix that labeled engine-best tactical moves as
+    // blunders (and mates as cpl-28000 "Blunders").
+    let searched_white: Vec<Option<Score>> = prepared
+        .iter()
+        .enumerate()
+        .map(|(i, p)| match (p, &search_results[i]) {
+            (Some(p), Some(r)) => Some(to_white_perspective(r.score, p.side)),
+            _ => None,
+        })
+        .collect();
+
+    // The LAST move has no next-position search — run one. Terminal
+    // positions (mate/stalemate) get their exact score directly.
+    let last_some_idx = prepared.iter().rposition(|p| p.is_some());
+    let final_white: Option<Score> = last_some_idx.map(|i| {
+        let b = &prepared[i].as_ref().unwrap().board_after;
+        let legal = generate_legal_moves(b);
+        let stm_score = if legal.is_empty() {
+            let ksq = b.piece_bb(b.side_to_move, Piece::King).lsb();
+            if attacks::is_square_attacked(b, ksq, b.side_to_move.flip()) {
+                -MATE_SCORE
+            } else {
+                0
+            }
+        } else {
+            let mut searcher = Searcher::new(ANALYSIS_TT_MB_PER_THREAD);
+            searcher.use_nnue = use_nnue;
+            searcher.silent = true;
+            searcher.search(b, depth).score
+        };
+        to_white_perspective(stm_score, b.side_to_move)
+    });
+
     // ── Phase 3: sequential post-processing ────────────────────────────
     let mut analysis = Vec::with_capacity(total);
     for (i, prep_opt) in prepared.into_iter().enumerate() {
@@ -282,13 +318,35 @@ pub fn analyze_game(
         let best_eval = to_white_perspective(search_result.score, prep.side);
         let best_move_uci = search_result.best_move.to_uci();
 
-        let played_eval_for_side = to_side_perspective(prep.eval_after, prep.side);
+        // Searched played-eval: next position's search, or the extra
+        // final-position search for the last move. Static eval only as
+        // a last-resort fallback (e.g. unparseable next move).
+        let played_eval_white = if Some(i) == last_some_idx {
+            final_white
+        } else {
+            searched_white.get(i + 1).copied().flatten()
+        }
+        .unwrap_or(prep.eval_after);
+
+        let played_eval_for_side = to_side_perspective(played_eval_white, prep.side);
         let best_eval_for_side = to_side_perspective(best_eval, prep.side);
         let cpl = (best_eval_for_side - played_eval_for_side).max(0);
 
-        let mat_before = material_count(&prep.board, prep.side);
-        let mat_after = material_count(&prep.board_after, prep.side);
-        let was_sacrifice = mat_after < mat_before - 100 && cpl <= 20;
+        // Sacrifice: the move deliberately leaves material en prise (the
+        // opponent's best capture sequence wins >= ~minor-piece value, or
+        // the move itself was a losing capture by SEE) while the searched
+        // eval says it's still among the best moves. The old test
+        // compared the mover's own material before/after their own move,
+        // which is mathematically unsatisfiable — Brilliant was dead.
+        let was_sacrifice = cpl <= 20 && !prep.is_forced && {
+            let own_capture_losing = see(&prep.board, prep.played_mv) <= -100;
+            let opp_moves = generate_legal_moves(&prep.board_after);
+            let opp_best_see = (0..opp_moves.len())
+                .map(|j| see(&prep.board_after, opp_moves[j]))
+                .max()
+                .unwrap_or(0);
+            own_capture_losing || opp_best_see >= 100
+        };
 
         let classification = if prep.is_forced {
             MoveClass::Forced
@@ -320,14 +378,29 @@ pub fn analyze_game(
             move_number: prep.move_number,
             side: prep.side,
             move_san: prep.san,
-            eval_before: prep.eval_before,
-            eval_after: prep.eval_after,
+            // Searched values — the eval graph and accuracy formula
+            // consume these, so they must match what the classification
+            // was computed from.
+            eval_before: best_eval,
+            eval_after: played_eval_white,
             best_move_uci,
             best_eval,
             cpl,
             classification,
             explanation,
         });
+    }
+
+    // Eval graph from the same searched values the classifications use.
+    let initial_white = searched_white
+        .first()
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| eval::evaluate(&Board::startpos()));
+    let mut eval_history = Vec::with_capacity(analysis.len() + 1);
+    eval_history.push(initial_white);
+    for m in &analysis {
+        eval_history.push(m.eval_after);
     }
 
     // Compute accuracy
@@ -388,17 +461,6 @@ fn to_side_perspective(white_score: Score, side: Color) -> Score {
         Color::White => white_score,
         Color::Black => -white_score,
     }
-}
-
-/// Simple material count for one side.
-fn material_count(board: &Board, color: Color) -> Score {
-    let mut total = 0;
-    total += board.piece_bb(color, Piece::Pawn).popcount() as Score * 100;
-    total += board.piece_bb(color, Piece::Knight).popcount() as Score * 320;
-    total += board.piece_bb(color, Piece::Bishop).popcount() as Score * 330;
-    total += board.piece_bb(color, Piece::Rook).popcount() as Score * 500;
-    total += board.piece_bb(color, Piece::Queen).popcount() as Score * 900;
-    total
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -671,6 +733,27 @@ mod tests {
             matches!(nf6.classification, MoveClass::Inaccuracy | MoveClass::Mistake | MoveClass::Blunder),
             "Nf6 should be bad, got {:?} (cpl={})",
             nf6.classification, nf6.cpl
+        );
+
+        // Regression: the mate-delivering move must NOT be a blunder.
+        // The old depth-N-vs-static CPL labeled checkmating moves as
+        // Blunder with cpl ~28000 because the static eval of the mated
+        // position knew nothing about mate. With searched played-evals
+        // the cpl is ~0.
+        let qxf7 = result.moves.last().unwrap();
+        assert!(
+            matches!(qxf7.classification, MoveClass::Best | MoveClass::Good | MoveClass::Brilliant),
+            "mate-delivering move must be Best/Good, got {:?} (cpl={})",
+            qxf7.classification, qxf7.cpl
+        );
+        assert!(qxf7.cpl <= 50, "mate move cpl should be ~0, got {}", qxf7.cpl);
+
+        // The eval graph's final point must reflect the mate, not a
+        // static material count of the final position.
+        let last_eval = *result.eval_history.last().unwrap();
+        assert!(
+            last_eval > MATE_SCORE - 1000,
+            "final eval-history entry should be mate-magnitude for white, got {last_eval}"
         );
     }
 }
