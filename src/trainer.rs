@@ -715,7 +715,7 @@ fn quantize(net: &TrainNet) -> Vec<u8> {
         bytes.push(v as u8);
     }
 
-    let mut warn = |name: &str, n: usize, total: usize, range: &str| {
+    let warn = |name: &str, n: usize, total: usize, range: &str| {
         if n > 0 {
             eprintln!(
                 "  WARNING: {n}/{total} {name} saturated at the {range} boundary during \
