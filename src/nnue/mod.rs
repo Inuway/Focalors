@@ -219,7 +219,17 @@ const DEFAULT_NET: &[u8] = include_bytes!("../../nets/current.nnue");
 /// otherwise uses the embedded default net.
 pub fn init(path: Option<&str>) -> Result<(), String> {
     if get_network().is_some() {
-        return Ok(()); // already initialized
+        // The OnceLock cannot be replaced. Re-initializing with the
+        // default is a harmless no-op, but silently "accepting" a custom
+        // path while keeping the old net made every UCI
+        // `setoption EvalFile` net A/B test measure the wrong net.
+        return match path {
+            None => Ok(()),
+            Some(p) => Err(format!(
+                "NNUE network already initialized; cannot replace it with '{p}'. \
+                 Set EvalFile before the first search, or restart the engine."
+            )),
+        };
     }
 
     if let Some(p) = path {
@@ -238,7 +248,9 @@ pub fn init(path: Option<&str>) -> Result<(), String> {
 /// only exists when the user explicitly asks for a challenger.
 pub fn init_alt(path: &str) -> Result<(), String> {
     if get_alt_network().is_some() {
-        return Ok(()); // already initialized
+        return Err(format!(
+            "alt NNUE slot already initialized; cannot replace it with '{path}'"
+        ));
     }
     let data = std::fs::read(path)
         .map_err(|e| format!("Failed to read alt NNUE net file '{}': {}", path, e))?;

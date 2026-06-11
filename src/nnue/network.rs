@@ -118,6 +118,19 @@ impl Network {
         };
         let l3_weights = read_i8s(data, &mut cursor, L2_SIZE)?;
 
+        // Strict size check: trailing bytes mean this is not a net for
+        // this architecture. Without it, a future bigger-architecture
+        // net, a training-data file, or any blob >= our size would
+        // "validate" and load as garbage weights — and `focalors
+        // promote` relies on this function as its only safety gate
+        // before embedding a default net into the shipped binary.
+        if cursor != data.len() {
+            return Err(format!(
+                "NNUE file size mismatch: expected exactly {cursor} bytes, got {}",
+                data.len()
+            ));
+        }
+
         Ok(Network {
             ft_weights,
             ft_biases,
@@ -341,5 +354,23 @@ mod tests {
     fn rejects_truncated_data() {
         let result = Network::from_bytes(&[0u8; 100]);
         assert!(result.is_err());
+    }
+
+    /// Regression: files LARGER than the exact format size must be
+    /// rejected too. The old loader parsed the prefix and ignored
+    /// trailing bytes, so a wrong-architecture net or a 22 MB
+    /// training-data file "validated" through `focalors promote` and
+    /// could be embedded as the shipping default net.
+    #[test]
+    fn rejects_trailing_bytes() {
+        // Exact-size zero net parses...
+        let exact = vec![0u8; 411_428];
+        assert!(Network::from_bytes(&exact).is_ok());
+        // ...one extra byte must fail.
+        let mut padded = exact;
+        padded.push(0);
+        assert!(Network::from_bytes(&padded).is_err());
+        // A much larger blob (like a data file) must fail as well.
+        assert!(Network::from_bytes(&vec![0u8; 1_000_000]).is_err());
     }
 }

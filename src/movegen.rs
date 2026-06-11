@@ -78,21 +78,30 @@ pub fn make_move(board: &mut Board, mv: Move) {
 
             update_castling_rights(board, from, to);
 
-            // En passant
+            // En passant. Record the ep square only when an enemy pawn
+            // can actually capture onto it — per FIDE 9.2.2 two
+            // positions are the same for repetition purposes when no ep
+            // capture is genuinely available, so a phantom ep key would
+            // make identical positions hash differently and delay
+            // threefold detection.
             board.en_passant = None;
             if piece == Piece::Pawn {
                 let diff = (to.0 as i8 - from.0 as i8).unsigned_abs();
                 if diff == 16 {
                     let ep_sq = Square((from.0 as i16 + (to.0 as i16 - from.0 as i16) / 2) as u8);
-                    board.en_passant = Some(ep_sq);
-                    board.hash ^= zobrist::en_passant_key(ep_sq.file());
+                    if (pawn_attacks(us, ep_sq) & board.piece_bb(them, Piece::Pawn))
+                        .is_not_empty()
+                    {
+                        board.en_passant = Some(ep_sq);
+                        board.hash ^= zobrist::en_passant_key(ep_sq.file());
+                    }
                 }
             }
 
             if piece == Piece::Pawn || was_capture {
                 board.halfmove_clock = 0;
             } else {
-                board.halfmove_clock += 1;
+                board.halfmove_clock = board.halfmove_clock.saturating_add(1);
             }
         }
         MoveFlag::Promotion => {
@@ -155,7 +164,7 @@ pub fn make_move(board: &mut Board, mv: Move) {
             }
 
             board.en_passant = None;
-            board.halfmove_clock += 1;
+            board.halfmove_clock = board.halfmove_clock.saturating_add(1);
         }
     }
 

@@ -132,8 +132,15 @@ impl MoveList {
     }
 
     pub fn push(&mut self, mv: Move) {
-        self.moves[self.len] = mv;
-        self.len += 1;
+        // 256 covers any legal position (max ~218 legal moves), but
+        // FEN-loaded positions with illegal piece counts can generate
+        // more pseudo-legal moves than that. Dropping the overflow is
+        // harmless in an already-illegal position; indexing past the
+        // array would abort the whole app (panic = abort in release).
+        if self.len < self.moves.len() {
+            self.moves[self.len] = mv;
+            self.len += 1;
+        }
     }
 
     pub fn len(&self) -> usize {

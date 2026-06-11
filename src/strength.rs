@@ -194,34 +194,39 @@ pub fn select_move(
         return best_move;
     }
 
-    // Score the top-N candidate moves with a shallow verification search
+    // Score EVERY legal move with a shallow verification search, then
+    // keep the genuine top N as softmax candidates. The previous version
+    // took the FIRST n-1 moves in movegen order — i.e. arbitrary
+    // queenside pawn pushes — so the "alternatives" were random legal
+    // moves rather than the engine's actual 2nd/3rd choices, defeating
+    // the level calibration entirely.
     let verify_depth = search_depth.saturating_sub(2).max(1);
     let n = config.top_n_moves.min(legal_moves.len());
-
-    let mut candidates: Vec<(Move, Score)> = Vec::with_capacity(n);
-    candidates.push((best_move, best_score));
 
     // Silence the searcher during verification searches
     let was_silent = searcher.silent;
     searcher.silent = true;
 
+    let mut scored: Vec<(Move, Score)> = Vec::with_capacity(legal_moves.len());
     for i in 0..legal_moves.len() {
-        if candidates.len() >= n {
-            break;
-        }
         let mv = legal_moves[i];
         if mv == best_move {
-            continue;
+            continue; // already scored at full depth
         }
         // Play the move, search from opponent's perspective, negate
         let mut child = board.clone();
         make_move(&mut child, mv);
         let result = searcher.search(&child, verify_depth);
-        let score = -result.score; // negate: opponent's score → our score
-        candidates.push((mv, score));
+        scored.push((mv, -result.score));
     }
 
     searcher.silent = was_silent;
+
+    // Best move (full-depth score) + the n-1 strongest alternatives.
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut candidates: Vec<(Move, Score)> = Vec::with_capacity(n);
+    candidates.push((best_move, best_score));
+    candidates.extend(scored.into_iter().take(n.saturating_sub(1)));
 
     // Sort by score descending (best first)
     candidates.sort_by(|a, b| b.1.cmp(&a.1));

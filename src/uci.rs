@@ -1,10 +1,15 @@
 use std::io::{self, BufRead};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::Duration;
 
 use crate::board::Board;
 use crate::movegen::{generate_legal_moves, make_move};
 use crate::moves::Move;
 use crate::nnue;
-use crate::search::{SearchResult, Searcher};
+use crate::search::{SearchResult, Searcher, uci_score_string};
 use crate::types::{Color, Square};
 
 /// What the "go" command asked for.
@@ -16,19 +21,32 @@ enum SearchLimit {
 }
 
 pub fn uci_loop() {
-    let nnue_available = nnue::network::get_network().is_some();
-
-    let stdin = io::stdin();
     let mut board = Board::startpos();
     let mut position_hashes: Vec<u64> = vec![board.hash];
     let mut searcher = Searcher::new(64);
-    searcher.use_nnue = nnue_available;
+    // UseNNUE preference. The network itself is initialized LAZILY at
+    // the first search, so `setoption name EvalFile` can install a
+    // custom net first — the global slot cannot be replaced once the
+    // embedded default is loaded, which used to make EvalFile a silent
+    // no-op that still printed success.
+    let mut nnue_pref = true;
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+    // Dedicated stdin reader so commands can be received WHILE a search
+    // runs. Previously `go infinite` ran a depth-64 search synchronously
+    // inside the read loop — "stop" was never even read, hanging any GUI
+    // that uses infinite analysis mode.
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(l) = line else { break };
+            if line_tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+
+    'outer: while let Ok(line) = line_rx.recv() {
         let line = line.trim().to_string();
         if line.is_empty() { continue; }
 
@@ -37,7 +55,7 @@ pub fn uci_loop() {
             "uci" => {
                 println!("id name Focalors 0.3.0");
                 println!("id author mPmprz");
-                println!("option name UseNNUE type check default {nnue_available}");
+                println!("option name UseNNUE type check default true");
                 println!("option name EvalFile type string default <internal>");
                 println!("uciok");
             }
@@ -51,13 +69,13 @@ pub fn uci_loop() {
                     let value = tokens[vi + 1..].join(" ");
                     match name.to_lowercase().as_str() {
                         "usennue" => {
-                            searcher.use_nnue = value == "true" && nnue_available;
+                            nnue_pref = value == "true";
                         }
                         "evalfile" => {
                             if value != "<internal>" {
                                 match nnue::init(Some(&value)) {
                                     Ok(()) => {
-                                        searcher.use_nnue = true;
+                                        nnue_pref = true;
                                         eprintln!("info string Loaded NNUE net from {value}");
                                     }
                                     Err(e) => eprintln!("info string Failed to load net: {e}"),
@@ -79,8 +97,48 @@ pub fn uci_loop() {
                 position_hashes = hashes;
             }
             "go" => {
+                // Lazy default-net init (skipped when EvalFile installed one).
+                if nnue::network::get_network().is_none() {
+                    match nnue::init(None) {
+                        Ok(()) => eprintln!("info string NNUE initialized"),
+                        Err(_) => eprintln!("info string NNUE not available, using HCE"),
+                    }
+                }
+                searcher.use_nnue = nnue_pref && nnue::network::get_network().is_some();
                 searcher.set_position_history(position_hashes.clone());
-                let result = execute_go(&mut searcher, &board, &tokens);
+
+                let stop_flag = Arc::new(AtomicBool::new(false));
+                searcher.external_stop = Some(Arc::clone(&stop_flag));
+                let mut quit_after = false;
+
+                // Search on a worker; keep consuming stdin so "stop"
+                // (and "isready"/"quit") work mid-search per the UCI spec.
+                let result = thread::scope(|s| {
+                    let handle = s.spawn(|| execute_go(&mut searcher, &board, &tokens));
+                    loop {
+                        if handle.is_finished() {
+                            break handle.join().expect("search thread panicked");
+                        }
+                        match line_rx.recv_timeout(Duration::from_millis(10)) {
+                            Ok(cmd) => match cmd.trim() {
+                                "stop" => stop_flag.store(true, Ordering::Relaxed),
+                                "quit" => {
+                                    stop_flag.store(true, Ordering::Relaxed);
+                                    quit_after = true;
+                                }
+                                "isready" => println!("readyok"),
+                                _ => {} // other commands mid-search are dropped
+                            },
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => {
+                                stop_flag.store(true, Ordering::Relaxed);
+                                quit_after = true;
+                            }
+                        }
+                    }
+                });
+                searcher.external_stop = None;
+
                 let pv_str = if result.pv.is_empty() {
                     result.best_move.to_string()
                 } else {
@@ -92,10 +150,16 @@ pub fn uci_loop() {
                         .join(" ")
                 };
                 println!(
-                    "info depth {} score cp {} nodes {} pv {}",
-                    result.depth, result.score, result.nodes, pv_str
+                    "info depth {} score {} nodes {} pv {}",
+                    result.depth,
+                    uci_score_string(result.score),
+                    result.nodes,
+                    pv_str
                 );
                 println!("bestmove {}", result.best_move);
+                if quit_after {
+                    break 'outer;
+                }
             }
             "quit" => break,
             "d" | "display" => {

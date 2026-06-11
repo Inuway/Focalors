@@ -38,7 +38,11 @@ pub fn parse_pgn(text: &str) -> Result<ParsedPgn, String> {
     let mut board = Board::startpos();
 
     for (ply, raw_token) in cleaned.split_whitespace().enumerate() {
-        let token = raw_token.trim_end_matches(['!', '?', '+', '#']);
+        // Normalize typographic dashes (smart punctuation from web pages
+        // and word processors) so "1–0" is recognized as a result token
+        // instead of reaching the SAN parser.
+        let normalized = raw_token.replace(['–', '—'], "-");
+        let token = normalized.trim_end_matches(['!', '?', '+', '#']);
         if token.is_empty() {
             continue;
         }
@@ -46,6 +50,21 @@ pub fn parse_pgn(text: &str) -> Result<ParsedPgn, String> {
             if is_result_token(token) && parsed.result.is_none() {
                 parsed.result = Some(token.to_string());
             }
+            continue;
+        }
+        // Compact move numbers ("1.e4", "12...Nf6" — SCID, many sites,
+        // hand-typed PGN): strip the numeric prefix and parse the rest
+        // as SAN. Result tokens like "1-0" don't match (no dot after
+        // the digits) and were already handled above.
+        let token = {
+            let stripped = token.trim_start_matches(|c: char| c.is_ascii_digit());
+            if stripped.len() < token.len() && stripped.starts_with('.') {
+                stripped.trim_start_matches('.')
+            } else {
+                token
+            }
+        };
+        if token.is_empty() {
             continue;
         }
         let mv = san_to_move(&board, token).map_err(|e| {
@@ -171,18 +190,22 @@ pub fn san_to_move(board: &Board, san: &str) -> Result<Move, String> {
         (Piece::Pawn, body)
     };
 
-    let rest_no_x: String = rest.chars().filter(|&c| c != 'x').collect();
+    // Work on chars, not byte slices: a multibyte character in a token
+    // (e.g. an en dash that survived normalization, or pasted Unicode)
+    // would make byte-index slicing panic mid-codepoint and abort the
+    // whole app.
+    let rest_no_x: Vec<char> = rest.chars().filter(|&c| c != 'x').collect();
     if rest_no_x.len() < 2 {
         return Err("destination square missing".to_string());
     }
-    let dest_str = &rest_no_x[rest_no_x.len() - 2..];
-    let dest = Square::from_algebraic(dest_str)
+    let dest_str: String = rest_no_x[rest_no_x.len() - 2..].iter().collect();
+    let dest = Square::from_algebraic(&dest_str)
         .ok_or_else(|| format!("bad destination '{dest_str}'"))?;
     let disambig = &rest_no_x[..rest_no_x.len() - 2];
 
     let mut want_file: Option<u8> = None;
     let mut want_rank: Option<u8> = None;
-    for c in disambig.chars() {
+    for &c in disambig {
         if ('a'..='h').contains(&c) {
             want_file = Some((c as u8) - b'a');
         } else if ('1'..='8').contains(&c) {
@@ -266,6 +289,38 @@ mod tests {
         let p = parse_pgn(pgn).unwrap();
         assert_eq!(p.uci_moves, vec!["e2e4", "e7e5", "g1f3", "b8c6"]);
         assert_eq!(p.result.as_deref(), Some("1-0"));
+    }
+
+    /// Regression: a typeset en-dash result ("1–0", standard smart
+    /// punctuation when copying from web pages or word processors) must
+    /// parse as a result token — the old byte-index slicing panicked
+    /// mid-codepoint and aborted the whole app from the paste box.
+    #[test]
+    fn unicode_dash_result_does_not_panic() {
+        init();
+        let p = parse_pgn("1. e4 e5 1\u{2013}0").unwrap();
+        assert_eq!(p.uci_moves, vec!["e2e4", "e7e5"]);
+        assert_eq!(p.result.as_deref(), Some("1-0"));
+        // Arbitrary multibyte garbage must error cleanly, not panic.
+        assert!(parse_pgn("1. e4 e\u{2014}5").is_err());
+    }
+
+    /// Regression: compact move numbers with no space after the dot
+    /// ("1.e4" — SCID, many sites, hand-typed) must import correctly.
+    /// The old parser fed "1.e4" to the SAN matcher, where the leading
+    /// digit became a rank disambiguator — and mixed spacing could even
+    /// silently match a WRONG move ("2.Nf3" parsed as the pawn move f3).
+    #[test]
+    fn compact_move_numbers_parse() {
+        init();
+        let p = parse_pgn("1.e4 e5 2.Nf3 Nc6").unwrap();
+        assert_eq!(p.uci_moves, vec!["e2e4", "e7e5", "g1f3", "b8c6"]);
+        // Mixed spacing — the silent-wrong-move corner.
+        let p = parse_pgn("1. e4 e5 2.Nf3 Nc6").unwrap();
+        assert_eq!(p.uci_moves[2], "g1f3", "2.Nf3 must be the knight, not pawn f3");
+        // Black-side continuation form.
+        let p = parse_pgn("1.e4 1...e5 2.Nf3").unwrap();
+        assert_eq!(p.uci_moves, vec!["e2e4", "e7e5", "g1f3"]);
     }
 
     #[test]

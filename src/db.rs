@@ -501,28 +501,40 @@ impl Database {
         uci_moves: &[String],
         moves: &[crate::analysis::MoveAnalysis],
     ) -> SqlResult<()> {
-        let mut stmt = self.conn.prepare(
-            "INSERT INTO move_analysis (game_id, move_number, side, move_uci, move_san,
-             eval_before, eval_after, best_move, best_eval, classification)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        // Idempotent: clear any previous analysis rows for this game in
+        // the same transaction as the inserts. Bare appends meant a
+        // re-analysis (or a stale overlapping run) left two interleaved
+        // move sets under one game id — permanently corrupting the
+        // review panel and accuracy history.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM move_analysis WHERE game_id = ?1",
+            params![game_id],
         )?;
-        for (i, ma) in moves.iter().enumerate() {
-            let side = if ma.side == crate::types::Color::White { "white" } else { "black" };
-            let uci = uci_moves.get(i).map(|s| s.as_str()).unwrap_or("");
-            stmt.execute(params![
-                game_id,
-                ma.move_number as i32,
-                side,
-                uci,
-                ma.move_san,
-                ma.eval_before,
-                ma.eval_after,
-                ma.best_move_uci,
-                ma.best_eval,
-                ma.classification.to_db_str(),
-            ])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO move_analysis (game_id, move_number, side, move_uci, move_san,
+                 eval_before, eval_after, best_move, best_eval, classification)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for (i, ma) in moves.iter().enumerate() {
+                let side = if ma.side == crate::types::Color::White { "white" } else { "black" };
+                let uci = uci_moves.get(i).map(|s| s.as_str()).unwrap_or("");
+                stmt.execute(params![
+                    game_id,
+                    ma.move_number as i32,
+                    side,
+                    uci,
+                    ma.move_san,
+                    ma.eval_before,
+                    ma.eval_after,
+                    ma.best_move_uci,
+                    ma.best_eval,
+                    ma.classification.to_db_str(),
+                ])?;
+            }
         }
-        Ok(())
+        tx.commit()
     }
 
     /// Get the saved accuracy for a game, or None if it hasn't been

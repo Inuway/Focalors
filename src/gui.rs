@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -513,6 +513,11 @@ enum AnalysisState {
         analysis: crate::analysis::GameAnalysis,
         puzzles: Vec<crate::puzzles::PuzzleCandidate>,
         uci_moves: Vec<String>,
+        /// The game this analysis belongs to, captured when the worker
+        /// was SPAWNED — never read from current UI state at persist
+        /// time, or a stale worker finishing late would save game A's
+        /// moves under whatever game the user has navigated to since.
+        game_id: Option<i64>,
     },
 }
 
@@ -574,6 +579,8 @@ pub struct FocalorsApp {
     /// If set, completed analysis should be persisted against this game id
     /// instead of the most-recent-game fallback.
     analysis_target_game_id: Option<i64>,
+    /// Monotonic stamp for analysis workers; see start_analysis.
+    analysis_generation: Arc<AtomicU64>,
     /// Cache of (game_id → final-position board) for History thumbnails.
     /// Computed lazily on first display, never invalidated since saved game
     /// PGNs don't change after persistence.
@@ -608,6 +615,11 @@ pub struct FocalorsApp {
     pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
     pgn_import_error: Option<String>,
     pgn_import_user_color: Color,
+    /// Cache for the live PGN parse, keyed on the exact import text.
+    /// parse_pgn replays the whole game (legal movegen per SAN token),
+    /// so re-running it every frame while text sits in the box wastes
+    /// milliseconds per frame on long games.
+    pgn_parse_cache: Option<(String, Result<crate::pgn::ParsedPgn, String>)>,
 }
 
 /// Replay the saved PGN once, building parallel `boards`/`moves` vectors so the
@@ -779,6 +791,7 @@ impl FocalorsApp {
             analysis_state: Arc::new(Mutex::new(AnalysisState::Idle)),
             analysis_review_cursor: 0,
             analysis_target_game_id: None,
+            analysis_generation: Arc::new(AtomicU64::new(0)),
             history_thumbnails: std::collections::HashMap::new(),
             selected_square: None,
             drag_state: None,
@@ -804,6 +817,7 @@ impl FocalorsApp {
             pgn_import_parsed: None,
             pgn_import_error: None,
             pgn_import_user_color: Color::White,
+            pgn_parse_cache: None,
         }
     }
 
@@ -2325,6 +2339,7 @@ impl FocalorsApp {
                                 analysis,
                                 puzzles: Vec::new(),
                                 uci_moves: Vec::new(),
+                                game_id: Some(game_id),
                             };
                         self.analysis_target_game_id = Some(game_id);
                         self.analysis_review_cursor = 0;
@@ -2504,6 +2519,16 @@ impl FocalorsApp {
     fn start_analysis(&mut self, uci_moves: Vec<String>, user_color: Color) {
         let analysis_state = self.analysis_state.clone();
 
+        // Generation stamp: starting a new analysis invalidates any
+        // still-running older worker. Stale workers compare their stamp
+        // against the counter before every state write and discard their
+        // results — otherwise a slow analysis of game A finishing late
+        // would overwrite game B's state and persist A's moves under
+        // B's id (permanent DB corruption).
+        let my_gen = self.analysis_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let gen_counter = Arc::clone(&self.analysis_generation);
+        let target_game_id = self.analysis_target_game_id;
+
         {
             let mut a = analysis_state.lock().unwrap();
             *a = AnalysisState::Running {
@@ -2523,11 +2548,20 @@ impl FocalorsApp {
             // the UI spinner would hang. The guard runs on any unwind and
             // resets state to Idle so the user can retry. On the success path
             // the state has already moved to Complete, so the guard sees a
-            // non-Running state and does nothing.
-            struct ResetGuard(Arc<Mutex<AnalysisState>>);
+            // non-Running state and does nothing. A STALE worker's guard
+            // must not touch state owned by a newer run, hence the
+            // generation check.
+            struct ResetGuard {
+                state: Arc<Mutex<AnalysisState>>,
+                gen_counter: Arc<AtomicU64>,
+                my_gen: u64,
+            }
             impl Drop for ResetGuard {
                 fn drop(&mut self) {
-                    let mut a = match self.0.lock() {
+                    if self.gen_counter.load(Ordering::SeqCst) != self.my_gen {
+                        return;
+                    }
+                    let mut a = match self.state.lock() {
                         Ok(g) => g,
                         Err(poisoned) => poisoned.into_inner(),
                     };
@@ -2540,7 +2574,11 @@ impl FocalorsApp {
                     }
                 }
             }
-            let _reset_guard = ResetGuard(analysis_state.clone());
+            let _reset_guard = ResetGuard {
+                state: analysis_state.clone(),
+                gen_counter: gen_counter.clone(),
+                my_gen,
+            };
 
             crate::attacks::init();
             let use_nnue = crate::nnue::network::get_network().is_some();
@@ -2550,6 +2588,9 @@ impl FocalorsApp {
                 analysis_depth,
                 use_nnue,
                 &mut |cur, tot| {
+                    if gen_counter.load(Ordering::SeqCst) != my_gen {
+                        return; // superseded — don't clobber the new run's progress
+                    }
                     let mut a = analysis_state.lock().unwrap();
                     *a = AnalysisState::Running {
                         progress: cur,
@@ -2562,7 +2603,15 @@ impl FocalorsApp {
                 &uci_moves, &result, user_color, user_rating,
             );
             let mut a = analysis_state.lock().unwrap();
-            *a = AnalysisState::Complete { analysis: result, puzzles, uci_moves };
+            if gen_counter.load(Ordering::SeqCst) != my_gen {
+                return; // superseded while finishing — discard silently
+            }
+            *a = AnalysisState::Complete {
+                analysis: result,
+                puzzles,
+                uci_moves,
+                game_id: target_game_id,
+            };
         });
     }
 
@@ -2666,10 +2715,11 @@ impl FocalorsApp {
     /// when set, falling back to the most recent saved game). Clears `puzzles`
     /// and `uci_moves` on the `Complete` state to mark "already saved".
     fn persist_completed_analysis(&mut self) {
-        let target = self.analysis_target_game_id;
         let acc_opt: Option<f64> = {
             let analysis = self.analysis_state.lock().unwrap();
-            if let AnalysisState::Complete { puzzles, analysis: ga, uci_moves } = &*analysis {
+            if let AnalysisState::Complete { puzzles, analysis: ga, uci_moves, game_id } =
+                &*analysis
+            {
                 if let Some(ref db) = self.db {
                     if !puzzles.is_empty() {
                         for p in puzzles {
@@ -2683,7 +2733,10 @@ impl FocalorsApp {
                         }
                     }
                     if !uci_moves.is_empty() {
-                        let game_id = target.or_else(|| {
+                        // Use the id captured when the worker was spawned —
+                        // NOT current UI state, which may point at a
+                        // different game by the time a slow analysis lands.
+                        let game_id = game_id.or_else(|| {
                             db.get_recent_games(1)
                                 .ok()
                                 .and_then(|g| g.into_iter().next())
@@ -2741,10 +2794,20 @@ impl FocalorsApp {
 
             // Live PGN parse — drives the validation badge and the parsed
             // panel state without requiring an explicit "Parse" click.
+            // Re-parsed only when the text actually changes.
             let pgn_validation = if self.pgn_import_text.trim().is_empty() {
+                self.pgn_parse_cache = None;
                 None
             } else {
-                Some(crate::pgn::parse_pgn(&self.pgn_import_text))
+                let stale = self
+                    .pgn_parse_cache
+                    .as_ref()
+                    .is_none_or(|(text, _)| *text != self.pgn_import_text);
+                if stale {
+                    let result = crate::pgn::parse_pgn(&self.pgn_import_text);
+                    self.pgn_parse_cache = Some((self.pgn_import_text.clone(), result));
+                }
+                self.pgn_parse_cache.as_ref().map(|(_, r)| r.clone())
             };
             // Resync the suggested user color whenever the parsed PGN
             // changes — first call after a paste, then leave it sticky so

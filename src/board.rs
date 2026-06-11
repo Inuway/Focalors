@@ -192,8 +192,18 @@ impl Board {
 
             for ch in rank_str.chars() {
                 if let Some(skip) = ch.to_digit(10) {
-                    file += skip as u8;
+                    // Bounds-check BEFORE accumulating: a crafted rank
+                    // like "999..." would otherwise overflow the u8 (and
+                    // in release silently wrap, placing pieces on wrong
+                    // squares while still passing the file == 8 check).
+                    file = file
+                        .checked_add(skip as u8)
+                        .filter(|f| *f <= 8)
+                        .ok_or_else(|| format!("Rank {rank} runs past file h"))?;
                 } else {
+                    if file >= 8 {
+                        return Err(format!("Rank {rank} runs past file h"));
+                    }
                     let color = if ch.is_uppercase() {
                         Color::White
                     } else {
@@ -218,6 +228,19 @@ impl Board {
             }
         }
 
+        // Semantic validation: exactly one king per side. Movegen
+        // assumes a king exists (it takes lsb() of the king bitboard
+        // unconditionally); a kingless board would index out of bounds
+        // and abort the process.
+        for color in [Color::White, Color::Black] {
+            let kings = board.piece_bb(color, Piece::King).popcount();
+            if kings != 1 {
+                return Err(format!(
+                    "{color:?} must have exactly one king, found {kings}"
+                ));
+            }
+        }
+
         // 2) Side to move
         board.side_to_move = match parts[1] {
             "w" => Color::White,
@@ -236,14 +259,48 @@ impl Board {
                     _ => return Err(format!("Invalid castling character: {ch}")),
                 };
             }
+
+            // Mask rights against actual piece placement — castling
+            // move generation trusts these bits and would otherwise
+            // conjure a rook (or a second king) out of thin air when a
+            // FEN claims rights without the pieces on their home squares.
+            let has = |color: Color, piece: Piece, sq: u8| {
+                (board.piece_bb(color, piece) & Bitboard::from_square(Square(sq))).is_not_empty()
+            };
+            let wk = has(Color::White, Piece::King, 4);
+            let bk = has(Color::Black, Piece::King, 60);
+            let keep_wk = wk && has(Color::White, Piece::Rook, 7);
+            let keep_wq = wk && has(Color::White, Piece::Rook, 0);
+            let keep_bk = bk && has(Color::Black, Piece::Rook, 63);
+            let keep_bq = bk && has(Color::Black, Piece::Rook, 56);
+            if !keep_wk {
+                board.castling.remove(CastlingRights::WHITE_KING);
+            }
+            if !keep_wq {
+                board.castling.remove(CastlingRights::WHITE_QUEEN);
+            }
+            if !keep_bk {
+                board.castling.remove(CastlingRights::BLACK_KING);
+            }
+            if !keep_bq {
+                board.castling.remove(CastlingRights::BLACK_QUEEN);
+            }
         }
 
-        // 4) En passant target square
+        // 4) En passant target square. Keep it only when a side-to-move
+        // pawn can actually capture onto it — mirrors make_move's
+        // condition so FEN-loaded and move-reached positions hash
+        // identically (matters for repetition detection and the TT).
         if parts[3] != "-" {
-            board.en_passant = Some(
-                Square::from_algebraic(parts[3])
-                    .ok_or_else(|| format!("Invalid en passant square: {}", parts[3]))?,
-            );
+            let ep_sq = Square::from_algebraic(parts[3])
+                .ok_or_else(|| format!("Invalid en passant square: {}", parts[3]))?;
+            let pusher = board.side_to_move.flip();
+            if (crate::attacks::pawn_attacks(pusher, ep_sq)
+                & board.piece_bb(board.side_to_move, Piece::Pawn))
+            .is_not_empty()
+            {
+                board.en_passant = Some(ep_sq);
+            }
         }
 
         // 5) Halfmove clock (optional)
@@ -465,11 +522,93 @@ mod tests {
 
     #[test]
     fn fen_with_en_passant() {
-        let fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
+        // Black pawn on d4 can genuinely capture onto e3 → ep kept.
+        let fen = "rnbqkbnr/ppp1pppp/8/8/3pP3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 3";
         let board = Board::from_fen(fen).unwrap();
         assert_eq!(board.en_passant, Some(Square::from_algebraic("e3").unwrap()));
         assert_eq!(board.side_to_move, Color::Black);
         assert_eq!(board.to_fen(), fen);
+    }
+
+    /// FIDE 9.2.2: an ep square only distinguishes positions when an ep
+    /// capture is actually available. A phantom ep square (no enemy pawn
+    /// adjacent) must be dropped so the position hashes identically to
+    /// the same placement reached without the double push.
+    #[test]
+    fn phantom_en_passant_is_filtered() {
+        // After 1.e4: no black pawn can capture onto e3.
+        let with_phantom =
+            Board::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")
+                .unwrap();
+        assert_eq!(with_phantom.en_passant, None, "uncapturable ep must be dropped");
+
+        // Identical placement declared without the ep square: same hash.
+        let without =
+            Board::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+                .unwrap();
+        assert_eq!(
+            with_phantom.hash, without.hash,
+            "phantom ep must not change the zobrist hash"
+        );
+    }
+
+    /// Same rule applied by make_move: a double push with no adjacent
+    /// enemy pawn must not set the ep square, so the position hashes the
+    /// same as one reached by slow maneuvering.
+    #[test]
+    fn double_push_without_capturer_sets_no_ep() {
+        crate::attacks::init();
+        let mut board = Board::startpos();
+        // 1.e4 — no black pawn can take en passant.
+        let e2e4 = crate::moves::Move::new(Square(12), Square(28));
+        crate::movegen::make_move(&mut board, e2e4);
+        assert_eq!(board.en_passant, None);
+        // Hash must equal the from-scratch hash of the same position.
+        assert_eq!(board.hash, crate::zobrist::hash_position(&board));
+    }
+
+    #[test]
+    fn kingless_fen_is_rejected() {
+        assert!(Board::from_fen("8/8/8/8/8/8/8/8 w - - 0 1").is_err());
+        assert!(Board::from_fen("8/8/8/4k3/8/8/8/8 w - - 0 1").is_err());
+        // Two kings of one color also rejected.
+        assert!(Board::from_fen("4k3/8/8/8/8/8/8/2K1K3 w - - 0 1").is_err());
+    }
+
+    #[test]
+    fn castling_rights_masked_against_placement() {
+        // Rights claimed but no rooks: rights dropped, castling not generated.
+        let board = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w KQ - 0 1").unwrap();
+        assert_eq!(board.castling, CastlingRights::NONE);
+
+        // King not on e1: all white rights dropped even with rooks present.
+        let board = Board::from_fen("r3k2r/8/8/8/8/8/8/R2K3R w KQkq - 0 1").unwrap();
+        assert!(!board.castling.contains(CastlingRights::WHITE_KING));
+        assert!(!board.castling.contains(CastlingRights::WHITE_QUEEN));
+        assert!(board.castling.contains(CastlingRights::BLACK_KING));
+        assert!(board.castling.contains(CastlingRights::BLACK_QUEEN));
+    }
+
+    #[test]
+    fn fen_digit_overflow_is_rejected() {
+        // Digits summing past file h must error, not wrap the u8.
+        let many_nines = "9".repeat(29);
+        assert!(Board::from_fen(&format!("{many_nines}/8/8/8/8/8/8/4K2k w - - 0 1")).is_err());
+        assert!(
+            Board::from_fen("8r9999999999999999999999999993/8/8/8/8/8/8/4K2k w - - 0 1").is_err()
+        );
+    }
+
+    #[test]
+    fn dense_position_does_not_overflow_movelist() {
+        crate::attacks::init();
+        // 22 queens: >256 pseudo-legal moves. Must not abort.
+        let board = Board::from_fen(
+            "1QQkQQ2/Q5QK/Q5Q1/Q2Q2Q1/Q6Q/Q6Q/4QQ1Q/QQQ4Q w - - 0 1",
+        )
+        .unwrap();
+        let moves = crate::movegen::generate_legal_moves(&board);
+        assert!(moves.len() <= 256);
     }
 
     #[test]
