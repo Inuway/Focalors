@@ -45,6 +45,25 @@ fn score_to_tt(score: Score, ply: u32) -> Score {
     else { score }
 }
 
+/// Format a search score for UCI output: mate scores (encoded as
+/// MATE_SCORE - ply) become "mate N" in full moves, signed from the side
+/// to move's perspective; everything else is "cp X". GUIs and match
+/// adjudicators rely on the mate form — a raw "cp 28997" reads as a
+/// nonsense eval.
+pub(crate) fn uci_score_string(score: Score) -> String {
+    if score.abs() >= MATE_BOUND {
+        let plies = MATE_SCORE - score.abs();
+        let mate_in = (plies + 1) / 2;
+        if score > 0 {
+            format!("mate {mate_in}")
+        } else {
+            format!("mate -{mate_in}")
+        }
+    } else {
+        format!("cp {score}")
+    }
+}
+
 /// Inverse of `score_to_tt`: rebase a position-relative mate score to the
 /// probing search's current ply. No-op for non-mate scores.
 fn score_from_tt(score: Score, ply: u32) -> Score {
@@ -349,8 +368,11 @@ impl Searcher {
 
             if !self.silent {
                 eprintln!(
-                    "info depth {} score cp {} nodes {} pv {}",
-                    depth, score, self.nodes, best_result.best_move
+                    "info depth {} score {} nodes {} pv {}",
+                    depth,
+                    uci_score_string(score),
+                    self.nodes,
+                    best_result.best_move
                 );
             }
 
@@ -549,7 +571,7 @@ impl Searcher {
                 // would compare mismatched frames (off by exactly ply).
                 if entry.depth as u32 >= depth - 3
                     && matches!(entry.flag, TTFlag::Exact | TTFlag::LowerBound)
-                    && entry.score.abs() < MATE_SCORE - MAX_PLY as Score
+                    && entry.score.abs() < MATE_BOUND
                 {
                     let s_beta = entry.score - (depth as Score * 2);
                     let s_depth = (depth - 1) / 2;
