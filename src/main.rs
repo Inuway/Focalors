@@ -41,7 +41,10 @@ fn main() {
         }
         #[cfg(feature = "gpu-training")]
         Some("train-gpu") => {
-            let data_path = args.get(2).expect("Usage: focalors train-gpu <data_file> [options]");
+            let Some(data_path) = args.get(2) else {
+                eprintln!("Usage: focalors train-gpu <data_file> [options]");
+                std::process::exit(1);
+            };
             trainer_gpu::run_training_gpu(data_path, &args[3..]);
         }
         Some("promote") => {

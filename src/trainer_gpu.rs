@@ -25,7 +25,8 @@ use burn::tensor::{Int, Shape, Tensor, TensorData};
 use crate::nnue::features::NUM_FEATURES;
 use crate::nnue::network::{FT_SIZE, L1_INPUT, L1_SIZE, L2_SIZE, QA, QB};
 use crate::trainer::{
-    Rng, SIGMOID_SCALE, Sample, TrainNet, load_data, load_data_multi, quantize, sigmoid,
+    Rng, SIGMOID_SCALE, Sample, TrainNet, load_data, load_data_multi, lr_for_epoch, quantize,
+    sigmoid,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -485,14 +486,20 @@ fn train_gpu(config: &GpuTrainConfig) {
         .with_epsilon(1e-8);
     let mut optim = adam_config.init::<TrainBackend, NnueModel<TrainBackend>>();
 
-    // LR schedule mirrors the CPU trainer one-for-one.
-    let mut current_lr: f64 = if config.resume_path.is_some() && config.warmup_epochs > 0 {
-        (config.lr * config.warmup_lr_factor) as f64
-    } else {
-        config.lr as f64
-    };
+    // LR schedule: the same lr_for_epoch the CPU trainer uses — warmup
+    // and decay composed in one function, so a warmup restore can never
+    // overwrite an already-applied drop on short resumed runs.
     let lr_drop_1 = config.epochs * 3 / 4;
     let lr_drop_2 = config.epochs * 9 / 10;
+    let mut current_lr: f64 = lr_for_epoch(
+        config.lr,
+        config.resume_path.is_some(),
+        config.warmup_epochs,
+        config.warmup_lr_factor,
+        1,
+        lr_drop_1,
+        lr_drop_2,
+    ) as f64;
 
     eprintln!(
         "Training (GPU): {} epochs, batch_size={}, lr={}, wdl={:.2}, save every {} epochs",
@@ -509,12 +516,18 @@ fn train_gpu(config: &GpuTrainConfig) {
     let batcher = NnueBatcher { wdl_weight: config.wdl_weight };
 
     for epoch in 1..=config.epochs {
-        if config.resume_path.is_some()
-            && config.warmup_epochs > 0
-            && epoch == config.warmup_epochs + 1
-        {
-            current_lr = config.lr as f64;
-            eprintln!("  Warm-up complete; LR restored to {current_lr:.6}");
+        let epoch_lr = lr_for_epoch(
+            config.lr,
+            config.resume_path.is_some(),
+            config.warmup_epochs,
+            config.warmup_lr_factor,
+            epoch,
+            lr_drop_1,
+            lr_drop_2,
+        ) as f64;
+        if epoch_lr != current_lr {
+            current_lr = epoch_lr;
+            eprintln!("  LR now {current_lr:.6}");
         }
 
         rng.shuffle(&mut samples);
@@ -571,10 +584,6 @@ fn train_gpu(config: &GpuTrainConfig) {
             }
         }
 
-        if epoch == lr_drop_1 || epoch == lr_drop_2 {
-            current_lr *= 0.3;
-            eprintln!("  LR dropped to {current_lr:.6}");
-        }
     }
 
     eprintln!("Quantizing and saving to '{}'...", config.output_path);
@@ -753,31 +762,51 @@ mod tests {
 
     // ─── Phase 2: Burn vs CPU forward numerical match ────────────────────
 
-    fn lcg_scaled(state: &mut u64) -> f32 {
+    /// Deterministic LCG mapped to uniform [-1, 1). The original version
+    /// of this helper had a bit-math bug (`>> 33` keeps 31 bits but
+    /// divided by `u32::MAX`) that made every output NEGATIVE — all
+    /// weights and biases negative meant SCReLU zeroed every activation
+    /// and both forwards collapsed to the constant `l3_bias / QB`,
+    /// silently making the match gate vacuous (it passed even with the
+    /// perspectives' concat order deliberately swapped).
+    fn lcg_uniform(state: &mut u64) -> f32 {
         *state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let u = (*state >> 33) as f32 / u32::MAX as f32;
-        (u * 2.0 - 1.0) / 16.0
+        // Top 24 bits / 2^24 → [0, 1), same construction as
+        // trainer::Rng::next_f32.
+        let u = (*state >> 40) as f32 / (1u64 << 24) as f32;
+        u * 2.0 - 1.0
     }
 
+    /// Random weights at REALISTIC quantized-space magnitudes, scaled
+    /// per layer so the FT accumulators genuinely sweep the SCReLU
+    /// 0..QA=255 range, hidden layers sweep 0..QB=64, and the output
+    /// lands at centipawn scale. At these scales a structural bug
+    /// (swapped concat, transposed weight load, wrong clamp bound or
+    /// division point) shifts the output by whole centipawns instead of
+    /// hiding in the noise floor that near-zero weights produce.
     fn random_raw_weights(seed: u64) -> RawWeights {
         let mut s = seed;
-        let mut mk = |n: usize| -> Vec<f32> {
+        let mut mk = |n: usize, scale: f32| -> Vec<f32> {
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
-                out.push(lcg_scaled(&mut s));
+                out.push(lcg_uniform(&mut s) * scale);
             }
             out
         };
-        let ft_weights = mk(NUM_FEATURES * FT_SIZE);
-        let ft_biases = mk(FT_SIZE);
-        let l1_weights = mk(L1_INPUT * L1_SIZE);
-        let l1_biases = mk(L1_SIZE);
-        let l2_weights = mk(L1_SIZE * L2_SIZE);
-        let l2_biases = mk(L2_SIZE);
-        let l3_weights = mk(L2_SIZE);
-        let l3_bias = mk(1)[0];
+        // Scales chosen so pre-activations land mostly INSIDE the clamp
+        // windows (some clipping, not wholesale saturation): a heavily
+        // saturated net washes out small structural differences and
+        // would blunt the negative control below.
+        let ft_weights = mk(NUM_FEATURES * FT_SIZE, 40.0);
+        let ft_biases = mk(FT_SIZE, 50.0);
+        let l1_weights = mk(L1_INPUT * L1_SIZE, 0.08);
+        let l1_biases = mk(L1_SIZE, 500.0);
+        let l2_weights = mk(L1_SIZE * L2_SIZE, 0.3);
+        let l2_biases = mk(L2_SIZE, 20.0);
+        let l3_weights = mk(L2_SIZE, 100.0);
+        let l3_bias = mk(1, 500.0)[0];
         RawWeights {
             ft_weights,
             ft_biases,
@@ -790,10 +819,16 @@ mod tests {
         }
     }
 
-    fn synthetic_sample() -> Sample {
+    /// Asymmetric STM/OPP feature lists (offset shifts both) so a
+    /// perspective swap or concat-order bug produces a materially
+    /// different output instead of silent equivalence.
+    fn synthetic_sample(offset: usize) -> Sample {
+        let shift = |base: [usize; 8], by: usize| -> Vec<usize> {
+            base.iter().map(|f| (f + by) % NUM_FEATURES).collect()
+        };
         Sample {
-            stm_features: vec![0, 12, 64, 100, 250, 400, 500, 700],
-            opp_features: vec![1, 13, 65, 101, 251, 401, 501, 701],
+            stm_features: shift([0, 12, 64, 100, 250, 400, 500, 700], offset),
+            opp_features: shift([1, 13, 65, 101, 251, 401, 501, 701], offset * 2),
             score: 0.0,
             result: 0.5,
         }
@@ -802,37 +837,69 @@ mod tests {
     #[test]
     fn burn_forward_matches_cpu_forward() {
         let device = test_device();
-        let raw = random_raw_weights(0xC0FFEE);
-
-        let cpu_net = TrainNet::from_f32_weights(
-            raw.ft_weights.clone(),
-            raw.ft_biases.clone(),
-            raw.l1_weights.clone(),
-            raw.l1_biases.clone(),
-            raw.l2_weights.clone(),
-            raw.l2_biases.clone(),
-            raw.l3_weights.clone(),
-            raw.l3_bias,
-        );
-        let sample = synthetic_sample();
-        let cpu_out = forward_output(&cpu_net, &sample);
-
-        let mut model: NnueModel<TestBackend> = NnueModel::new(&device);
-        load_raw_weights(&mut model, raw, &device);
-
-        // Pack the single sample through the production batcher — this
-        // ensures the batcher itself is exercised by the match gate.
         let batcher = NnueBatcher { wdl_weight: 0.5 };
-        let batch: NnueBatch<TestBackend> = batcher.batch(vec![sample], &device);
-        let burn_out: f32 = model
-            .forward(batch.stm_idx, batch.stm_mask, batch.opp_idx, batch.opp_mask)
-            .into_scalar();
 
-        let diff = (burn_out - cpu_out).abs();
-        assert!(
-            diff < 1e-4,
-            "Burn vs CPU forward mismatch: burn={burn_out}, cpu={cpu_out}, diff={diff}"
-        );
+        // Several independent seeds + samples so a single accidental
+        // cancellation can't mask a structural bug.
+        for (i, seed) in [0xC0FFEE_u64, 0xB00C, 0x5EED_5EED].into_iter().enumerate() {
+            let raw = random_raw_weights(seed);
+            let cpu_net = TrainNet::from_f32_weights(
+                raw.ft_weights.clone(),
+                raw.ft_biases.clone(),
+                raw.l1_weights.clone(),
+                raw.l1_biases.clone(),
+                raw.l2_weights.clone(),
+                raw.l2_biases.clone(),
+                raw.l3_weights.clone(),
+                raw.l3_bias,
+            );
+            let sample = synthetic_sample(i * 37);
+            let cpu_out = forward_output(&cpu_net, &sample);
+
+            // Anti-collapse guard: if the activations all die, the
+            // forward degenerates to the constant l3_bias/QB and the
+            // comparison below stops testing anything. Fail loudly
+            // instead of passing vacuously.
+            let collapsed = raw.l3_bias / QB as f32;
+            assert!(
+                (cpu_out - collapsed).abs() > 1.0,
+                "seed {seed:#x}: test weights collapsed to l3_bias/QB; the gate is vacuous (cpu_out={cpu_out})"
+            );
+
+            let mut model: NnueModel<TestBackend> = NnueModel::new(&device);
+            load_raw_weights(&mut model, raw, &device);
+
+            // Pack through the production batcher so it is exercised by
+            // the gate too.
+            let batch: NnueBatch<TestBackend> = batcher.batch(vec![sample.clone()], &device);
+            let burn_out: f32 = model
+                .forward(batch.stm_idx, batch.stm_mask, batch.opp_idx, batch.opp_mask)
+                .into_scalar();
+
+            // Relative tolerance: at centipawn scale, f32 reordering
+            // between the CPU scalar loops and Burn's batched matmuls
+            // costs ~1e-5 relative; a structural bug costs whole
+            // centipawns. Floor keeps near-zero outputs meaningful.
+            let tol = (cpu_out.abs() * 1e-3).max(0.01);
+            let diff = (burn_out - cpu_out).abs();
+            assert!(
+                diff < tol,
+                "seed {seed:#x}: Burn vs CPU forward mismatch: burn={burn_out}, cpu={cpu_out}, diff={diff}, tol={tol}"
+            );
+
+            // Negative control: feeding the perspectives swapped must
+            // change the output materially. Pins the STM-first concat
+            // order and perspective wiring — the exact class of bug the
+            // collapsed gate provably failed to catch.
+            let batch2: NnueBatch<TestBackend> = batcher.batch(vec![sample], &device);
+            let swapped: f32 = model
+                .forward(batch2.opp_idx, batch2.opp_mask, batch2.stm_idx, batch2.stm_mask)
+                .into_scalar();
+            assert!(
+                (swapped - cpu_out).abs() > 1.0,
+                "seed {seed:#x}: swapped perspectives gave ~the same output ({swapped} vs {cpu_out}); gate is insensitive to perspective wiring"
+            );
+        }
     }
 
     // ─── Phase 3: batcher tensor shapes + WDL blend ──────────────────────
@@ -930,12 +997,42 @@ mod tests {
             .with_epsilon(1e-8)
             .init::<AutodiffNd, NnueModel<AutodiffNd>>();
 
+        // Snapshot the FT row of an active feature (index 0 is in
+        // stm_features) so we can prove gradients flow all the way
+        // through the select/mask/sum embedding path — not just into
+        // the output bias, which is all the old all-negative-weights
+        // version of this test actually validated.
+        let ft_row_before: Vec<f32> = model
+            .ft_weight
+            .val()
+            .inner()
+            .into_data()
+            .into_vec::<f32>()
+            .unwrap()[0..FT_SIZE]
+            .to_vec();
+
         let pred = model.forward(batch.stm_idx, batch.stm_mask, batch.opp_idx, batch.opp_mask);
         let pred_sig = burn::tensor::activation::sigmoid(pred.div_scalar(SIGMOID_SCALE));
         let loss = (batch.target - pred_sig).powf_scalar(2.0).mean();
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         // Aggressive LR so a single step makes a measurable dent.
         model = optim.step(1e-2_f64, model, grads);
+
+        let ft_row_after: Vec<f32> = model
+            .ft_weight
+            .val()
+            .inner()
+            .into_data()
+            .into_vec::<f32>()
+            .unwrap()[0..FT_SIZE]
+            .to_vec();
+        assert!(
+            ft_row_before
+                .iter()
+                .zip(&ft_row_after)
+                .any(|(b, a)| b != a),
+            "feature-transformer row of an active feature did not move — gradients are not flowing through the embedding path"
+        );
 
         let loss_after: f32 = {
             let pred = model.forward(idx_s, mask_s, idx_o, mask_o);
