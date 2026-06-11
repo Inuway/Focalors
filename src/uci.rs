@@ -53,7 +53,7 @@ pub fn uci_loop() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens[0] {
             "uci" => {
-                println!("id name Focalors 0.3.0");
+                println!("id name Focalors {}", env!("CARGO_PKG_VERSION"));
                 println!("id author mPmprz");
                 println!("option name UseNNUE type check default true");
                 println!("option name EvalFile type string default <internal>");
