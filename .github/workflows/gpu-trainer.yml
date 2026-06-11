@@ -1,0 +1,42 @@
+# Tests the optional `gpu-training` feature (Burn-based NNUE trainer).
+# Separate from ci.yml so the Burn compile cost is only paid when
+# training-related code actually changes. Test-only — has no connection
+# to the release pipeline, which always builds without this feature.
+name: GPU trainer
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/trainer.rs"
+      - "src/trainer_gpu.rs"
+      - "src/nnue/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/gpu-trainer.yml"
+  pull_request:
+    paths:
+      - "src/trainer.rs"
+      - "src/trainer_gpu.rs"
+      - "src/nnue/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/gpu-trainer.yml"
+
+jobs:
+  test:
+    name: Test (--features gpu-training)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests with the GPU trainer enabled
+        run: cargo test --locked --features gpu-training

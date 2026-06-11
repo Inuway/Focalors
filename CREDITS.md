@@ -27,13 +27,14 @@ was trained by **Luc Vedrenne** ([@ListIndexOutOfRange](https://github.com/ListI
 through 10 generations of self-play fine-tuning, contributed via
 [PR #2](https://github.com/Inuway/Focalors/pull/2).
 
-## GPU training pipeline (experimental, `gpu-training` branch only)
+## GPU training pipeline (optional `gpu-training` feature)
 
 The optional GPU NNUE training path uses the [Burn](https://burn.dev/)
 machine learning framework by [Tracel AI](https://github.com/tracel-ai),
 licensed under Apache-2.0 OR MIT. Burn is pulled in **only** when the
 `gpu-training` Cargo feature is enabled; the shipping `focalors` binary
-on `main` does not depend on Burn.
+does not depend on Burn. See
+[`docs/GPU_TRAINING.md`](docs/GPU_TRAINING.md).
 
 CPU training (used to produce all shipping nets to date) does not depend
 on Burn — see [`src/trainer.rs`](src/trainer.rs).

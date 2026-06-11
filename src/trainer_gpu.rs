@@ -1,4 +1,4 @@
-//! GPU NNUE trainer (experimental, `gpu-training` feature only).
+//! GPU NNUE trainer (`gpu-training` feature only).
 //!
 //! Complete Burn 0.21 NNUE training pipeline: model + data batcher +
 //! manual training loop (Adam, LR schedule, WDL-blended MSE loss) +
@@ -6,12 +6,13 @@
 //! produces (via [`crate::trainer::quantize`]).
 //!
 //! All forward semantics mirror [`crate::trainer::forward`] bit-for-bit
-//! in f32 — the Phase 2 numerical-match test (`burn_forward_matches_cpu_forward`)
+//! in f32 — the numerical-match test (`burn_forward_matches_cpu_forward`)
 //! is the regression gate. Outer training shape (epochs, LR drops at
 //! `epochs*3/4` and `epochs*9/10`, warmup ramp on `--resume`, save_rate
 //! checkpoints) mirrors [`crate::trainer::train`] one-for-one.
 //!
-//! See `BRANCH.md` for the design and roadmap.
+//! See `docs/GPU_TRAINING.md` for build instructions, design notes, and
+//! the validation workflow.
 
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};

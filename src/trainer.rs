@@ -19,7 +19,7 @@ pub const SIGMOID_SCALE: f32 = 400.0;
 // ════════════════════════════════════════════════════════════════════════════
 
 /// Training sample parsed from a ChessBoard record. Public so the GPU
-/// trainer ([`crate::trainer_gpu`] on the `gpu-training` branch) consumes
+/// trainer ([`crate::trainer_gpu`], behind the `gpu-training` feature) consumes
 /// the same data format and can feed Burn tensors that mirror the CPU
 /// path.
 #[derive(Clone)]
@@ -31,7 +31,7 @@ pub struct Sample {
 }
 
 /// f32 network weights for training. Public so alternate trainers (e.g.
-/// the Burn-based GPU trainer on the `gpu-training` branch) can fill one
+/// the Burn-based GPU trainer behind the `gpu-training` feature) can fill one
 /// in and hand it to [`quantize`] for a byte-identical `.nnue` output.
 ///
 /// Construct via [`TrainNet::from_f32_weights`] — fields stay private so

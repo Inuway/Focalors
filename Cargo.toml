@@ -10,9 +10,9 @@ panic = "abort"
 
 [features]
 default = []
-# Experimental GPU NNUE training backend, branch `gpu-training` only.
-# Pulls in Burn (Apache-2.0/MIT) + wgpu. Off by default — the shipping
-# binary on main is untouched. See BRANCH.md.
+# GPU NNUE training backend (`focalors train-gpu`). Pulls in Burn
+# (Apache-2.0/MIT) + wgpu. Off by default — the shipping binary is
+# untouched. See docs/GPU_TRAINING.md.
 gpu-training = ["dep:burn"]
 
 [dependencies]

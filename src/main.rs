@@ -172,7 +172,7 @@ fn main() {
             eprintln!("  selfmatch <games> [opts] — Run focalors-vs-focalors match (elo delta + LOS)");
             eprintln!("  promote <net.nnue>     — Set a .nnue file as the shipped default");
             #[cfg(feature = "gpu-training")]
-            eprintln!("  train-gpu <data> [opts] — Experimental GPU NNUE training (see BRANCH.md)");
+            eprintln!("  train-gpu <data> [opts] — GPU NNUE training (see docs/GPU_TRAINING.md)");
             std::process::exit(1);
         }
     }
