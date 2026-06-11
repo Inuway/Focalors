@@ -16,7 +16,8 @@ src/
 ├── search.rs      alpha-beta search with iterative deepening
 ├── eval.rs        hand-crafted evaluation
 ├── nnue/          NNUE inference (incremental accumulators, AVX2)
-├── trainer.rs     NNUE training loop
+├── trainer.rs     NNUE training loop (CPU)
+├── trainer_gpu.rs GPU training via Burn (optional `gpu-training` feature)
 ├── selfplay.rs    self-play data generation
 ├── selfmatch.rs   engine-vs-engine match runner for strength benchmarking
 ├── tuning.rs      HCE weight tuning
@@ -42,7 +43,7 @@ The compiled binary takes a subcommand:
 ```bash
 ./target/release/focalors gui        # desktop app
 ./target/release/focalors uci        # standard UCI engine
-./target/release/focalors            # same as uci
+./target/release/focalors            # same as gui (double-click behavior)
 ```
 
 `gui` is the everyday mode. `uci` lets external front-ends (Arena, Cute Chess, etc.) drive the engine.
@@ -69,6 +70,8 @@ cargo run --release -- train nets/gen1v2-data.bin \
   --epochs 30 \
   --output nets/gen2v2.nnue
 ```
+
+There is also a GPU trainer (`train-gpu`, built on Burn) behind the optional `gpu-training` Cargo feature. It accepts the same flags, reads the same data files, and exports the same `.nnue` format — a drop-in alternative when training on a GPU. Build it with `cargo build --release --features gpu-training`; details in [GPU_TRAINING.md](GPU_TRAINING.md).
 
 Promoting installs a trained net as the new default and rebuilds:
 
@@ -102,6 +105,7 @@ Options:
 | `--seed N` | wall-clock | Reproducible openings. Pass the same seed to replay the exact same set of games. |
 | `--random-plies N` | `8` | Random plies played at the start of each game from startpos to diversify openings. |
 | `--max-moves N` | `200` | Cap on game length. Reached games are scored as draws. |
+| `--threads N` | all cores | Games run in parallel across threads; opening pairs stay matched. |
 
 The match uses **matched-pair openings**: each random opening is played twice with the engines swapping colors. This is the standard variance-reduction trick used by cutechess-cli / fastchess — any positional imbalance from the random walk cancels across the pair, so the resulting WLD reflects engine strength rather than which side got the better opening.
 

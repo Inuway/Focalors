@@ -16,7 +16,7 @@ The repo's `.cargo/config.toml` matches the GitHub Actions release workflow: x86
 
 ## Engine development
 
-The NNUE training pipeline and the HCE tuner are documented in [docs/TECHNICAL.md](docs/TECHNICAL.md) — the same commands work for contributors. There's nothing special to set up beyond what's already in the repo.
+The NNUE training pipeline and the HCE tuner are documented in [docs/TECHNICAL.md](docs/TECHNICAL.md) — the same commands work for contributors. There's nothing special to set up beyond what's already in the repo. If you have a GPU, [docs/GPU_TRAINING.md](docs/GPU_TRAINING.md) covers the optional Burn-based trainer (`--features gpu-training`).
 
 ## Working on patches
 
@@ -28,7 +28,7 @@ Don't commit secrets or anything under `target/`.
 
 ## CI and releases
 
-CI lives in `.github/workflows/ci.yml`. Pull requests and pushes run the test suite on Linux, macOS, and Windows. Pushing a tag of the form `v*` also builds release binaries for all three and attaches them to the GitHub release.
+CI lives in `.github/workflows/ci.yml`. Pull requests and pushes run the test suite on Linux, macOS, and Windows. Pushing a tag of the form `v*` also builds release binaries for all three and attaches them to the GitHub release. A second workflow (`gpu-trainer.yml`) tests the optional `gpu-training` feature build, and only runs when training-related files change.
 
 ## Where to start
 
