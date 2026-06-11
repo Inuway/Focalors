@@ -467,7 +467,7 @@ mod tests {
         init_test_net();
 
         // Position with a pawn about to promote
-        let board = Board::from_fen("8/4P3/8/8/8/8/4k3/4K3 w - - 0 1").unwrap();
+        let board = Board::from_fen("8/4P3/8/8/8/4k3/8/4K3 w - - 0 1").unwrap();
 
         // e7e8=Q: e7(52) to e8(60), promote to Queen
         let mv = Move::new_promotion(Square(52), Square(60), Piece::Queen);

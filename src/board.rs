@@ -248,6 +248,16 @@ impl Board {
             other => return Err(format!("Invalid side to move: {other}")),
         };
 
+        // The side that just moved cannot have left its king in check.
+        // Search would otherwise "capture" that king, and evaluating the
+        // kingless position takes lsb() of an empty bitboard — indexing
+        // out of bounds and aborting the process.
+        let opp = board.side_to_move.flip();
+        let opp_king = board.piece_bb(opp, Piece::King).lsb();
+        if crate::attacks::is_square_attacked(&board, opp_king, board.side_to_move) {
+            return Err("Side not to move is in check (illegal position)".into());
+        }
+
         // 3) Castling rights
         if parts[2] != "-" {
             for ch in parts[2].chars() {
@@ -576,6 +586,16 @@ mod tests {
     }
 
     #[test]
+    fn side_not_to_move_in_check_is_rejected() {
+        // White to move while the black king is already attacked by the
+        // f7 knight — illegal; search would "capture" the king and then
+        // evaluate a kingless board.
+        assert!(Board::from_fen("6rk/5Npp/8/8/8/8/8/6QK w - - 0 1").is_err());
+        // The side TO move being in check is an ordinary legal position.
+        assert!(Board::from_fen("4k3/8/8/8/8/8/4q3/4K3 w - - 0 1").is_ok());
+    }
+
+    #[test]
     fn castling_rights_masked_against_placement() {
         // Rights claimed but no rooks: rights dropped, castling not generated.
         let board = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w KQ - 0 1").unwrap();
@@ -602,11 +622,16 @@ mod tests {
     #[test]
     fn dense_position_does_not_overflow_movelist() {
         crate::attacks::init();
-        // 22 queens: >256 pseudo-legal moves. Must not abort.
-        let board = Board::from_fen(
-            "1QQkQQ2/Q5QK/Q5Q1/Q2Q2Q1/Q6Q/Q6Q/4QQ1Q/QQQ4Q w - - 0 1",
-        )
-        .unwrap();
+        // 22 queens: >256 pseudo-legal moves for White. Must not abort.
+        // With White to move the position is illegal (Black's king is en
+        // prise), so from_fen now rejects it at the front door...
+        let fen = "1QQkQQ2/Q5QK/Q5Q1/Q2Q2Q1/Q6Q/Q6Q/4QQ1Q/QQQ4Q";
+        assert!(Board::from_fen(&format!("{fen} w - - 0 1")).is_err());
+        // ...so parse it as the legal black-to-move position and flip the
+        // side directly, exercising MoveList's guard as defense-in-depth
+        // against absurd internal states.
+        let mut board = Board::from_fen(&format!("{fen} b - - 0 1")).unwrap();
+        board.side_to_move = Color::White;
         let moves = crate::movegen::generate_legal_moves(&board);
         assert!(moves.len() <= 256);
     }
