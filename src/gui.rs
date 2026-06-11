@@ -608,6 +608,11 @@ pub struct FocalorsApp {
     pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
     pgn_import_error: Option<String>,
     pgn_import_user_color: Color,
+    /// Cache for the live PGN parse, keyed on the exact import text.
+    /// parse_pgn replays the whole game (legal movegen per SAN token),
+    /// so re-running it every frame while text sits in the box wastes
+    /// milliseconds per frame on long games.
+    pgn_parse_cache: Option<(String, Result<crate::pgn::ParsedPgn, String>)>,
 }
 
 /// Replay the saved PGN once, building parallel `boards`/`moves` vectors so the
@@ -804,6 +809,7 @@ impl FocalorsApp {
             pgn_import_parsed: None,
             pgn_import_error: None,
             pgn_import_user_color: Color::White,
+            pgn_parse_cache: None,
         }
     }
 
@@ -2741,10 +2747,20 @@ impl FocalorsApp {
 
             // Live PGN parse — drives the validation badge and the parsed
             // panel state without requiring an explicit "Parse" click.
+            // Re-parsed only when the text actually changes.
             let pgn_validation = if self.pgn_import_text.trim().is_empty() {
+                self.pgn_parse_cache = None;
                 None
             } else {
-                Some(crate::pgn::parse_pgn(&self.pgn_import_text))
+                let stale = self
+                    .pgn_parse_cache
+                    .as_ref()
+                    .is_none_or(|(text, _)| *text != self.pgn_import_text);
+                if stale {
+                    let result = crate::pgn::parse_pgn(&self.pgn_import_text);
+                    self.pgn_parse_cache = Some((self.pgn_import_text.clone(), result));
+                }
+                self.pgn_parse_cache.as_ref().map(|(_, r)| r.clone())
             };
             // Resync the suggested user color whenever the parsed PGN
             // changes — first call after a paste, then leave it sticky so
