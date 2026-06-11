@@ -109,7 +109,15 @@ impl TranspositionTable {
     pub fn new(size_mb: usize) -> Self {
         let entry_size = std::mem::size_of::<AtomicTTEntry>();
         let num_entries = (size_mb * 1024 * 1024) / entry_size;
-        let num_entries = num_entries.next_power_of_two() / 2;
+        // Largest power of two <= the budget. Only halve after rounding
+        // UP when the count wasn't already a power of two — the previous
+        // unconditional halving cut every power-of-two request (16, 64,
+        // 256 MB — i.e. every real call site) to half the configured size.
+        let num_entries = if num_entries.is_power_of_two() {
+            num_entries
+        } else {
+            num_entries.next_power_of_two() / 2
+        };
         let num_entries = num_entries.max(1);
 
         let mut entries = Vec::with_capacity(num_entries);

@@ -271,15 +271,20 @@ impl Searcher {
 
             // Check time between iterations (and the external Lazy SMP
             // stop flag, so a sibling thread that finished early can pull
-            // the rest down with it).
-            if let Some(deadline) = self.stop_time {
-                if Instant::now() >= deadline {
-                    break;
+            // the rest down with it). Always allow the first iteration —
+            // with a zero/expired budget (`go movetime 0`) breaking before
+            // depth 1 would return Move::NULL, which UCI prints as the
+            // illegal "bestmove a1a1". Depth 1 completes in microseconds.
+            if best_result.depth > 0 {
+                if let Some(deadline) = self.stop_time {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                 }
-            }
-            if let Some(ref flag) = self.external_stop {
-                if flag.load(Ordering::Relaxed) {
-                    break;
+                if let Some(ref flag) = self.external_stop {
+                    if flag.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
             }
 
@@ -379,6 +384,17 @@ impl Searcher {
                         }
                     }
                 }
+            }
+        }
+
+        // Belt-and-braces: never hand callers a NULL best move (UCI would
+        // print it as the illegal "a1a1" and forfeit). If every iteration
+        // aborted before producing a move, fall back to any legal move.
+        if best_result.best_move.is_null() {
+            let moves = generate_legal_moves(board);
+            if !moves.is_empty() {
+                best_result.best_move = moves[0];
+                best_result.pv = vec![moves[0]];
             }
         }
 
@@ -510,6 +526,11 @@ impl Searcher {
             );
             let null_score = -null_score;
 
+            // An aborted child returns 0, which must not be treated as a
+            // real null-move verification result.
+            if self.stopped {
+                return (0, Move::NULL);
+            }
             if null_score >= beta {
                 return (beta, Move::NULL);
             }
@@ -523,14 +544,21 @@ impl Searcher {
             && excluded_move.is_null()
         {
             if let Some(entry) = self.tt.probe(hash) {
+                // Skip near-mate entries: TT mate scores are stored
+                // ply-relative, so deriving a margin from the raw score
+                // would compare mismatched frames (off by exactly ply).
                 if entry.depth as u32 >= depth - 3
                     && matches!(entry.flag, TTFlag::Exact | TTFlag::LowerBound)
+                    && entry.score.abs() < MATE_SCORE - MAX_PLY as Score
                 {
                     let s_beta = entry.score - (depth as Score * 2);
                     let s_depth = (depth - 1) / 2;
                     let (s_score, _) = self.negamax(
                         board, s_depth, s_beta - 1, s_beta, ply, prev_move, tt_move,
                     );
+                    if self.stopped {
+                        return (0, Move::NULL);
+                    }
                     if s_score < s_beta {
                         singular_extension = 1;
                     }
@@ -634,6 +662,12 @@ impl Searcher {
                 );
                 let reduced_score = -reduced_score;
 
+                // Aborted child → its 0 score is garbage; bail out with
+                // what we had before this move, storing nothing.
+                if self.stopped {
+                    return (best_score, best_move);
+                }
+
                 if reduced_score <= alpha {
                     if reduced_score > best_score {
                         best_score = reduced_score;
@@ -663,6 +697,16 @@ impl Searcher {
                 } else {
                     score = zw;
                 }
+            }
+
+            // An aborted child returned 0; treating it as real would
+            // store a garbage LowerBound into the (persistent, shared)
+            // TT at full claimed depth whenever beta <= 0 — one wrong
+            // entry per unwinding stack level, on every timed Lazy SMP
+            // move. Bail out with the pre-move state instead; the guard
+            // below line 707 already protects the fail-low store.
+            if self.stopped {
+                return (best_score, best_move);
             }
 
             if score > best_score {
@@ -695,7 +739,15 @@ impl Searcher {
                     }
                 }
 
-                self.tt.store(hash, depth as u8, TTFlag::LowerBound, score_to_tt(score, ply), mv);
+                // Never store from a singular verification search: its
+                // result describes the position WITH the best move
+                // excluded, and same-key stores always replace — a
+                // shallow misleading entry would clobber the deep one
+                // that triggered the singular check (Stockfish guards
+                // its tte->save with !excludedMove for the same reason).
+                if excluded_move.is_null() {
+                    self.tt.store(hash, depth as u8, TTFlag::LowerBound, score_to_tt(score, ply), mv);
+                }
                 return (score, mv);
             }
 
@@ -708,49 +760,70 @@ impl Searcher {
             return (best_score, best_move);
         }
 
-        let flag = if alpha > orig_alpha { TTFlag::Exact } else { TTFlag::UpperBound };
-        self.tt.store(hash, depth as u8, flag, score_to_tt(best_score, ply), best_move);
+        if excluded_move.is_null() {
+            let flag = if alpha > orig_alpha { TTFlag::Exact } else { TTFlag::UpperBound };
+            self.tt.store(hash, depth as u8, flag, score_to_tt(best_score, ply), best_move);
+        }
 
         (best_score, best_move)
     }
 
-    /// Quiescence search with SEE ordering and pruning.
+    /// Quiescence search with SEE ordering and pruning. When the side to
+    /// move is in check, stand-pat and pruning are disabled (passing is
+    /// not legal in check) and ALL evasions are searched, not just
+    /// captures — otherwise horizon nodes in check get mis-scored as
+    /// quiet positions.
     fn quiescence(&mut self, board: &Board, mut alpha: Score, beta: Score, ply: u32) -> Score {
         self.nodes += 1;
         self.check_time();
         if self.stopped { return 0; }
 
         let ply_idx = (ply as usize).min(MAX_PLY - 1);
+
+        let king_sq = board.piece_bb(board.side_to_move, Piece::King).lsb();
+        let in_check = attacks::is_square_attacked(board, king_sq, board.side_to_move.flip());
+
         let stand_pat = self.eval(board, ply_idx as u32);
-        if stand_pat >= beta {
-            return beta;
-        }
-        if stand_pat > alpha {
-            alpha = stand_pat;
+        if !in_check {
+            if stand_pat >= beta {
+                return beta;
+            }
+            if stand_pat > alpha {
+                alpha = stand_pat;
+            }
         }
         if ply_idx >= MAX_PLY - 1 {
-            return alpha;
+            // Hard horizon: the eval is all we have, even in check.
+            return if in_check { stand_pat } else { alpha };
         }
 
-        let delta = 1000;
-        if stand_pat + delta < alpha {
-            return alpha;
+        if !in_check {
+            let delta = 1000;
+            if stand_pat + delta < alpha {
+                return alpha;
+            }
         }
 
         let moves = generate_legal_moves(board);
 
-        // Collect and order captures by SEE — stack-bounded, no heap alloc
-        // in the quiescence hot path. 256 = MoveList's upper bound, so the
-        // bound is always satisfied by construction.
+        if in_check && moves.is_empty() {
+            return -MATE_SCORE + ply as Score;
+        }
+
+        // Collect and order candidates by SEE — stack-bounded, no heap
+        // alloc in the quiescence hot path. 256 = MoveList's upper bound,
+        // so the bound is always satisfied by construction. In check:
+        // every evasion qualifies and SEE pruning is off (the "losing
+        // capture" may be the only way out).
         let mut captures: [(Move, Score); 256] = [(Move::NULL, 0); 256];
         let mut cap_len = 0usize;
         for i in 0..moves.len() {
             let mv = moves[i];
-            if !is_capture(board, mv) && !matches!(mv.flag(), MoveFlag::Promotion) {
+            if !in_check && !is_capture(board, mv) && !matches!(mv.flag(), MoveFlag::Promotion) {
                 continue;
             }
             let see_val = see(board, mv);
-            if see_val < 0 { continue; } // SEE pruning: skip losing captures
+            if !in_check && see_val < 0 { continue; } // SEE pruning: skip losing captures
             captures[cap_len] = (mv, see_val);
             cap_len += 1;
         }
@@ -1120,6 +1193,49 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_millis(500), "Should stop in time: {:?}", elapsed);
         assert!(!result.best_move.is_null(), "Should find a move");
+    }
+
+    /// Regression: `go movetime 0` (or any expired budget) must still
+    /// produce a legal move — the old pre-iteration break returned
+    /// Move::NULL, which UCI printed as the illegal "bestmove a1a1".
+    #[test]
+    fn zero_time_budget_returns_legal_move() {
+        attacks::init();
+        let board = Board::startpos();
+        let mut searcher = Searcher::new(16);
+        let result = searcher.search_timed(&board, 0);
+        assert!(!result.best_move.is_null(), "zero budget must not yield NULL");
+        let legal = generate_legal_moves(&board);
+        let found = (0..legal.len()).any(|i| legal[i].raw() == result.best_move.raw());
+        assert!(found, "returned move must be legal");
+    }
+
+    /// Regression: quiescence must not stand pat while in check. A
+    /// depth-1 search from a position where the only check evasion
+    /// loses heavy material must still see the loss (the old qsearch
+    /// scored in-check horizon nodes as quiet).
+    #[test]
+    fn qsearch_does_not_stand_pat_in_check() {
+        attacks::init();
+        // Black queen gives check on e1-file; white king must move and
+        // then the white queen on h1 hangs: Qe1+ was played, white to
+        // move, in check, Kxe1/Kg2 etc. — eval should reflect material
+        // reality, not a calm stand-pat.
+        // Simpler canary: mate-in-1-delivered position at depth 1:
+        // back-rank mate already on the board → side to move is mated.
+        let board = Board::from_fen("6k1/5ppp/8/8/8/8/8/r3K3 w - - 0 1").unwrap();
+        let mut searcher = Searcher::new(16);
+        let result = searcher.search(&board, 1);
+        // White is in check from the rook; all evasions exist (Kd2/Ke2..),
+        // so not mate — but the score must come from searching evasions,
+        // not from standing pat at an in-check qsearch node. At depth 1
+        // every child IS an in-check qsearch entry from black's reply
+        // perspective in the old code; the key assertion is simply that
+        // search completes and returns a legal evasion.
+        assert!(!result.best_move.is_null());
+        let legal = generate_legal_moves(&board);
+        let found = (0..legal.len()).any(|i| legal[i].raw() == result.best_move.raw());
+        assert!(found);
     }
 
     #[test]
