@@ -402,11 +402,16 @@ pub(crate) fn load_data_multi(paths: &[String], weights: &[f32], rng: &mut Rng) 
             }
             combined.extend(samples.drain(0..target));
         } else {
-            // Take all + oversample with replacement for the rest
+            // Take all + oversample with replacement for the rest.
+            // Extras must be drawn from THIS file's records only —
+            // drawing from `combined` (which already holds other files'
+            // selections) would mostly clone other files' positions and
+            // silently skew the mix away from the requested weights.
+            let start = combined.len();
             combined.append(samples);
             let extra = target - available;
             for _ in 0..extra {
-                let idx = (rng.next_u64() as usize) % combined.len();
+                let idx = start + (rng.next_u64() as usize) % available;
                 let s = &combined[idx];
                 combined.push(Sample {
                     stm_features: s.stm_features.clone(),
@@ -711,15 +716,33 @@ fn backward(
 pub fn quantize(net: &TrainNet) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(412_000);
 
+    // Saturation counters: weights that exceed their integer range get
+    // silently flattened by the clamp, meaning the exported net computes
+    // a different function than the f32 net whose loss was just
+    // reported. Count and warn so distortion is visible.
+    let mut sat_ft_biases = 0usize;
+    let mut sat_ft_weights = 0usize;
+    let mut sat_l1_weights = 0usize;
+    let mut sat_l2_weights = 0usize;
+    let mut sat_l3_weights = 0usize;
+
     // FT biases [FT_SIZE] as i16
     for j in 0..FT_SIZE {
-        let v = net.ft_biases[j].round().clamp(-32768.0, 32767.0) as i16;
+        let r = net.ft_biases[j].round();
+        if !(-32768.0..=32767.0).contains(&r) {
+            sat_ft_biases += 1;
+        }
+        let v = r.clamp(-32768.0, 32767.0) as i16;
         bytes.extend_from_slice(&v.to_le_bytes());
     }
 
     // FT weights [NUM_FEATURES * FT_SIZE] as i16
     for i in 0..(NUM_FEATURES * FT_SIZE) {
-        let v = net.ft_weights[i].round().clamp(-32768.0, 32767.0) as i16;
+        let r = net.ft_weights[i].round();
+        if !(-32768.0..=32767.0).contains(&r) {
+            sat_ft_weights += 1;
+        }
+        let v = r.clamp(-32768.0, 32767.0) as i16;
         bytes.extend_from_slice(&v.to_le_bytes());
     }
 
@@ -731,7 +754,11 @@ pub fn quantize(net: &TrainNet) -> Vec<u8> {
 
     // L1 weights [L1_INPUT * L1_SIZE] as i8
     for i in 0..(L1_INPUT * L1_SIZE) {
-        let v = net.l1_weights[i].round().clamp(-128.0, 127.0) as i8;
+        let r = net.l1_weights[i].round();
+        if !(-128.0..=127.0).contains(&r) {
+            sat_l1_weights += 1;
+        }
+        let v = r.clamp(-128.0, 127.0) as i8;
         bytes.push(v as u8);
     }
 
@@ -743,7 +770,11 @@ pub fn quantize(net: &TrainNet) -> Vec<u8> {
 
     // L2 weights [L1_SIZE * L2_SIZE] as i8
     for i in 0..(L1_SIZE * L2_SIZE) {
-        let v = net.l2_weights[i].round().clamp(-128.0, 127.0) as i8;
+        let r = net.l2_weights[i].round();
+        if !(-128.0..=127.0).contains(&r) {
+            sat_l2_weights += 1;
+        }
+        let v = r.clamp(-128.0, 127.0) as i8;
         bytes.push(v as u8);
     }
 
@@ -753,9 +784,28 @@ pub fn quantize(net: &TrainNet) -> Vec<u8> {
 
     // L3 weights [L2_SIZE] as i8
     for j in 0..L2_SIZE {
-        let v = net.l3_weights[j].round().clamp(-128.0, 127.0) as i8;
+        let r = net.l3_weights[j].round();
+        if !(-128.0..=127.0).contains(&r) {
+            sat_l3_weights += 1;
+        }
+        let v = r.clamp(-128.0, 127.0) as i8;
         bytes.push(v as u8);
     }
+
+    let mut warn = |name: &str, n: usize, total: usize, range: &str| {
+        if n > 0 {
+            eprintln!(
+                "  WARNING: {n}/{total} {name} saturated at the {range} boundary during \
+                 quantization — the exported net will differ from the trained f32 net. \
+                 Consider a lower --lr or fewer epochs."
+            );
+        }
+    };
+    warn("ft_biases", sat_ft_biases, FT_SIZE, "i16");
+    warn("ft_weights", sat_ft_weights, NUM_FEATURES * FT_SIZE, "i16");
+    warn("l1_weights", sat_l1_weights, L1_INPUT * L1_SIZE, "i8");
+    warn("l2_weights", sat_l2_weights, L1_SIZE * L2_SIZE, "i8");
+    warn("l3_weights", sat_l3_weights, L2_SIZE, "i8");
 
     bytes
 }
@@ -763,6 +813,37 @@ pub fn quantize(net: &TrainNet) -> Vec<u8> {
 // ════════════════════════════════════════════════════════════════════════════
 // Training loop
 // ════════════════════════════════════════════════════════════════════════════
+
+/// Learning rate for a 1-based epoch as a pure function — warmup and
+/// decay composed in one place. The previous two-independent-mutations
+/// version had an ordering bug: on short resumed runs (warmup_epochs+1
+/// past a drop epoch) the warmup restore overwrote an already-applied
+/// drop, so the final fine-tune epochs ran at the HIGHEST Lr of the run.
+///
+/// Drops land at the END of `lr_drop_1`/`lr_drop_2` (i.e. affect later
+/// epochs); when the two drop epochs collide (small `epochs`), only one
+/// drop applies — matching the original `||` semantics.
+pub(crate) fn lr_for_epoch(
+    base_lr: f32,
+    resumed: bool,
+    warmup_epochs: usize,
+    warmup_lr_factor: f32,
+    epoch: usize,
+    lr_drop_1: usize,
+    lr_drop_2: usize,
+) -> f32 {
+    let mut lr = base_lr;
+    if resumed && warmup_epochs > 0 && epoch <= warmup_epochs {
+        lr *= warmup_lr_factor;
+    }
+    if lr_drop_1 > 0 && epoch > lr_drop_1 {
+        lr *= 0.3;
+    }
+    if lr_drop_2 > lr_drop_1 && epoch > lr_drop_2 {
+        lr *= 0.3;
+    }
+    lr
+}
 
 fn train(config: &TrainConfig) {
     let mut rng = Rng::new(0xDEAD_CAFE_1234);
@@ -793,16 +874,18 @@ fn train(config: &TrainConfig) {
         TrainNet::random_init(&mut rng)
     };
 
-    // Use reduced LR for first warmup_epochs when resuming (preserves learned features)
-    let initial_lr = if config.resume_path.is_some() && config.warmup_epochs > 0 {
-        config.lr * config.warmup_lr_factor
-    } else {
-        config.lr
-    };
-    let mut adam = Adam::new(initial_lr);
-
     let lr_drop_1 = config.epochs * 3 / 4;
     let lr_drop_2 = config.epochs * 9 / 10;
+
+    let mut adam = Adam::new(lr_for_epoch(
+        config.lr,
+        config.resume_path.is_some(),
+        config.warmup_epochs,
+        config.warmup_lr_factor,
+        1,
+        lr_drop_1,
+        lr_drop_2,
+    ));
 
     eprintln!("Training: {} epochs, batch_size={}, lr={}, wdl={:.2}, threads={}, save every {} epochs",
         config.epochs, config.batch_size, config.lr, config.wdl_weight, config.num_threads, config.save_rate);
@@ -815,13 +898,21 @@ fn train(config: &TrainConfig) {
     let num_threads = config.num_threads.max(1);
 
     for epoch in 1..=config.epochs {
-        // Warm-up: ramp LR from warmup_lr_factor*lr back to full lr after warmup_epochs
-        if config.resume_path.is_some()
-            && config.warmup_epochs > 0
-            && epoch == config.warmup_epochs + 1
-        {
-            adam.lr = config.lr;
-            eprintln!("  Warm-up complete; LR restored to {:.6}", adam.lr);
+        // LR is a pure function of the epoch (warmup × decay composed in
+        // one place) so a warmup restore can never overwrite an
+        // already-applied drop on short resumed runs.
+        let epoch_lr = lr_for_epoch(
+            config.lr,
+            config.resume_path.is_some(),
+            config.warmup_epochs,
+            config.warmup_lr_factor,
+            epoch,
+            lr_drop_1,
+            lr_drop_2,
+        );
+        if epoch_lr != adam.lr {
+            adam.lr = epoch_lr;
+            eprintln!("  LR now {:.6}", adam.lr);
         }
 
         rng.shuffle(&mut samples);
@@ -891,11 +982,6 @@ fn train(config: &TrainConfig) {
             }
         }
 
-        // LR schedule
-        if epoch == lr_drop_1 || epoch == lr_drop_2 {
-            adam.lr *= 0.3;
-            eprintln!("  LR dropped to {:.6}", adam.lr);
-        }
     }
 
     // Final save
@@ -1022,6 +1108,83 @@ mod tests {
     fn sigmoid_at_zero_is_half() {
         let s = sigmoid(0.0);
         assert!((s - 0.5).abs() < 0.001);
+    }
+
+    /// Regression: extras for an oversampled file must be cloned from
+    /// THAT file's own records, never from other files already in the
+    /// combined pool. The old code drew from the whole pool, silently
+    /// skewing --mix toward whichever file was processed first.
+    #[test]
+    fn load_data_multi_oversamples_from_own_file_only() {
+        // File A: 10 records (score 100). File B: 2 records (score -100).
+        // Equal weights, total 12 → target 6 each. B must oversample
+        // 2 → 6 using only its own records.
+        let dir = std::env::temp_dir().join(format!("focalors-mix-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mk_record = |score: i16| -> [u8; 32] {
+            let mut r = [0u8; 32];
+            // occ: two pawns on squares 0 and 8; pcs nibbles stay 0 (own pawns)
+            r[0] = 0x01;
+            r[1] = 0x01;
+            let sb = score.to_le_bytes();
+            r[24] = sb[0];
+            r[25] = sb[1];
+            r[26] = 1; // result 0.5
+            r
+        };
+
+        let path_a = dir.join("a.bin");
+        let path_b = dir.join("b.bin");
+        let mut a = Vec::new();
+        for _ in 0..10 {
+            a.extend_from_slice(&mk_record(100));
+        }
+        let mut b = Vec::new();
+        for _ in 0..2 {
+            b.extend_from_slice(&mk_record(-100));
+        }
+        std::fs::write(&path_a, &a).unwrap();
+        std::fs::write(&path_b, &b).unwrap();
+
+        let mut rng = Rng::new(99);
+        let samples = load_data_multi(
+            &[
+                path_a.to_string_lossy().into_owned(),
+                path_b.to_string_lossy().into_owned(),
+            ],
+            &[1.0, 1.0],
+            &mut rng,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let a_count = samples.iter().filter(|s| s.score == 100.0).count();
+        let b_count = samples.iter().filter(|s| s.score == -100.0).count();
+        assert_eq!(a_count, 6, "file A must contribute exactly its 50% share");
+        assert_eq!(b_count, 6, "file B extras must be clones of file B records only");
+    }
+
+    /// Regression: on a short resumed run where warmup extends past the
+    /// drop epoch, the LR must reflect the drop — the old two-mutation
+    /// schedule restored full LR after the drop had already fired.
+    #[test]
+    fn lr_schedule_warmup_cannot_overwrite_drop() {
+        let lr = 0.001_f32;
+
+        // epochs=4, resume, warmup=3: drops collide at epoch 3 (end of
+        // epoch), so epoch 4 must run at 0.3x — NOT restored full lr.
+        let (d1, d2) = (4 * 3 / 4, 4 * 9 / 10); // (3, 3)
+        let e4 = lr_for_epoch(lr, true, 3, 0.3, 4, d1, d2);
+        assert!((e4 - lr * 0.3).abs() < 1e-9, "epoch 4 must keep the drop, got {e4}");
+
+        // Normal config (epochs=20, warmup=3, drops 15/18) unchanged:
+        let (d1, d2) = (15, 18);
+        assert!((lr_for_epoch(lr, true, 3, 0.3, 2, d1, d2) - lr * 0.3).abs() < 1e-9);
+        assert!((lr_for_epoch(lr, true, 3, 0.3, 4, d1, d2) - lr).abs() < 1e-9);
+        assert!((lr_for_epoch(lr, true, 3, 0.3, 16, d1, d2) - lr * 0.3).abs() < 1e-9);
+        assert!((lr_for_epoch(lr, true, 3, 0.3, 19, d1, d2) - lr * 0.09).abs() < 1e-9);
+        // Fresh (non-resumed) runs ignore warmup entirely:
+        assert!((lr_for_epoch(lr, false, 3, 0.3, 1, d1, d2) - lr).abs() < 1e-9);
     }
 
     #[test]
