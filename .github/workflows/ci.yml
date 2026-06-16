@@ -86,8 +86,7 @@ jobs:
         run: |
           mkdir -p dist/${{ matrix.artifact_name }}
           cp ${{ matrix.binary_path }} dist/${{ matrix.artifact_name }}/
-          cp README.md dist/${{ matrix.artifact_name }}/
-          cp CONTRIBUTING.md dist/${{ matrix.artifact_name }}/
+          cp packaging/README.txt dist/${{ matrix.artifact_name }}/
           cp LICENSE dist/${{ matrix.artifact_name }}/
           tar -czf ${{ matrix.archive_name }} -C dist ${{ matrix.artifact_name }}
 
@@ -97,8 +96,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact_name }} | Out-Null
           Copy-Item ${{ matrix.binary_path }} dist/${{ matrix.artifact_name }}/
-          Copy-Item README.md dist/${{ matrix.artifact_name }}/
-          Copy-Item CONTRIBUTING.md dist/${{ matrix.artifact_name }}/
+          Copy-Item packaging/README.txt dist/${{ matrix.artifact_name }}/
           Copy-Item LICENSE dist/${{ matrix.artifact_name }}/
           Compress-Archive -Path dist/${{ matrix.artifact_name }} -DestinationPath ${{ matrix.archive_name }}
 
