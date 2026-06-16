@@ -1,3 +1,10 @@
+// On Windows, release builds use the GUI subsystem so the desktop app opens
+// without a console window popping up beside it (which looks alarming to
+// non-technical users). No-op on Linux/macOS. Debug builds keep the console,
+// so the CLI tools (`train`, `selfplay`, `uci`, …) stay usable in a terminal
+// during development. See CONTRIBUTING.md for the Windows CLI-output note.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod analysis;
 mod attacks;
 mod board;

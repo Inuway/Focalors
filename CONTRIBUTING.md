@@ -18,6 +18,8 @@ The repo's `.cargo/config.toml` matches the GitHub Actions release workflow: x86
 
 The NNUE training pipeline and the HCE tuner are documented in [docs/TECHNICAL.md](docs/TECHNICAL.md) — the same commands work for contributors. There's nothing special to set up beyond what's already in the repo. If you have a GPU, [docs/GPU_TRAINING.md](docs/GPU_TRAINING.md) covers the optional Burn-based trainer (`--features gpu-training`).
 
+**Windows CLI output:** release builds run as a desktop app with no console window, so the command-line tools (`train`, `selfplay`, `selfmatch`, `uci`) won't print to a terminal in a release build. To see their output on Windows, use a debug build, redirect to a file (`focalors.exe train ... > train.log`), or run under WSL. Linux and macOS are unaffected.
+
 ## Working on patches
 
 Keep changes focused. If a patch touches the engine, the GUI, and the docs all at once, it's usually easier to review (and easier to revert) when split. Add or update tests when changing search, move generation, evaluation, persistence, or analysis logic — the test suite is the cheap insurance against regressions in those areas.
