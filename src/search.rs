@@ -1308,16 +1308,34 @@ mod tests {
     #[test]
     fn smart_time_management() {
         attacks::init();
-        let board = Board::startpos();
+        // A position with one obvious, immediately-stable best move: white
+        // grabs the hanging queen with d4xe5. Because the root best move is the
+        // same from the first iteration on, the best-move-stability early exit
+        // fires right after the soft limit no matter how fast the machine is.
+        //
+        // The old version searched the start position, whose best move only
+        // settles several plies deep, so the wall-clock to reach stability
+        // tracked machine speed and went flaky on loaded CI (a slow runner took
+        // 3.75s against a 3.0s bound). Full material here keeps the score out of
+        // mate range, so the early exit is driven by stability, not a mate cutoff.
+        let board =
+            Board::from_fen("rnb1kbnr/pppp1ppp/8/4q3/3P4/8/PPP1PPPP/RNBQKBNR w KQkq - 0 1")
+                .unwrap();
         let mut searcher = Searcher::new(16);
         let start = Instant::now();
-        // Soft limit 200ms, hard limit 5000ms — should stop well before hard limit
+        // Soft 200ms, hard 5000ms; a stable best move must exit via the soft
+        // stability check, far below the hard limit.
         let result = searcher.search_with_time_management(&board, 200, 5000);
         let elapsed = start.elapsed();
-        assert!(!result.best_move.is_null());
-        // Should stop well before the hard limit due to move stability.
-        // The generous threshold accounts for unoptimized debug builds on slow CI runners.
-        assert!(elapsed < Duration::from_millis(3000), "Should use smart early stop: {:?}", elapsed);
+        assert_eq!(
+            result.best_move.to_uci(),
+            "d4e5",
+            "should grab the free queen"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "stable best move should trigger smart early stop near the soft limit, got {elapsed:?}"
+        );
     }
 
     #[test]
