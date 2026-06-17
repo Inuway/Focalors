@@ -4823,9 +4823,18 @@ impl FocalorsApp {
 
             if state.search_info.depth > 0 {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let score = state.search_info.score;
+                    // search_info.score comes from the engine's own search, so it
+                    // is signed from the engine's perspective. The engine is always
+                    // your opponent here, so negating it gives a "you-positive"
+                    // reading: + means you are winning, - means you are losing.
+                    let score = -state.search_info.score;
                     let score_text = if score.abs() > 20000 {
-                        format!("M{}", (29000 - score.abs() + 1) / 2)
+                        let mate_in = (29000 - score.abs() + 1) / 2;
+                        if score > 0 {
+                            format!("M{mate_in}")
+                        } else {
+                            format!("-M{mate_in}")
+                        }
                     } else {
                         format!("{:+.2}", score as f64 / 100.0)
                     };
