@@ -163,6 +163,29 @@ fn accuracy_from_wp_loss(wp_loss: f64) -> f64 {
     acc.clamp(0.0, 100.0)
 }
 
+/// Whole-game accuracy from per-move `(accuracy, volatility-weight)` pairs,
+/// the way lichess blends it: the mean of a volatility-weighted mean and a
+/// harmonic mean. The harmonic term punishes the worst moves hard, so one or
+/// two blunders drag the score down instead of being averaged away by a
+/// handful of accurate moves. Empty input (e.g. every move was forced) is a
+/// perfect 100.
+fn blend_accuracy(acc_weights: &[(f64, f64)]) -> f64 {
+    if acc_weights.is_empty() {
+        return 100.0;
+    }
+    let wsum: f64 = acc_weights.iter().map(|(_, w)| w).sum();
+    let weighted_mean = if wsum > 0.0 {
+        acc_weights.iter().map(|(a, w)| a * w).sum::<f64>() / wsum
+    } else {
+        acc_weights.iter().map(|(a, _)| a).sum::<f64>() / acc_weights.len() as f64
+    };
+    // Floor each accuracy at 1% so a single ~0 move can't blow the reciprocal
+    // sum (and thus the harmonic mean) up into nonsense.
+    let harmonic_mean = acc_weights.len() as f64
+        / acc_weights.iter().map(|(a, _)| 1.0 / a.max(1.0)).sum::<f64>();
+    (weighted_mean + harmonic_mean) / 2.0
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Analysis result per move
 // ════════════════════════════════════════════════════════════════════════════
@@ -450,37 +473,47 @@ pub fn analyze_game(
         eval_history.push(m.eval_after);
     }
 
-    // Compute accuracy
-    let user_moves: Vec<&MoveAnalysis> = analysis
-        .iter()
-        .filter(|m| m.side == user_color && !matches!(m.classification, MoveClass::Forced))
-        .collect();
-
-    // Accuracy: per-move win-percentage loss → lichess sigmoid → mean.
-    // Replaces the previous `100 - avg_cpl` linear formula which produced
-    // absurdly low numbers (e.g. ~5% accuracy on a normal game) because it
-    // treated every centipawn loss as equally costly regardless of position.
-    let user_accuracy = if user_moves.is_empty() {
-        100.0
-    } else {
-        let total: f64 = user_moves
-            .iter()
-            .map(|m| {
-                let wp_before_white = win_percentage(m.eval_before);
-                let wp_after_white  = win_percentage(m.eval_after);
-                // Convert to player POV: black's win % is the complement.
-                let (wp_before, wp_after) = match m.side {
-                    Color::White => (wp_before_white, wp_after_white),
-                    Color::Black => (100.0 - wp_before_white, 100.0 - wp_after_white),
-                };
-                // Negative wp_loss (the move "improved" win chances per the
-                // analysis search) clamps to 0 — i.e. counts as 100% accurate.
-                let wp_loss = (wp_before - wp_after).max(0.0);
-                accuracy_from_wp_loss(wp_loss)
-            })
-            .sum();
-        total / user_moves.len() as f64
+    // Accuracy, lichess-style. Per move: win-percentage loss → sigmoid →
+    // per-move accuracy. Whole game: blend a volatility-weighted mean with a
+    // harmonic mean (see blend_accuracy). The harmonic term is what makes a
+    // game-defining blunder actually show — a plain mean lets a handful of
+    // accurate moves mask it, so a thrown-away game still read ~85%. The
+    // volatility weight is the std-dev of the win-% trajectory in a sliding
+    // window around each move, so swingy moments (where a blunder really cost
+    // something) count for more than quiet shuffling.
+    let win_seq: Vec<f64> = eval_history.iter().map(|&e| win_percentage(e)).collect();
+    let window = (analysis.len() / 10).clamp(2, 8);
+    let weight_at = |pos: usize| -> f64 {
+        let end = pos.min(win_seq.len() - 1);
+        let start = end.saturating_sub(window - 1);
+        let slice = &win_seq[start..=end];
+        let mean = slice.iter().sum::<f64>() / slice.len() as f64;
+        let var = slice.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / slice.len() as f64;
+        var.sqrt().max(0.5)
     };
+
+    // Per-move (accuracy, weight) for the user's own non-forced moves.
+    let mut acc_weights: Vec<(f64, f64)> = Vec::with_capacity(analysis.len());
+    for (i, m) in analysis.iter().enumerate() {
+        if m.side != user_color || matches!(m.classification, MoveClass::Forced) {
+            continue;
+        }
+        let wp_before_white = win_percentage(m.eval_before);
+        let wp_after_white = win_percentage(m.eval_after);
+        // Convert to player POV: black's win % is the complement.
+        let (wp_before, wp_after) = match m.side {
+            Color::White => (wp_before_white, wp_after_white),
+            Color::Black => (100.0 - wp_before_white, 100.0 - wp_after_white),
+        };
+        // Negative wp_loss (the move "improved" win chances per the analysis
+        // search) clamps to 0 — i.e. counts as 100% accurate.
+        let wp_loss = (wp_before - wp_after).max(0.0);
+        let acc = accuracy_from_wp_loss(wp_loss);
+        // Weight from the position the move produced (win_seq index i + 1).
+        acc_weights.push((acc, weight_at(i + 1)));
+    }
+
+    let user_accuracy = blend_accuracy(&acc_weights);
 
     GameAnalysis {
         moves: analysis,
@@ -801,6 +834,30 @@ mod tests {
         assert!(a > 5.0 && a < 15.0, "50% wp loss should give ~8.5% accuracy, got {a}");
         // Catastrophic losses clamp to 0.
         assert!(accuracy_from_wp_loss(100.0) < 5.0);
+    }
+
+    #[test]
+    fn one_blunder_tanks_accuracy_via_harmonic_blend() {
+        // Eight near-perfect moves plus one catastrophic, high-volatility move.
+        // The old plain mean read ~88% (a thrown-away game looking "accurate");
+        // the lichess-style blend must drop it well below that so a single
+        // game-defining blunder actually shows.
+        let mut moves = vec![(98.0, 0.5); 8];
+        moves.push((10.0, 20.0)); // the blunder, in a swingy position
+        let blended = blend_accuracy(&moves);
+        let plain: f64 = moves.iter().map(|(a, _)| a).sum::<f64>() / moves.len() as f64;
+        assert!(plain > 88.0, "plain mean is misleadingly high: {plain}");
+        assert!(
+            blended < 60.0,
+            "blended accuracy should drop hard on a blunder, got {blended}"
+        );
+
+        // No moves (everything forced) is a clean 100, not a divide-by-zero.
+        assert_eq!(blend_accuracy(&[]), 100.0);
+
+        // A clean game of accurate moves stays high.
+        let clean = blend_accuracy(&vec![(97.0, 0.5); 30]);
+        assert!(clean > 90.0, "a clean game should stay high, got {clean}");
     }
 
     #[test]
