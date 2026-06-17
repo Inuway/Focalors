@@ -95,6 +95,56 @@ impl MoveClass {
     }
 }
 
+/// Whether a move is a genuine material sacrifice — the gate for a Brilliant
+/// classification. A real sacrifice gives up *at least a minor piece* of
+/// material (not merely a pawn) while the move is still among the best and the
+/// position is not lost.
+///
+/// The previous check fired whenever the opponent had *any* pawn-winning
+/// capture available after the move (`opp_best_see >= 100`), which is true on
+/// almost every move in a middlegame — so nearly every accurate move was
+/// labelled "Brilliant". Requiring ~a minor piece of net material plus a
+/// non-losing position makes brilliancies rare and meaningful again.
+pub(crate) fn is_sacrifice(
+    board: &Board,
+    played_mv: Move,
+    board_after: &Board,
+    cpl: Score,
+    is_forced: bool,
+    best_eval_for_side: Score,
+) -> bool {
+    // Net-material threshold for "a real sacrifice". Note SEE here nets the
+    // capturing piece's value, so a hung knight taken by a pawn reads ~220
+    // (320 - 100), a hung rook ~400, while a free pawn reads ~0 and winning
+    // the exchange reads ~180. 200 cp therefore catches genuine piece
+    // sacrifices while excluding pawn-grabs and exchange-level noise.
+    const SAC_CP: Score = 200;
+
+    // Brilliant requires a top, non-forced move in a position that is still at
+    // least roughly equal. A desperate sacrifice while already lost is not it.
+    if is_forced || cpl > 20 || best_eval_for_side < -50 {
+        return false;
+    }
+
+    // (a) the move is itself a capture that loses >= that much by SEE.
+    if see(board, played_mv) <= -SAC_CP {
+        return true;
+    }
+
+    // (b) the move leaves >= that much of our material en prise: the
+    //     opponent's best capture in the resulting position wins it.
+    //     (see() returns 0 for non-captures, so the max is over captures.)
+    let opp_moves = generate_legal_moves(board_after);
+    let mut opp_best = 0;
+    for j in 0..opp_moves.len() {
+        let s = see(board_after, opp_moves[j]);
+        if s > opp_best {
+            opp_best = s;
+        }
+    }
+    opp_best >= SAC_CP
+}
+
 /// Convert a centipawn eval (white's perspective) to white's winning
 /// percentage in [0, 100]. Uses the lichess sigmoid mapping.
 fn win_percentage(cp: Score) -> f64 {
@@ -332,21 +382,18 @@ pub fn analyze_game(
         let best_eval_for_side = to_side_perspective(best_eval, prep.side);
         let cpl = (best_eval_for_side - played_eval_for_side).max(0);
 
-        // Sacrifice: the move deliberately leaves material en prise (the
-        // opponent's best capture sequence wins >= ~minor-piece value, or
-        // the move itself was a losing capture by SEE) while the searched
-        // eval says it's still among the best moves. The old test
-        // compared the mover's own material before/after their own move,
-        // which is mathematically unsatisfiable — Brilliant was dead.
-        let was_sacrifice = cpl <= 20 && !prep.is_forced && {
-            let own_capture_losing = see(&prep.board, prep.played_mv) <= -100;
-            let opp_moves = generate_legal_moves(&prep.board_after);
-            let opp_best_see = (0..opp_moves.len())
-                .map(|j| see(&prep.board_after, opp_moves[j]))
-                .max()
-                .unwrap_or(0);
-            own_capture_losing || opp_best_see >= 100
-        };
+        // Brilliant gate: a genuine material sacrifice (>= a minor piece) that
+        // is still a top move in a non-losing position. See is_sacrifice — the
+        // old inline check fired on any pawn-winning capture the opponent had,
+        // which made almost every accurate move "Brilliant".
+        let was_sacrifice = is_sacrifice(
+            &prep.board,
+            prep.played_mv,
+            &prep.board_after,
+            cpl,
+            prep.is_forced,
+            best_eval_for_side,
+        );
 
         let classification = if prep.is_forced {
             MoveClass::Forced
@@ -680,6 +727,58 @@ mod tests {
         // ranking. 200 cp is a Mistake (121..=250); 400 cp is a Blunder.
         assert_eq!(MoveClass::from_cpl(200, true), MoveClass::Mistake);
         assert_eq!(MoveClass::from_cpl(400, true), MoveClass::Blunder);
+    }
+
+    fn mv(board: &Board, uci: &str) -> Move {
+        let from = Square::from_algebraic(&uci[0..2]).unwrap();
+        let to = Square::from_algebraic(&uci[2..4]).unwrap();
+        let moves = generate_legal_moves(board);
+        (0..moves.len())
+            .map(|i| moves[i])
+            .find(|m| m.from_sq() == from && m.to_sq() == to)
+            .unwrap_or_else(|| panic!("no legal move {uci}"))
+    }
+
+    #[test]
+    fn sacrifice_requires_real_material_not_a_pawn() {
+        crate::attacks::init();
+
+        // (A) The regression: a quiet, accurate move after which the opponent
+        // can only win a PAWN must NOT count as a sacrifice. White pushes
+        // e3-e4; Black can take the undefended e4 pawn (SEE 100). Under the old
+        // `>= 100` rule this was flagged a sacrifice -> Brilliant. It must not.
+        let before = Board::from_fen("4k3/8/8/3p4/8/4P3/8/4K3 w - - 0 1").unwrap();
+        let push = mv(&before, "e3e4");
+        let mut after = before.clone();
+        make_move(&mut after, push);
+        assert!(
+            !is_sacrifice(&before, push, &after, 10, false, 0),
+            "winning only a pawn is not a sacrifice"
+        );
+
+        // (B) A real piece sacrifice: white plays Nf2-e4, leaving the knight en
+        // prise to ...dxe4 (SEE 320 >= minor). Top move, equal-ish -> sacrifice.
+        let before = Board::from_fen("4k3/8/8/3p4/8/8/5N2/4K3 w - - 0 1").unwrap();
+        let nf2e4 = mv(&before, "f2e4");
+        let mut after = before.clone();
+        make_move(&mut after, nf2e4);
+        assert!(
+            is_sacrifice(&before, nf2e4, &after, 10, false, 50),
+            "leaving a minor piece en prise while still best is a sacrifice"
+        );
+
+        // (C) Same hanging-piece position, but the player is already lost: not
+        // brilliant (a desperate sac doesn't earn it).
+        assert!(
+            !is_sacrifice(&before, nf2e4, &after, 10, false, -200),
+            "a sacrifice in a losing position is not brilliant"
+        );
+
+        // (D) Forced moves are never brilliant.
+        assert!(
+            !is_sacrifice(&before, nf2e4, &after, 10, true, 50),
+            "forced moves are not brilliant"
+        );
     }
 
     #[test]
