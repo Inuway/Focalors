@@ -9,7 +9,7 @@ use crate::eval::{self, EvalBreakdown, Score};
 use crate::movegen::{generate_legal_moves, make_move};
 use crate::moves::{Move, MoveFlag};
 use crate::eval::MATE_SCORE;
-use crate::search::{SearchResult, Searcher, see};
+use crate::search::{SearchResult, Searcher};
 use crate::types::*;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -95,54 +95,101 @@ impl MoveClass {
     }
 }
 
-/// Whether a move is a genuine material sacrifice — the gate for a Brilliant
-/// classification. A real sacrifice gives up *at least a minor piece* of
-/// material (not merely a pawn) while the move is still among the best and the
-/// position is not lost.
+/// Material balance from `side`'s point of view, in centipawns (our pieces
+/// minus the opponent's). Kings excluded.
+fn material_balance(board: &Board, side: Color) -> Score {
+    let mut bal = 0;
+    for pc in [Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen] {
+        let ours = board.piece_bb(side, pc).popcount() as Score;
+        let theirs = board.piece_bb(side.flip(), pc).popcount() as Score;
+        bal += (ours - theirs) * piece_value(pc);
+    }
+    bal
+}
+
+/// The most material (centipawns) the side to move can win with a single
+/// capture, netting one immediate recapture when we defend the landing square.
 ///
-/// The previous check fired whenever the opponent had *any* pawn-winning
-/// capture available after the move (`opp_best_see >= 100`), which is true on
-/// almost every move in a middlegame — so nearly every accurate move was
-/// labelled "Brilliant". Requiring ~a minor piece of net material plus a
-/// non-losing position makes brilliancies rare and meaningful again.
+/// A small, reliable replacement for `see()` in this file: this codebase's
+/// `see()` mis-scores captures by valuable pieces — it effectively returns
+/// `victim - attacker` (a queen taking a free pawn reads -800), so every
+/// capture by a big piece looked like a sacrifice.
+fn best_capture_gain(board: &Board) -> Score {
+    let defender = board.side_to_move.flip();
+    let moves = generate_legal_moves(board);
+    let mut best = 0;
+    for i in 0..moves.len() {
+        let m = moves[i];
+        let victim = match board.piece_type_on(m.to_sq()) {
+            Some(p) => piece_value(p),
+            None => continue, // not a capture (en passant is rare; skip it)
+        };
+        let attacker = piece_value(board.piece_type_on(m.from_sq()).unwrap());
+        let mut after = board.clone();
+        make_move(&mut after, m);
+        // If we can recapture on the landing square it is a 1-ply trade;
+        // otherwise the opponent keeps the captured piece. (A legal king
+        // capture lands on an undefended square, so this is correct for kings.)
+        let net = if attacks::is_square_attacked(&after, m.to_sq(), defender) {
+            victim - attacker
+        } else {
+            victim
+        };
+        if net > best {
+            best = net;
+        }
+    }
+    best
+}
+
+/// Whether a move is a genuine material sacrifice — the gate for a Brilliant
+/// classification. A real sacrifice *invests* at least a minor piece of fresh
+/// material while still being a top, non-forced move that keeps the game from
+/// being lost, and it leaves us no longer ahead on material once the opponent
+/// collects.
+///
+/// This deliberately excludes the false-positive families seen in real games:
+/// captures that WIN material (a queen grabbing a free pawn is the opposite of
+/// a sacrifice), even trades (a knight for a bishop the opponent recaptures),
+/// and strong moves while already up material (conversion, not brilliance). It
+/// uses plain material counting rather than `see()`, which is unreliable here
+/// (see `best_capture_gain`).
 pub(crate) fn is_sacrifice(
     board: &Board,
-    played_mv: Move,
+    _played_mv: Move,
     board_after: &Board,
     cpl: Score,
     is_forced: bool,
     best_eval_for_side: Score,
 ) -> bool {
-    // Net-material threshold for "a real sacrifice". Note SEE here nets the
-    // capturing piece's value, so a hung knight taken by a pawn reads ~220
-    // (320 - 100), a hung rook ~400, while a free pawn reads ~0 and winning
-    // the exchange reads ~180. 200 cp therefore catches genuine piece
-    // sacrifices while excluding pawn-grabs and exchange-level noise.
+    // Net-material threshold for "a real sacrifice": at least ~a minor piece.
     const SAC_CP: Score = 200;
 
-    // Brilliant requires a top, non-forced move in a position that is still at
-    // least roughly equal. A desperate sacrifice while already lost is not it.
+    // Must be a top, non-forced move that does not leave us losing.
     if is_forced || cpl > 20 || best_eval_for_side < -50 {
         return false;
     }
 
-    // (a) the move is itself a capture that loses >= that much by SEE.
-    if see(board, played_mv) <= -SAC_CP {
-        return true;
+    let mover = board.side_to_move;
+
+    // Material this move itself won (0 for a quiet move; +victim for a capture).
+    let captured = material_balance(board_after, mover) - material_balance(board, mover);
+
+    // Material the opponent can immediately win — the piece(s) we left hanging.
+    let opp_gain = best_capture_gain(board_after);
+
+    // (1) The move must invest >= a minor piece of *fresh* material: what the
+    //     opponent can take, beyond anything the move itself captured. This
+    //     rejects free grabs (Qxb7: opp_gain ~ 0) and even trades (NxB then a
+    //     recapture: `captured` offsets `opp_gain`).
+    if opp_gain - captured < SAC_CP {
+        return false;
     }
 
-    // (b) the move leaves >= that much of our material en prise: the
-    //     opponent's best capture in the resulting position wins it.
-    //     (see() returns 0 for non-captures, so the max is over captures.)
-    let opp_moves = generate_legal_moves(board_after);
-    let mut opp_best = 0;
-    for j in 0..opp_moves.len() {
-        let s = see(board_after, opp_moves[j]);
-        if s > opp_best {
-            opp_best = s;
-        }
-    }
-    opp_best >= SAC_CP
+    // (2) Once the opponent collects the hanging material we must no longer be
+    //     ahead by >= a minor; otherwise we were simply converting an already
+    //     winning position, not sacrificing.
+    material_balance(board_after, mover) - opp_gain < SAC_CP
 }
 
 /// Convert a centipawn eval (white's perspective) to white's winning
@@ -811,6 +858,38 @@ mod tests {
         assert!(
             !is_sacrifice(&before, nf2e4, &after, 10, true, 50),
             "forced moves are not brilliant"
+        );
+    }
+
+    #[test]
+    fn sacrifice_excludes_material_gains_and_conversions() {
+        crate::attacks::init();
+
+        // (E) The reported bug: a capture that WINS material is never a
+        // sacrifice, even though our piece then sits deep in enemy territory.
+        // White's queen grabs a free b7 pawn (SEE +100) — exactly like the
+        // Qxb7/Rxc4/Rxa7 captures that were wrongly flagged Brilliant in the
+        // imported game.
+        let before = Board::from_fen("4k3/1p6/8/8/8/8/8/1Q2K3 w - - 0 1").unwrap();
+        let qxb7 = mv(&before, "b1b7");
+        let mut after = before.clone();
+        make_move(&mut after, qxb7);
+        assert!(
+            !is_sacrifice(&before, qxb7, &after, 0, false, 446),
+            "winning a free pawn is not a sacrifice"
+        );
+
+        // (F) The other half: leaving a knight en prise (a real sac shape) is
+        // NOT a brilliancy when we are already up material — that is just
+        // converting a won game. Same Nf2-e4 as case (B), but White is a rook
+        // ahead, so once Black takes the knight White is still ~+500.
+        let before = Board::from_fen("4k3/8/8/3p4/8/8/5N2/R3K3 w - - 0 1").unwrap();
+        let ne4 = mv(&before, "f2e4");
+        let mut after = before.clone();
+        make_move(&mut after, ne4);
+        assert!(
+            !is_sacrifice(&before, ne4, &after, 5, false, 446),
+            "a strong move while already up material is conversion, not a sacrifice"
         );
     }
 
