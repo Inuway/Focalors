@@ -4302,8 +4302,11 @@ impl FocalorsApp {
                     egui::vec2(sq_size, sq_size),
                 );
 
-                // Square color
-                let is_light = (display_rank + display_file) % 2 == 0;
+                // Square color. a1 (file 0, rank 0) must be dark — light squares
+                // are the odd-parity ones, matching the standard "light square on
+                // the right" / white queen on her own (light) color. This was
+                // inverted (== 0), which put the white queen on a dark d1.
+                let is_light = (display_rank + display_file) % 2 == 1;
                 let base_color = if is_light { light } else { dark };
                 let is_last_move = last_move_squares
                     .map(|(f, t)| f == sq_idx || t == sq_idx)
