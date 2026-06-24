@@ -463,9 +463,14 @@ fn enumerate_subsets(mask: u64) -> impl Iterator<Item = u64> {
 
 // ── Runtime initialization ─────────────────────────────────────────────────
 
-/// Must be called once at startup before using sliding piece attacks.
+/// Idempotent: fills the sliding-piece attack tables exactly once. Re-entrant
+/// or concurrent callers (the GUI "Analyze" worker, parallel test threads)
+/// would otherwise race the `static mut` writes against hot-path readers, a
+/// data race even though the rewritten values are identical. `Once` makes every
+/// call after the first a no-op with a proper happens-before edge.
 pub fn init() {
-    unsafe {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe {
         // Fill rook table
         for sq in 0..64 {
             let entry = &ROOK_MAGICS[sq];
@@ -485,7 +490,7 @@ pub fn init() {
                     Bitboard(bishop_attacks_slow(sq as u8, occ));
             }
         }
-    }
+    });
 }
 
 // ── Public attack lookups ──────────────────────────────────────────────────
