@@ -487,6 +487,20 @@ struct BoardView<'a> {
     board: &'a Board,
     last_move: Option<Move>,
     interactive: bool,
+    /// Game Review overlay: best-move and played-move arrows for the move that
+    /// produced this position. `None` for live play / anything non-review.
+    review: Option<ReviewOverlay>,
+}
+
+/// Overlay arrows drawn on the read-only Game Review board: the engine's best
+/// move (green) and the actually-played move (classification-colored), for the
+/// move that produced the displayed position. Square pairs are (from, to)
+/// indices; the played arrow is suppressed when it equals the best move.
+#[derive(Clone, Copy)]
+struct ReviewOverlay {
+    best: Option<(u8, u8)>,
+    played: Option<(u8, u8)>,
+    played_color: egui::Color32,
 }
 
 /// Puzzle trainer state — active when the user is solving puzzles.
@@ -611,6 +625,9 @@ pub struct FocalorsApp {
     show_advanced_engine_settings: bool,
     pending_promotion: Option<PendingPromotion>,
     piece_textures: HashMap<(Color, Piece), egui::TextureHandle>,
+    /// Coaching mascot shown on the Game Review page. Placeholder art for now;
+    /// see assets/mascot/README.md. Loaded once (never re-uploaded per frame).
+    mascot_texture: Option<egui::TextureHandle>,
     pgn_import_text: String,
     pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
     pgn_import_error: Option<String>,
@@ -728,6 +745,15 @@ impl FocalorsApp {
             load_piece_texture(ctx, "bP", include_bytes!("../assets/pieces/bP.png")),
         );
 
+        // Coaching mascot (placeholder art — swap assets/mascot/placeholder.png
+        // for real sprites, and later key a per-mood map off MoveClass). Loaded
+        // once here like the pieces so it is never re-uploaded per frame.
+        let mascot_texture = Some(load_piece_texture(
+            ctx,
+            "mascot_placeholder",
+            include_bytes!("../assets/mascot/placeholder.png"),
+        ));
+
         // Initialize database
         let db = match crate::db::Database::open() {
             Ok(d) => Some(d),
@@ -813,6 +839,7 @@ impl FocalorsApp {
             show_advanced_engine_settings: false,
             pending_promotion: None,
             piece_textures,
+            mascot_texture,
             pgn_import_text: String::new(),
             pgn_import_parsed: None,
             pgn_import_error: None,
@@ -2348,6 +2375,12 @@ impl FocalorsApp {
             }
         }
 
+        // Orient the review board to the reviewed player's perspective, the
+        // same as live play. Without this the board kept whatever orientation
+        // the last live game left, so a Black-perspective user could review
+        // their game upside down (and any best/played arrows with it).
+        self.flipped = game.user_color == "black";
+
         let replay = build_replay_state(game);
         self.replay_game = Some(replay);
     }
@@ -3083,6 +3116,25 @@ impl FocalorsApp {
             }
         };
 
+        // Game Review overlay arrows. Tied to `cursor` (the board currently on
+        // screen), not `new_cursor` (whose board lands a frame later), so the
+        // arrows always match the pieces shown. Describes the move that produced
+        // this position: analysis.moves[cursor - 1].
+        let review_overlay: Option<ReviewOverlay> = if cursor > 0 {
+            analysis_for_this_game
+                .as_ref()
+                .and_then(|ga| ga.moves.get(cursor - 1))
+                .map(|ma| ReviewOverlay {
+                    best: uci_arrow_squares(&ma.best_move_uci),
+                    played: last_move
+                        .filter(|m| !m.is_null())
+                        .map(|m| (m.from_sq().0, m.to_sq().0)),
+                    played_color: classification_color(ma.classification),
+                })
+        } else {
+            None
+        };
+
         // Keyboard navigation
         let (key_left, key_right, key_home, key_end) = ui.ctx().input(|i| {
             (
@@ -3179,6 +3231,7 @@ impl FocalorsApp {
                     board: &board,
                     last_move,
                     interactive: false,
+                    review: review_overlay,
                 };
                 self.draw_board(ui, Some(&view));
                 ui.add_space(6.0);
@@ -3348,6 +3401,10 @@ impl FocalorsApp {
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(4.0);
+                    // Coach mascot placeholder, shown with the move detail. The
+                    // coach speech bubble / explanation text will sit beside it
+                    // in a later phase.
+                    self.draw_review_mascot(ui, 56.0);
                     ui.label(
                         egui::RichText::new(format!(
                             "{} — CPL {} | Eval {:.2} → {:.2} | Best: {} ({:.2})",
@@ -4206,6 +4263,18 @@ impl eframe::App for FocalorsApp {
 impl FocalorsApp {
     // ── Chess board ────────────────────────────────────────────────────
 
+    /// Draw the coaching mascot placeholder, if loaded. A stand-in slot for the
+    /// Game Review coach: replace assets/mascot/placeholder.png with real art,
+    /// and extend `mascot_texture` into a per-mood map (happy/neutral/worried,
+    /// keyed to the move classification) when the coach feature lands.
+    fn draw_review_mascot(&self, ui: &mut egui::Ui, size: f32) {
+        if let Some(tex) = &self.mascot_texture {
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+            draw_piece_image(ui.painter(), tex, rect);
+        }
+    }
+
     fn draw_board(&mut self, ui: &mut egui::Ui, override_pos: Option<&BoardView<'_>>) {
         let interactive = override_pos.map(|v| v.interactive).unwrap_or(true);
         let board = match override_pos {
@@ -4399,6 +4468,35 @@ impl FocalorsApp {
                     let to_pos   = board_square_center(board_rect, sq_size, self.flipped, to);
                     draw_annotation_arrow(&painter, from_pos, to_pos, color.arrow(), sq_size);
                 }
+            }
+        }
+
+        // Game Review overlay arrows: the played move (classification color,
+        // drawn only when it differs from best) and the engine's best move
+        // (green). Rendered last so they sit above the pieces. flip-aware via
+        // board_square_center, so they always match the board's orientation.
+        if let Some(rv) = override_pos.and_then(|v| v.review) {
+            let alpha = 205u8;
+            if let Some((pf, pt)) = rv.played
+                && rv.best != Some((pf, pt))
+            {
+                let c = rv.played_color;
+                draw_annotation_arrow(
+                    &painter,
+                    board_square_center(board_rect, sq_size, self.flipped, pf),
+                    board_square_center(board_rect, sq_size, self.flipped, pt),
+                    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha),
+                    sq_size,
+                );
+            }
+            if let Some((bf, bt)) = rv.best {
+                draw_annotation_arrow(
+                    &painter,
+                    board_square_center(board_rect, sq_size, self.flipped, bf),
+                    board_square_center(board_rect, sq_size, self.flipped, bt),
+                    egui::Color32::from_rgba_unmultiplied(94, 176, 102, alpha),
+                    sq_size,
+                );
             }
         }
 
@@ -5651,6 +5749,18 @@ fn configure_theme(ctx: &egui::Context, theme: UiTheme) {
     ctx.set_global_style(style);
 }
 
+/// Parse the from/to squares of a UCI move ("e2e4", "e7e8q") into square
+/// indices for drawing a Game Review arrow. Returns `None` for malformed or
+/// empty UCI (UCI is always ASCII, so byte slicing is safe).
+fn uci_arrow_squares(uci: &str) -> Option<(u8, u8)> {
+    if uci.len() < 4 {
+        return None;
+    }
+    let from = Square::from_algebraic(&uci[0..2])?;
+    let to = Square::from_algebraic(&uci[2..4])?;
+    Some((from.0, to.0))
+}
+
 /// Inverse of `board_square_from_pos` — center of a square in screen coords.
 fn board_square_center(
     board_rect: egui::Rect,
@@ -6230,4 +6340,31 @@ pub fn run_gui() {
         Box::new(|cc| Ok(Box::new(FocalorsApp::new(cc)))),
     )
     .expect("Failed to launch GUI");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uci_arrow_squares;
+    use crate::types::Square;
+
+    #[test]
+    fn uci_arrow_squares_parses_plain_and_promotion() {
+        // e2e4: from e2 (file 4, rank 1 -> idx 12), to e4 (idx 28).
+        assert_eq!(
+            uci_arrow_squares("e2e4"),
+            Some((Square::from_algebraic("e2").unwrap().0, Square::from_algebraic("e4").unwrap().0))
+        );
+        // Promotion suffix is ignored; only the from/to squares matter.
+        assert_eq!(
+            uci_arrow_squares("e7e8q"),
+            Some((Square::from_algebraic("e7").unwrap().0, Square::from_algebraic("e8").unwrap().0))
+        );
+    }
+
+    #[test]
+    fn uci_arrow_squares_rejects_malformed() {
+        assert_eq!(uci_arrow_squares(""), None);
+        assert_eq!(uci_arrow_squares("e2"), None); // too short
+        assert_eq!(uci_arrow_squares("z9z9"), None); // off-board
+    }
 }
