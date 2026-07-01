@@ -29,14 +29,18 @@ pub enum MoveClass {
 
 impl MoveClass {
     pub fn symbol(self) -> &'static str {
+        // ASCII-only so nothing renders as a "tofu" box in the bundled egui
+        // font (which lacks glyphs like U+2713 and U+25A1). Best/Good/Forced
+        // carry no mark; their move-list color already conveys them, and the
+        // Game Review badge only decorates the four that return a symbol here.
         match self {
-            MoveClass::Best => "✓",
+            MoveClass::Best => "",
             MoveClass::Good => "",
             MoveClass::Inaccuracy => "?!",
             MoveClass::Mistake => "?",
             MoveClass::Blunder => "??",
             MoveClass::Brilliant => "!!",
-            MoveClass::Forced => "□",
+            MoveClass::Forced => "",
         }
     }
 

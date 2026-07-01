@@ -492,15 +492,17 @@ struct BoardView<'a> {
     review: Option<ReviewOverlay>,
 }
 
-/// Overlay arrows drawn on the read-only Game Review board: the engine's best
-/// move (green) and the actually-played move (classification-colored), for the
-/// move that produced the displayed position. Square pairs are (from, to)
-/// indices; the played arrow is suppressed when it equals the best move.
+/// Overlay drawn on the read-only Game Review board for the move that produced
+/// the displayed position: the engine's best move (green arrow), the played
+/// move (classification-colored arrow, suppressed when it equals best), and a
+/// classification badge on the played move's destination square. Square pairs
+/// are (from, to) indices.
 #[derive(Clone, Copy)]
 struct ReviewOverlay {
     best: Option<(u8, u8)>,
     played: Option<(u8, u8)>,
     played_color: egui::Color32,
+    played_class: crate::analysis::MoveClass,
 }
 
 /// Puzzle trainer state — active when the user is solving puzzles.
@@ -3124,6 +3126,7 @@ impl FocalorsApp {
                         .filter(|m| !m.is_null())
                         .map(|m| (m.from_sq().0, m.to_sq().0)),
                     played_color: classification_color(ma.classification),
+                    played_class: ma.classification,
                 })
         } else {
             None
@@ -3407,15 +3410,24 @@ impl FocalorsApp {
                     // coach speech bubble / explanation text will sit beside it
                     // in a later phase.
                     self.draw_review_mascot(ui, 56.0);
+                    // Best move as SAN needs the position BEFORE the move
+                    // (boards[new_cursor - 1]); fall back to raw UCI if that
+                    // board or the parse is unavailable.
+                    let best_san = self
+                        .replay_game
+                        .as_ref()
+                        .and_then(|r| r.boards.get(new_cursor - 1))
+                        .map(|b| crate::db::uci_to_san(b, &ma.best_move_uci))
+                        .unwrap_or_else(|| ma.best_move_uci.clone());
                     ui.label(
                         egui::RichText::new(format!(
-                            "{} — CPL {} | Eval {:.2} → {:.2} | Best: {} ({:.2})",
+                            "{} | CPL {} | Eval {} -> {} | Best {} ({})",
                             ma.classification.label(),
                             ma.cpl,
-                            ma.eval_before as f64 / 100.0,
-                            ma.eval_after as f64 / 100.0,
-                            ma.best_move_uci,
-                            ma.best_eval as f64 / 100.0,
+                            format_eval(ma.eval_before),
+                            format_eval(ma.eval_after),
+                            best_san,
+                            format_eval(ma.best_eval),
                         ))
                         .size(11.0)
                         .color(hydra_subtle_text()),
@@ -4500,6 +4512,33 @@ impl FocalorsApp {
                     sq_size,
                 );
             }
+
+            // Classification badge on the played move's destination square, in
+            // the chess.com corner style. Only moves whose symbol is non-empty
+            // are badged, which after MoveClass::symbol() means Inaccuracy /
+            // Mistake / Blunder / Brilliant (Best/Good/Forced return ""), so it
+            // stays uncluttered. Symbols are ASCII (?! ? ?? !!) — never tofu.
+            if let Some((_, pt)) = rv.played {
+                let sym = rv.played_class.symbol();
+                if !sym.is_empty() {
+                    let center = board_square_center(board_rect, sq_size, self.flipped, pt);
+                    let badge_center = center + egui::vec2(sq_size * 0.32, -sq_size * 0.32);
+                    let ink = egui::Color32::from_rgb(24, 20, 16);
+                    painter.circle(
+                        badge_center,
+                        sq_size * 0.19,
+                        classification_color(rv.played_class),
+                        egui::Stroke::new(1.5, ink),
+                    );
+                    painter.text(
+                        badge_center,
+                        egui::Align2::CENTER_CENTER,
+                        sym,
+                        egui::FontId::proportional(sq_size * 0.22),
+                        ink,
+                    );
+                }
+            }
         }
 
         // Right-click annotation handling — press records origin square,
@@ -4931,16 +4970,7 @@ impl FocalorsApp {
                     // your opponent here, so negating it gives a "you-positive"
                     // reading: + means you are winning, - means you are losing.
                     let score = -state.search_info.score;
-                    let score_text = if score.abs() > 20000 {
-                        let mate_in = (29000 - score.abs() + 1) / 2;
-                        if score > 0 {
-                            format!("M{mate_in}")
-                        } else {
-                            format!("-M{mate_in}")
-                        }
-                    } else {
-                        format!("{:+.2}", score as f64 / 100.0)
-                    };
+                    let score_text = format_eval(score);
 
                     if !state.search_info.best_move.is_empty() {
                         ui.label(
@@ -6266,6 +6296,25 @@ fn update_local_game_outcome(state: &mut SharedState) {
     }
 }
 
+/// Format a White-POV centipawn score for display. Scores inside the mate
+/// window (|cp| > 20000, i.e. near ±MATE_SCORE) render as "M{n}" / "-M{n}"
+/// (full moves to mate) instead of an absurd pawn count; everything else as
+/// signed pawns to two decimals. Shared by the live score readout and the
+/// Game Review detail line.
+fn format_eval(cp: crate::eval::Score) -> String {
+    const MATE_DISPLAY_CUTOFF: crate::eval::Score = 20000;
+    if cp.abs() > MATE_DISPLAY_CUTOFF {
+        let mate_in = (crate::eval::MATE_SCORE - cp.abs() + 1) / 2;
+        if cp > 0 {
+            format!("M{mate_in}")
+        } else {
+            format!("-M{mate_in}")
+        }
+    } else {
+        format!("{:+.2}", cp as f64 / 100.0)
+    }
+}
+
 fn classification_color(class: crate::analysis::MoveClass) -> egui::Color32 {
     use crate::analysis::MoveClass;
     match class {
@@ -6368,5 +6417,21 @@ mod tests {
         assert_eq!(uci_arrow_squares(""), None);
         assert_eq!(uci_arrow_squares("e2"), None); // too short
         assert_eq!(uci_arrow_squares("z9z9"), None); // off-board
+    }
+
+    #[test]
+    fn format_eval_normal_scores_are_signed_pawns() {
+        assert_eq!(super::format_eval(0), "+0.00");
+        assert_eq!(super::format_eval(217), "+2.17");
+        assert_eq!(super::format_eval(-135), "-1.35");
+    }
+
+    #[test]
+    fn format_eval_mate_scores_render_as_mate_in_n() {
+        // MATE_SCORE is 29000; 28997 => mate in (29000-28997+1)/2 = 2.
+        assert_eq!(super::format_eval(28997), "M2");
+        assert_eq!(super::format_eval(-28997), "-M2");
+        // Just below the cutoff stays a pawn count, not a mate.
+        assert_eq!(super::format_eval(19999), "+199.99");
     }
 }
