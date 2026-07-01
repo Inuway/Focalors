@@ -2375,12 +2375,6 @@ impl FocalorsApp {
             }
         }
 
-        // Orient the review board to the reviewed player's perspective, the
-        // same as live play. Without this the board kept whatever orientation
-        // the last live game left, so a Black-perspective user could review
-        // their game upside down (and any best/played arrows with it).
-        self.flipped = game.user_color == "black";
-
         let replay = build_replay_state(game);
         self.replay_game = Some(replay);
     }
@@ -3071,7 +3065,7 @@ impl FocalorsApp {
         }
 
         // ── Snapshot state for this frame ──────────────────────────────
-        let (cursor, num_plies, board, last_move, game_id, header_text, _user_color, uci_moves) = {
+        let (cursor, num_plies, board, last_move, game_id, header_text, user_color, uci_moves) = {
             let r = self.replay_game.as_ref().unwrap();
             let total_plies = r.moves.len();
             let cursor = r.cursor.min(total_plies);
@@ -3233,7 +3227,15 @@ impl FocalorsApp {
                     interactive: false,
                     review: review_overlay,
                 };
+                // Orient the review board to the reviewed player, but only for
+                // this draw: save and restore the shared `self.flipped` so that
+                // reviewing never re-orients the live-play / puzzle board, which
+                // keep using it. Without this, reviewing an opposite-color game
+                // would leave the live board flipped afterwards.
+                let saved_flip = self.flipped;
+                self.flipped = user_color == Color::Black;
                 self.draw_board(ui, Some(&view));
+                self.flipped = saved_flip;
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("⏮").clicked() {
