@@ -3210,13 +3210,17 @@ impl FocalorsApp {
         ui.horizontal_top(|ui| {
             // Center the board+sidebar block on wide screens by padding the
             // start of the horizontal layout. Left-pad alone shifts the
-            // whole row right; combined with the fixed widths below it
-            // produces visual centering.
-            let board_w: f32 = 760.0;
+            // whole row right; combined with the widths below it produces
+            // visual centering.
             let gap_w: f32 = 12.0;
             let right_w: f32 = 420.0;
-            let total = board_w + gap_w + right_w;
             let avail = ui.available_width();
+            // The board column gives way on narrow windows instead of pushing
+            // the right panel off-screen: draw_board sizes itself to whatever
+            // width it gets, so shrinking here is safe. At the 800px minimum
+            // window the board lands near 320px; on wide screens it stays 760.
+            let board_w: f32 = (avail - gap_w - right_w).clamp(320.0, 760.0);
+            let total = board_w + gap_w + right_w;
             if avail > total {
                 ui.add_space((avail - total) / 2.0);
             }
@@ -3403,13 +3407,7 @@ impl FocalorsApp {
                     && let Some(ga) = analysis_for_this_game.as_ref()
                     && let Some(ma) = ga.moves.get(new_cursor - 1)
                 {
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    // Coach mascot placeholder, shown with the move detail. The
-                    // coach speech bubble / explanation text will sit beside it
-                    // in a later phase.
-                    self.draw_review_mascot(ui, 56.0);
+                    ui.add_space(8.0);
                     // Best move as SAN needs the position BEFORE the move
                     // (boards[new_cursor - 1]); fall back to raw UCI if that
                     // board or the parse is unavailable.
@@ -3419,27 +3417,86 @@ impl FocalorsApp {
                         .and_then(|r| r.boards.get(new_cursor - 1))
                         .map(|b| crate::db::uci_to_san(b, &ma.best_move_uci))
                         .unwrap_or_else(|| ma.best_move_uci.clone());
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} | CPL {} | Eval {} -> {} | Best {} ({})",
-                            ma.classification.label(),
-                            ma.cpl,
-                            format_eval(ma.eval_before),
-                            format_eval(ma.eval_after),
-                            best_san,
-                            format_eval(ma.best_eval),
-                        ))
-                        .size(11.0)
-                        .color(hydra_subtle_text()),
-                    );
-                    if let Some(ref expl) = ma.explanation {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(expl)
-                                .size(11.0)
-                                .color(hydra_subtle_text()),
-                        );
-                    }
+                    let coach = crate::analysis::coach_line(ma, &best_san);
+                    // Coach row: mascot on the left, speech bubble beside it.
+                    // The bubble is a hydra card plus a small tail triangle
+                    // painted onto its left edge, pointing at the mascot.
+                    ui.horizontal_top(|ui| {
+                        self.draw_review_mascot(ui, 72.0);
+                        ui.add_space(10.0);
+                        let bubble = hydra_card_frame().show(ui, |ui| {
+                            // Frame::show inherits the surrounding layout,
+                            // which here is the horizontal mascot row; without
+                            // an explicit vertical the bubble's labels lay out
+                            // side by side and the last one wraps one char per
+                            // line as it runs out of row.
+                            ui.vertical(|ui| {
+                            // Column is 420; leave room for mascot + margins
+                            // so wrapped text never pushes past the panel.
+                            ui.set_max_width(290.0);
+                            ui.label(
+                                egui::RichText::new(ma.classification.label())
+                                    .size(13.0)
+                                    .strong()
+                                    .color(classification_color(ma.classification)),
+                            );
+                            ui.add_space(2.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&coach)
+                                        .size(12.0)
+                                        .color(hydra_text()),
+                                )
+                                .wrap(),
+                            );
+                            // Rich in-session explanation (hanging pieces, the
+                            // engine line). Not persisted, so only fresh
+                            // analyses have it; the coach line above always
+                            // shows either way.
+                            if let Some(ref expl) = ma.explanation {
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(expl)
+                                            .size(10.5)
+                                            .color(hydra_subtle_text()),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "CPL {} | Eval {} -> {} | Best {} ({})",
+                                        ma.cpl,
+                                        format_eval(ma.eval_before),
+                                        format_eval(ma.eval_after),
+                                        best_san,
+                                        format_eval(ma.best_eval),
+                                    ))
+                                    .size(10.5)
+                                    .color(hydra_subtle_text()),
+                                )
+                                .wrap(),
+                            );
+                            });
+                        });
+                        // Speech-bubble tail: small triangle on the bubble's
+                        // left edge, aimed at the mascot. Same fill as the
+                        // card so it reads as one shape.
+                        let rect = bubble.response.rect;
+                        let tail_y = rect.min.y + 24.0;
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            vec![
+                                egui::pos2(rect.min.x - 7.0, tail_y),
+                                egui::pos2(rect.min.x + 1.0, tail_y - 6.0),
+                                egui::pos2(rect.min.x + 1.0, tail_y + 6.0),
+                            ],
+                            hydra_panel_fill(),
+                            egui::Stroke::NONE,
+                        ));
+                    });
                 }
             });
         });
@@ -6302,7 +6359,7 @@ fn update_local_game_outcome(state: &mut SharedState) {
 /// signed pawns to two decimals. Shared by the live score readout and the
 /// Game Review detail line.
 fn format_eval(cp: crate::eval::Score) -> String {
-    const MATE_DISPLAY_CUTOFF: crate::eval::Score = 20000;
+    use crate::eval::MATE_DISPLAY_CUTOFF;
     if cp.abs() > MATE_DISPLAY_CUTOFF {
         let mate_in = (crate::eval::MATE_SCORE - cp.abs() + 1) / 2;
         if cp > 0 {

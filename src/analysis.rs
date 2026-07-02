@@ -594,6 +594,79 @@ fn to_side_perspective(white_score: Score, side: Color) -> Score {
     }
 }
 
+/// One short coaching sentence for a reviewed move, in plain language.
+///
+/// Unlike `generate_explanation` (which needs live board state and is only
+/// produced during a fresh analysis run), this is a pure function of the
+/// fields that survive DB persistence, so it works identically for games
+/// reopened from history. `best_san` is the best move already converted to
+/// SAN by the caller (the GUI has the pre-move board for that).
+///
+/// All numbers are given from the moving player's perspective (+ good for
+/// them), in pawns. Scores inside the mate window become mate prose instead
+/// of nonsense like "290 pawns". Copy is ASCII-only and em-dash-free.
+pub fn coach_line(ma: &MoveAnalysis, best_san: &str) -> String {
+    use crate::eval::MATE_DISPLAY_CUTOFF;
+
+    let before = to_side_perspective(ma.eval_before, ma.side);
+    let after = to_side_perspective(ma.eval_after, ma.side);
+    let best = to_side_perspective(ma.best_eval, ma.side);
+    let in_mate_window = |s: Score| s.abs() > MATE_DISPLAY_CUTOFF;
+    let pawns = |cp: Score| format!("{:+.1}", cp as f64 / 100.0);
+
+    match ma.classification {
+        MoveClass::Brilliant => {
+            "A brilliant move! A real sacrifice, and still the strongest continuation.".to_string()
+        }
+        MoveClass::Best => {
+            if after > MATE_DISPLAY_CUTOFF {
+                "The strongest move, keeping the forced mate on the board.".to_string()
+            } else {
+                "The strongest move in the position. Exactly what the engine would play."
+                    .to_string()
+            }
+        }
+        MoveClass::Good => format!(
+            "A solid move. {best_san} was the engine's slight preference, but this stays on track."
+        ),
+        MoveClass::Forced => "The only reasonable move in this position.".to_string(),
+        MoveClass::Inaccuracy | MoveClass::Mistake | MoveClass::Blunder => {
+            let intro = match ma.classification {
+                MoveClass::Inaccuracy => "A little imprecise.",
+                MoveClass::Mistake => "A real slip.",
+                _ => "A serious mistake.",
+            };
+            if after < -MATE_DISPLAY_CUTOFF {
+                // The move walks into a forced mate.
+                format!("{intro} It allows a forced mate. {best_san} was the move.")
+            } else if best > MATE_DISPLAY_CUTOFF {
+                // There was a forced mate and the move let it slip.
+                format!("{intro} There was a forced mate starting with {best_san}.")
+            } else if ma.classification == MoveClass::Blunder
+                && !in_mate_window(before)
+                && !in_mate_window(after)
+            {
+                format!(
+                    "{intro} The eval swings from {} to {}. {best_san} was the move.",
+                    pawns(before),
+                    pawns(after),
+                )
+            } else if !in_mate_window(best) {
+                format!(
+                    "{intro} This gives up about {:.1} pawns. {best_san} was stronger, \
+                     keeping the eval near {}.",
+                    ma.cpl as f64 / 100.0,
+                    pawns(best),
+                )
+            } else {
+                // Odd mate-window combination not covered above: keep it
+                // simple rather than printing a bogus pawn count.
+                format!("{intro} {best_san} was much stronger.")
+            }
+        }
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Human-readable explanations
 // ════════════════════════════════════════════════════════════════════════════
@@ -811,6 +884,95 @@ mod tests {
         // ranking. 200 cp is a Mistake (121..=250); 400 cp is a Blunder.
         assert_eq!(MoveClass::from_cpl(200, true), MoveClass::Mistake);
         assert_eq!(MoveClass::from_cpl(400, true), MoveClass::Blunder);
+    }
+
+    /// Build a MoveAnalysis literal for coach_line tests. Evals are White-POV,
+    /// mirroring how they are stored and persisted.
+    fn ma(
+        side: Color,
+        class: MoveClass,
+        eval_before: Score,
+        eval_after: Score,
+        best_eval: Score,
+        cpl: Score,
+    ) -> MoveAnalysis {
+        MoveAnalysis {
+            move_number: 1,
+            side,
+            move_san: "Nc3".to_string(),
+            eval_before,
+            eval_after,
+            best_move_uci: "g1f3".to_string(),
+            best_eval,
+            cpl,
+            classification: class,
+            explanation: None,
+        }
+    }
+
+    #[test]
+    fn coach_line_blunder_reports_side_perspective_swing() {
+        // White blunder: +1.5 to -2.6 from White's own view.
+        let m = ma(Color::White, MoveClass::Blunder, 150, -260, 140, 400);
+        assert_eq!(
+            coach_line(&m, "Nf3"),
+            "A serious mistake. The eval swings from +1.5 to -2.6. Nf3 was the move."
+        );
+        // Black blunder with the same story: stored White-POV evals are
+        // negated, so the coach line must read identically for Black.
+        let m = ma(Color::Black, MoveClass::Blunder, -150, 260, -140, 400);
+        assert_eq!(
+            coach_line(&m, "Nf6"),
+            "A serious mistake. The eval swings from +1.5 to -2.6. Nf6 was the move."
+        );
+    }
+
+    #[test]
+    fn coach_line_mate_scores_become_prose_not_pawn_counts() {
+        // Walking into a forced mate must not print "-289.9 pawns".
+        let m = ma(Color::White, MoveClass::Blunder, 50, -28995, 40, 29045);
+        assert_eq!(
+            coach_line(&m, "Qe2"),
+            "A serious mistake. It allows a forced mate. Qe2 was the move."
+        );
+        // Missing a forced mate mentions the mate, not a bogus cpl.
+        let m = ma(Color::White, MoveClass::Mistake, 28995, 200, 28995, 28795);
+        assert_eq!(
+            coach_line(&m, "Qh7"),
+            "A real slip. There was a forced mate starting with Qh7."
+        );
+    }
+
+    #[test]
+    fn coach_line_inaccuracy_mentions_loss_and_better_move() {
+        let m = ma(Color::White, MoveClass::Inaccuracy, 217, 135, 217, 82);
+        assert_eq!(
+            coach_line(&m, "d4"),
+            "A little imprecise. This gives up about 0.8 pawns. d4 was stronger, \
+             keeping the eval near +2.2."
+        );
+    }
+
+    #[test]
+    fn coach_line_covers_every_class_without_em_dashes() {
+        for class in [
+            MoveClass::Best,
+            MoveClass::Good,
+            MoveClass::Inaccuracy,
+            MoveClass::Mistake,
+            MoveClass::Blunder,
+            MoveClass::Brilliant,
+            MoveClass::Forced,
+        ] {
+            let m = ma(Color::White, class, 100, 50, 120, 50);
+            let line = coach_line(&m, "Nf3");
+            assert!(!line.is_empty(), "{class:?} must produce coach text");
+            assert!(
+                !line.contains('\u{2014}'),
+                "{class:?} coach text contains an em-dash: {line}"
+            );
+            assert!(line.is_ascii(), "{class:?} coach text is not ASCII: {line}");
+        }
     }
 
     fn mv(board: &Board, uci: &str) -> Move {

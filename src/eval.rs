@@ -9,6 +9,13 @@ pub type Score = i32;
 pub const INFINITY: Score = 30000;
 pub const MATE_SCORE: Score = 29000;
 
+/// Display-side mate window: any |score| above this is presented to the user
+/// as "mate in N" (or coach prose about mate) instead of an absurd pawn count.
+/// Deliberately far below MATE_SCORE so mate-in-many still reads as mate, and
+/// far above any real positional eval. Shared by the GUI score readout, the
+/// Game Review detail line, and the coach text.
+pub const MATE_DISPLAY_CUTOFF: Score = 20000;
+
 /// Material values in centipawns
 const PIECE_VALUE: [Score; Piece::COUNT] = [
     100,  // Pawn
