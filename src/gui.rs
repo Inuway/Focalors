@@ -627,9 +627,6 @@ pub struct FocalorsApp {
     show_advanced_engine_settings: bool,
     pending_promotion: Option<PendingPromotion>,
     piece_textures: HashMap<(Color, Piece), egui::TextureHandle>,
-    /// Coaching mascot shown on the Game Review page. Placeholder art for now;
-    /// see assets/mascot/README.md. Loaded once (never re-uploaded per frame).
-    mascot_texture: Option<egui::TextureHandle>,
     pgn_import_text: String,
     pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
     pgn_import_error: Option<String>,
@@ -747,15 +744,6 @@ impl FocalorsApp {
             load_piece_texture(ctx, "bP", include_bytes!("../assets/pieces/bP.png")),
         );
 
-        // Coaching mascot (placeholder art — swap assets/mascot/placeholder.png
-        // for real sprites, and later key a per-mood map off MoveClass). Loaded
-        // once here like the pieces so it is never re-uploaded per frame.
-        let mascot_texture = Some(load_piece_texture(
-            ctx,
-            "mascot_placeholder",
-            include_bytes!("../assets/mascot/placeholder.png"),
-        ));
-
         // Initialize database
         let db = match crate::db::Database::open() {
             Ok(d) => Some(d),
@@ -841,7 +829,6 @@ impl FocalorsApp {
             show_advanced_engine_settings: false,
             pending_promotion: None,
             piece_textures,
-            mascot_texture,
             pgn_import_text: String::new(),
             pgn_import_parsed: None,
             pgn_import_error: None,
@@ -3418,84 +3405,59 @@ impl FocalorsApp {
                         .map(|b| crate::db::uci_to_san(b, &ma.best_move_uci))
                         .unwrap_or_else(|| ma.best_move_uci.clone());
                     let coach = crate::analysis::coach_line(ma, &best_san);
-                    // Coach row: mascot on the left, speech bubble beside it.
-                    // The bubble is a hydra card plus a small tail triangle
-                    // painted onto its left edge, pointing at the mascot.
-                    ui.horizontal_top(|ui| {
-                        self.draw_review_mascot(ui, 72.0);
-                        ui.add_space(10.0);
-                        let bubble = hydra_card_frame().show(ui, |ui| {
-                            // Frame::show inherits the surrounding layout,
-                            // which here is the horizontal mascot row; without
-                            // an explicit vertical the bubble's labels lay out
-                            // side by side and the last one wraps one char per
-                            // line as it runs out of row.
-                            ui.vertical(|ui| {
-                            // Column is 420; leave room for mascot + margins
-                            // so wrapped text never pushes past the panel.
-                            ui.set_max_width(290.0);
-                            ui.label(
-                                egui::RichText::new(ma.classification.label())
-                                    .size(13.0)
-                                    .strong()
-                                    .color(classification_color(ma.classification)),
-                            );
-                            ui.add_space(2.0);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&coach)
-                                        .size(12.0)
-                                        .color(hydra_text()),
-                                )
-                                .wrap(),
-                            );
-                            // Rich in-session explanation (hanging pieces, the
-                            // engine line). Not persisted, so only fresh
-                            // analyses have it; the coach line above always
-                            // shows either way.
-                            if let Some(ref expl) = ma.explanation {
-                                ui.add_space(4.0);
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(expl)
-                                            .size(10.5)
-                                            .color(hydra_subtle_text()),
-                                    )
-                                    .wrap(),
-                                );
-                            }
+                    // Coach card, flush with the panel's left edge. When the
+                    // mascot lands (first full release), it sits to the left
+                    // of this card, which then becomes its speech bubble.
+                    hydra_card_frame().show(ui, |ui| {
+                        // Column is 420; keep wrapped text inside the card's
+                        // 18px margins.
+                        ui.set_max_width(370.0);
+                        ui.label(
+                            egui::RichText::new(ma.classification.label())
+                                .size(13.0)
+                                .strong()
+                                .color(classification_color(ma.classification)),
+                        );
+                        ui.add_space(2.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&coach)
+                                    .size(12.0)
+                                    .color(hydra_text()),
+                            )
+                            .wrap(),
+                        );
+                        // Rich in-session explanation (hanging pieces, the
+                        // engine line). Not persisted, so only fresh
+                        // analyses have it; the coach line above always
+                        // shows either way.
+                        if let Some(ref expl) = ma.explanation {
                             ui.add_space(4.0);
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "CPL {} | Eval {} -> {} | Best {} ({})",
-                                        ma.cpl,
-                                        format_eval(ma.eval_before),
-                                        format_eval(ma.eval_after),
-                                        best_san,
-                                        format_eval(ma.best_eval),
-                                    ))
-                                    .size(10.5)
-                                    .color(hydra_subtle_text()),
+                                    egui::RichText::new(expl)
+                                        .size(10.5)
+                                        .color(hydra_subtle_text()),
                                 )
                                 .wrap(),
                             );
-                            });
-                        });
-                        // Speech-bubble tail: small triangle on the bubble's
-                        // left edge, aimed at the mascot. Same fill as the
-                        // card so it reads as one shape.
-                        let rect = bubble.response.rect;
-                        let tail_y = rect.min.y + 24.0;
-                        ui.painter().add(egui::Shape::convex_polygon(
-                            vec![
-                                egui::pos2(rect.min.x - 7.0, tail_y),
-                                egui::pos2(rect.min.x + 1.0, tail_y - 6.0),
-                                egui::pos2(rect.min.x + 1.0, tail_y + 6.0),
-                            ],
-                            hydra_panel_fill(),
-                            egui::Stroke::NONE,
-                        ));
+                        }
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "CPL {} | Eval {} -> {} | Best {} ({})",
+                                    ma.cpl,
+                                    format_eval(ma.eval_before),
+                                    format_eval(ma.eval_after),
+                                    best_san,
+                                    format_eval(ma.best_eval),
+                                ))
+                                .size(10.5)
+                                .color(hydra_subtle_text()),
+                            )
+                            .wrap(),
+                        );
                     });
                 }
             });
@@ -4333,18 +4295,6 @@ impl eframe::App for FocalorsApp {
 
 impl FocalorsApp {
     // ── Chess board ────────────────────────────────────────────────────
-
-    /// Draw the coaching mascot placeholder, if loaded. A stand-in slot for the
-    /// Game Review coach: replace assets/mascot/placeholder.png with real art,
-    /// and extend `mascot_texture` into a per-mood map (happy/neutral/worried,
-    /// keyed to the move classification) when the coach feature lands.
-    fn draw_review_mascot(&self, ui: &mut egui::Ui, size: f32) {
-        if let Some(tex) = &self.mascot_texture {
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-            draw_piece_image(ui.painter(), tex, rect);
-        }
-    }
 
     fn draw_board(&mut self, ui: &mut egui::Ui, override_pos: Option<&BoardView<'_>>) {
         let interactive = override_pos.map(|v| v.interactive).unwrap_or(true);
