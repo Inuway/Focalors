@@ -1477,7 +1477,7 @@ impl FocalorsApp {
                     let label = crate::puzzles::PuzzleTheme::from_db_str(theme).label();
                     let tile = egui::Frame::new()
                         .fill(color.gamma_multiply(0.18))
-                        .stroke(egui::Stroke::new(1.0, color))
+                        .stroke(egui::Stroke::new(1.0_f32, color))
                         .corner_radius(6)
                         .inner_margin(egui::Margin::same(8));
                     tile.show(ui, |ui| {
@@ -1828,7 +1828,7 @@ impl FocalorsApp {
                         };
                         let phase_tile = egui::Frame::new()
                             .fill(color.gamma_multiply(0.10))
-                            .stroke(egui::Stroke::new(1.0, color))
+                            .stroke(egui::Stroke::new(1.0_f32, color))
                             .corner_radius(6)
                             .inner_margin(egui::Margin::same(12));
                         phase_tile.show(&mut cols[i], |ui| {
@@ -3001,7 +3001,7 @@ impl FocalorsApp {
                         Some(Err(err)) => {
                             egui::Frame::new()
                                 .fill(hydra_danger().gamma_multiply(0.10))
-                                .stroke(egui::Stroke::new(1.0, hydra_danger()))
+                                .stroke(egui::Stroke::new(1.0_f32, hydra_danger()))
                                 .corner_radius(6)
                                 .inner_margin(egui::Margin::same(10))
                                 .show(ui, |ui| {
@@ -4535,7 +4535,7 @@ impl FocalorsApp {
                         badge_center,
                         sq_size * 0.19,
                         classification_color(rv.played_class),
-                        egui::Stroke::new(1.5, ink),
+                        egui::Stroke::new(1.5_f32, ink),
                     );
                     painter.text(
                         badge_center,
@@ -5568,7 +5568,7 @@ fn hydra_card_frame() -> egui::Frame {
 fn hydra_callout_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(hydra_accent_soft())
-        .stroke(egui::Stroke::new(1.0, hydra_accent()))
+        .stroke(egui::Stroke::new(1.0_f32, hydra_accent()))
         .corner_radius(6)
         .inner_margin(egui::Margin::same(10))
 }
@@ -5600,7 +5600,7 @@ fn home_nav_button<'a>(selected: bool, label: &'a str) -> egui::Button<'a> {
         egui::Color32::TRANSPARENT
     })
     .stroke(egui::Stroke::new(
-        if selected { 1.0 } else { 0.0 },
+        if selected { 1.0_f32 } else { 0.0_f32 },
         if selected { hydra_accent() } else { egui::Color32::TRANSPARENT },
     ))
     .corner_radius(0)
@@ -5614,7 +5614,7 @@ fn primary_button(label: &str) -> egui::Button<'_> {
             .color(hydra_text_on_accent()),
     )
     .fill(hydra_accent())
-    .stroke(egui::Stroke::new(1.0, hydra_accent()))
+    .stroke(egui::Stroke::new(1.0_f32, hydra_accent()))
     .corner_radius(2)
 }
 
@@ -5626,7 +5626,7 @@ fn secondary_button(label: &str) -> egui::Button<'_> {
             .color(hydra_text()),
     )
     .fill(egui::Color32::TRANSPARENT)
-    .stroke(egui::Stroke::new(1.0, hydra_border()))
+    .stroke(egui::Stroke::new(1.0_f32, hydra_border()))
     .corner_radius(2)
 }
 
@@ -5638,7 +5638,7 @@ fn danger_button(label: &str) -> egui::Button<'_> {
             .color(hydra_danger()),
     )
     .fill(egui::Color32::TRANSPARENT)
-    .stroke(egui::Stroke::new(1.0, hydra_danger()))
+    .stroke(egui::Stroke::new(1.0_f32, hydra_danger()))
     .corner_radius(2)
 }
 
@@ -5650,7 +5650,7 @@ fn theme_toggle_button(label: &str) -> egui::Button<'_> {
             .color(hydra_text()),
     )
     .fill(egui::Color32::TRANSPARENT)
-    .stroke(egui::Stroke::new(1.0, hydra_border()))
+    .stroke(egui::Stroke::new(1.0_f32, hydra_border()))
     .corner_radius(2)
 }
 
@@ -5724,8 +5724,8 @@ fn configure_theme(ctx: &egui::Context, theme: UiTheme) {
     visuals.code_bg_color = hydra_panel_alt_fill();
     visuals.hyperlink_color = hydra_accent();
     visuals.selection.bg_fill = hydra_accent();
-    visuals.selection.stroke = egui::Stroke::new(1.0, hydra_text_on_accent());
-    visuals.window_stroke = egui::Stroke::new(1.0, hydra_border());
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, hydra_text_on_accent());
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, hydra_border());
     visuals.window_corner_radius = egui::CornerRadius::same(4);
     visuals.menu_corner_radius = egui::CornerRadius::same(2);
     visuals.window_shadow = egui::epaint::Shadow {
@@ -5742,23 +5742,23 @@ fn configure_theme(ctx: &egui::Context, theme: UiTheme) {
     };
     visuals.widgets.noninteractive.bg_fill = hydra_panel_fill();
     visuals.widgets.noninteractive.weak_bg_fill = hydra_panel_fill();
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, hydra_border());
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, hydra_border());
     visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
     visuals.widgets.inactive.bg_fill = hydra_panel_alt_fill();
     visuals.widgets.inactive.weak_bg_fill = hydra_panel_alt_fill();
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, hydra_border());
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, hydra_border());
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
     visuals.widgets.hovered.bg_fill = hydra_panel_raised_fill();
     visuals.widgets.hovered.weak_bg_fill = hydra_panel_raised_fill();
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, hydra_accent());
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, hydra_accent());
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
     visuals.widgets.active.bg_fill = hydra_panel_raised_fill();
     visuals.widgets.active.weak_bg_fill = hydra_panel_raised_fill();
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, hydra_accent());
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, hydra_accent());
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
     visuals.widgets.open.bg_fill = hydra_panel_raised_fill();
     visuals.widgets.open.weak_bg_fill = hydra_panel_raised_fill();
-    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, hydra_accent());
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, hydra_accent());
     visuals.widgets.open.corner_radius = egui::CornerRadius::same(6);
     ctx.set_visuals(visuals);
 

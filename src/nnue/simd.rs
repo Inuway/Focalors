@@ -6,22 +6,19 @@
 
 use super::network::{L1_INPUT, L1_SIZE, L2_SIZE, QA, QB, Network};
 
-/// Cached result of CPU feature detection.
+/// Cached result of CPU feature detection. x86_64-only, like every caller
+/// (the AVX2 dispatch branches and their tests): on other architectures
+/// (e.g. Apple Silicon) these would be dead code, and the scalar paths are
+/// used unconditionally.
+#[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
+#[cfg(target_arch = "x86_64")]
 static AVX2_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn has_avx2() -> bool {
-    *AVX2_AVAILABLE.get_or_init(|| {
-        #[cfg(target_arch = "x86_64")]
-        {
-            std::is_x86_feature_detected!("avx2")
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    })
+    *AVX2_AVAILABLE.get_or_init(|| std::is_x86_feature_detected!("avx2"))
 }
 
 /// Scalar implementation of the L1 layer:
