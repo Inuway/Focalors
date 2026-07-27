@@ -16,12 +16,18 @@ Windows
   only because the app is made by an independent developer rather than a
   big company. It is not a sign that anything is wrong.
 
-macOS (Apple Silicon, M1 to M4)
-  macOS blocks unsigned apps by default. Open the Terminal app in this
-  folder and run these three lines:
-    xattr -d com.apple.quarantine focalors
-    chmod +x focalors
-    ./focalors
+macOS (Intel and Apple Silicon)
+  Drag "Focalors" into your Applications folder, then open it. The
+  first time, macOS warns that it cannot verify the app. Like the
+  Windows note above, this is only because Focalors comes from an
+  independent developer rather than the App Store, and it only happens
+  once:
+    macOS 13 or 14: right-click "Focalors", choose "Open", then click
+    "Open" in the dialog.
+    macOS 15 or newer: double-click "Focalors", close the warning,
+    then open System Settings > Privacy & Security, scroll down, and
+    click "Open Anyway".
+  No Terminal needed.
 
 Linux
   Make it executable, then run it:

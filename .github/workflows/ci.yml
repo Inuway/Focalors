@@ -7,6 +7,11 @@ on:
       - main
     tags:
       - "v*"
+  # Dry-run the release packaging without tagging: builds and uploads the
+  # workflow artifacts (downloadable from the run page) but does not touch
+  # any GitHub release. Used to test the macOS .app bundling on a real
+  # runner, since there is no local Mac to test on.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -38,7 +43,7 @@ jobs:
 
   release:
     name: Release (${{ matrix.os }})
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ${{ matrix.os }}
     strategy:
@@ -50,9 +55,9 @@ jobs:
             binary_path: target/release/focalors
             archive_name: focalors-linux-x86_64.tar.gz
           - os: macos-latest
-            artifact_name: focalors-macos-aarch64
+            artifact_name: focalors-macos-universal
             binary_path: target/release/focalors
-            archive_name: focalors-macos-aarch64.tar.gz
+            archive_name: focalors-macos-universal.zip
           - os: windows-latest
             artifact_name: focalors-windows-x86_64
             binary_path: target/release/focalors.exe
@@ -72,23 +77,90 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo rustc --release --locked --bin focalors -- -C target-cpu=x86-64-v3
 
-      - name: Build portable release binary (macOS)
+      - name: Build release binaries (macOS, Intel + Apple Silicon)
         if: runner.os == 'macOS'
-        run: cargo rustc --release --locked --bin focalors
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo rustc --release --locked --bin focalors --target aarch64-apple-darwin
+          # Intel slice deliberately has NO -C target-cpu baseline (unlike the
+          # v3 Linux/Windows builds): pre-2013 Intel Macs then still run, and
+          # the NNUE SIMD path picks AVX2 at runtime anyway on newer chips.
+          cargo rustc --release --locked --bin focalors --target x86_64-apple-darwin
 
       - name: Build portable release binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: cargo rustc --release --locked --bin focalors -- -C target-cpu=x86-64-v3
 
-      - name: Assemble release bundle (Unix)
-        if: runner.os != 'Windows'
+      - name: Assemble release bundle (Linux)
+        if: runner.os == 'Linux'
         run: |
           mkdir -p dist/${{ matrix.artifact_name }}
           cp ${{ matrix.binary_path }} dist/${{ matrix.artifact_name }}/
           cp packaging/README.txt dist/${{ matrix.artifact_name }}/
           cp LICENSE dist/${{ matrix.artifact_name }}/
           tar -czf ${{ matrix.archive_name }} -C dist ${{ matrix.artifact_name }}
+
+      - name: Assemble Focalors.app bundle (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then VERSION="0.0.0"; fi
+          STAGE="dist/${{ matrix.artifact_name }}"
+          APP="$STAGE/Focalors.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          # One universal binary: runs natively on Intel and Apple Silicon.
+          lipo -create -output "$APP/Contents/MacOS/focalors" \
+            target/aarch64-apple-darwin/release/focalors \
+            target/x86_64-apple-darwin/release/focalors
+          lipo -info "$APP/Contents/MacOS/focalors"
+
+          # Icon set rendered from the committed 1024px master with sips
+          # (preinstalled), assembled into icns with iconutil.
+          ICONSET="dist/Focalors.iconset"
+          mkdir -p "$ICONSET"
+          for s in 16 32 128 256 512; do
+            sips -z "$s" "$s" assets/icon/focalors-1024.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+            d=$((s * 2))
+            sips -z "$d" "$d" assets/icon/focalors-1024.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Focalors.icns"
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Focalors</string>
+            <key>CFBundleDisplayName</key><string>Focalors</string>
+            <key>CFBundleIdentifier</key><string>com.focalors-chess.focalors</string>
+            <key>CFBundleExecutable</key><string>focalors</string>
+            <key>CFBundleIconFile</key><string>Focalors</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.board-games</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSHumanReadableCopyright</key><string>GPL-3.0 - https://focalors-chess.com</string>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$APP/Contents/Info.plist"
+
+          # Ad-hoc signature: needs no Apple account. Required for a clean
+          # launch on Apple Silicon and gives Gatekeeper its standard
+          # one-time "Open Anyway" path instead of a hard refusal.
+          codesign --force -s - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+          # Smoke test: the packaged binary must actually run (UCI on stdio).
+          printf 'uci\nquit\n' | "$APP/Contents/MacOS/focalors" uci | head -3
+
+          cp packaging/README.txt LICENSE "$STAGE/"
+          # ditto, not zip: preserves bundle metadata and the code signature.
+          ditto -c -k --sequesterRsrc "$STAGE" "${{ matrix.archive_name }}"
 
       - name: Assemble release bundle (Windows)
         if: runner.os == 'Windows'
@@ -107,6 +179,7 @@ jobs:
           path: ${{ matrix.archive_name }}
 
       - name: Attach archive to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.archive_name }}
