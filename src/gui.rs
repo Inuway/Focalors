@@ -481,6 +481,49 @@ struct ReplayState {
     cursor: usize,
 }
 
+/// How long a piece glides between squares. Short enough to never lag
+/// behind fast play, long enough that moves read as motion, not teleports.
+const MOVE_ANIM_DURATION: Duration = Duration::from_millis(160);
+
+/// A piece glide queued at move-apply time, before `make_move`, by whichever
+/// thread applied the move (GUI thread for human moves, worker for engine
+/// replies). Captured pre-move so the renderer never has to reconstruct
+/// which piece moved. `rook` is the companion (from, to) glide for castling.
+#[derive(Clone, Copy)]
+struct PendingAnimation {
+    from_sq: u8,
+    to_sq: u8,
+    piece: (Color, Piece),
+    rook: Option<(u8, u8)>,
+}
+
+/// A glide in flight on the live board: `pending.piece` slides from-square
+/// to to-square over `MOVE_ANIM_DURATION`, hiding the real piece on the
+/// destination square until it lands. Purely visual — the board state has
+/// already moved on, so dropping one mid-flight just snaps the piece home.
+struct MoveAnimation {
+    pending: PendingAnimation,
+    start: Instant,
+}
+
+/// Build the glide payload for `mv` from the board it is about to be played
+/// on. `None` for null moves or an unexpectedly empty origin square.
+fn pending_animation(board: &Board, mv: Move) -> Option<PendingAnimation> {
+    if mv.is_null() {
+        return None;
+    }
+    let piece = board.piece_on(mv.from_sq())?;
+    let (from_sq, to_sq) = (mv.from_sq().0, mv.to_sq().0);
+    // Castling is encoded as the king's move (e1g1 / e1c1); derive the
+    // rook's path from the king's destination file.
+    let rook = match mv.flag() {
+        MoveFlag::Castling if to_sq % 8 == 6 => Some((to_sq + 1, to_sq - 1)),
+        MoveFlag::Castling => Some((to_sq - 2, to_sq + 1)),
+        _ => None,
+    };
+    Some(PendingAnimation { from_sq, to_sq, piece, rook })
+}
+
 /// Read-only view of a board position, used by `draw_board` when rendering
 /// something other than the live game (e.g. replay).
 struct BoardView<'a> {
@@ -549,6 +592,8 @@ struct SharedState {
     game_saved: bool,
     /// Persistent searcher for TT reuse across moves
     persistent_searcher: Arc<Mutex<Searcher>>,
+    /// Piece glides queued by move application, drained by `draw_board`.
+    pending_animations: Vec<PendingAnimation>,
     status_message: String,
 }
 
@@ -569,6 +614,7 @@ impl Default for SharedState {
                 s.use_nnue = crate::nnue::network::get_network().is_some();
                 Arc::new(Mutex::new(s))
             },
+            pending_animations: Vec::new(),
             status_message: "Idle. Choose local play to begin.".to_string(),
         }
     }
@@ -603,6 +649,8 @@ pub struct FocalorsApp {
     history_thumbnails: std::collections::HashMap<i64, Option<Board>>,
     selected_square: Option<u8>,
     drag_state: Option<DragState>,
+    /// Piece glides currently in flight on the live board.
+    move_animations: Vec<MoveAnimation>,
     /// User-drawn annotations (right-click highlights + arrows for tactical
     /// thinking). Cleared on left-click, on move played, and on board change.
     annotations: Vec<Annotation>,
@@ -811,6 +859,7 @@ impl FocalorsApp {
             history_thumbnails: std::collections::HashMap::new(),
             selected_square: None,
             drag_state: None,
+            move_animations: Vec::new(),
             annotations: Vec::new(),
             right_drag_origin: None,
             last_annotation_board_hash: None,
@@ -933,6 +982,7 @@ impl FocalorsApp {
                 self.local_difficulty,
                 level,
             );
+            state.pending_animations.clear();
             state.game_saved = false;
             // Configure searcher for this difficulty level
             {
@@ -955,6 +1005,7 @@ impl FocalorsApp {
 
         self.selected_square = None;
         self.drag_state = None;
+        self.move_animations.clear();
         self.pending_promotion = None;
         self.flipped = human_color == Color::Black;
 
@@ -1040,6 +1091,7 @@ impl FocalorsApp {
             state.local_history.clear();
             state.local_history_cursor = 0;
             state.local_game = local_game.clone();
+            state.pending_animations.clear();
             state.status_message = "Local game ended. Back on the home screen.".to_string();
             local_game
         };
@@ -1047,6 +1099,7 @@ impl FocalorsApp {
         self.pending_promotion = None;
         self.selected_square = None;
         self.drag_state = None;
+        self.move_animations.clear();
         self.flipped = local_game.human_color == Color::Black;
     }
 
@@ -2137,7 +2190,7 @@ impl FocalorsApp {
     }
 
     /// Handle a move made during puzzle solving.
-    fn handle_puzzle_move(&mut self, played_move: Move) {
+    fn handle_puzzle_move(&mut self, played_move: Move, animate: bool) {
         // Extract what we need before mutating
         let (solution_move, puzzle_id, puzzle_board, is_solved, is_shown) = {
             let t = match &self.puzzle_trainer {
@@ -2162,8 +2215,19 @@ impl FocalorsApp {
                 std::time::Instant::now(),
             ));
             let mut board = puzzle_board;
+            let anim = if animate {
+                pending_animation(&board, played_move)
+            } else {
+                None
+            };
             make_move(&mut board, played_move);
-            self.state.lock().unwrap().board = board;
+            {
+                let mut s = self.state.lock().unwrap();
+                s.board = board;
+                if let Some(anim) = anim {
+                    s.pending_animations.push(anim);
+                }
+            }
             if let Some(ref mut t) = self.puzzle_trainer {
                 t.user_solved = true;
                 t.user_attempted = true;
@@ -4091,7 +4155,9 @@ impl FocalorsApp {
         self.show_advanced_engine_settings = open;
     }
 
-    fn apply_human_move(&mut self, mv: Move) -> bool {
+    /// `animate` is false for drag-drops: the piece was already dropped on
+    /// its destination square, so a glide would visually replay the move.
+    fn apply_human_move(&mut self, mv: Move, animate: bool) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.local_game.outcome.is_some() {
             return false;
@@ -4108,6 +4174,9 @@ impl FocalorsApp {
 
         let uci_str = mv.to_uci();
 
+        if animate && let Some(anim) = pending_animation(&state.board, mv) {
+            state.pending_animations.push(anim);
+        }
         make_move(&mut state.board, mv);
         state.local_game.time_control.add_increment(mover);
         record_local_snapshot(&mut state, uci_str.clone());
@@ -4129,7 +4198,7 @@ impl FocalorsApp {
             .into_iter()
             .find(|mv| mv.promotion_piece() == piece)
         {
-            if self.apply_human_move(mv) {
+            if self.apply_human_move(mv, true) {
                 self.start_engine_search();
             }
         }
@@ -4301,8 +4370,37 @@ impl FocalorsApp {
         let interactive = override_pos.map(|v| v.interactive).unwrap_or(true);
         let board = match override_pos {
             Some(v) => v.board.clone(),
-            None => self.state.lock().unwrap().board.clone(),
+            None => {
+                let mut s = self.state.lock().unwrap();
+                for pending in s.pending_animations.drain(..) {
+                    self.move_animations.push(MoveAnimation {
+                        pending,
+                        start: Instant::now(),
+                    });
+                }
+                s.board.clone()
+            }
         };
+        self.move_animations
+            .retain(|anim| anim.start.elapsed() < MOVE_ANIM_DURATION);
+
+        // Snapshot of every glide in flight: (from, to, piece, eased 0..=1
+        // progress), with castling rook glides flattened in. Only the live
+        // board animates; replay/review boards render statically.
+        let mut glides: Vec<(u8, u8, (Color, Piece), f32)> = Vec::new();
+        if override_pos.is_none() {
+            for anim in &self.move_animations {
+                let t = (anim.start.elapsed().as_secs_f32()
+                    / MOVE_ANIM_DURATION.as_secs_f32())
+                    .min(1.0);
+                let eased = 1.0 - (1.0 - t).powi(3);
+                let p = anim.pending;
+                glides.push((p.from_sq, p.to_sq, p.piece, eased));
+                if let Some((rook_from, rook_to)) = p.rook {
+                    glides.push((rook_from, rook_to, (p.piece.0, Piece::Rook), eased));
+                }
+            }
+        }
 
         // Clear annotations when the (main) board changes. Covers move played,
         // engine reply, move-list navigation, new game — anything that shifts
@@ -4427,9 +4525,11 @@ impl FocalorsApp {
                     }
                 }
 
-                // Draw piece
+                // Draw piece (hidden while a glide is still en route to it)
                 if let Some((piece_color, piece)) = board.piece_on(Square(sq_idx)) {
-                    if dragged_from_sq == Some(sq_idx) {
+                    if dragged_from_sq == Some(sq_idx)
+                        || glides.iter().any(|g| g.1 == sq_idx)
+                    {
                         continue;
                     }
 
@@ -4452,6 +4552,25 @@ impl FocalorsApp {
                     );
                 }
             }
+        }
+
+        // Pieces gliding between squares, drawn on top of the static board.
+        for (from_sq, to_sq, piece, t) in &glides {
+            if let Some(texture) = self.piece_textures.get(piece) {
+                let from_c =
+                    board_square_rect(board_rect, sq_size, self.flipped, *from_sq).center();
+                let to_c = board_square_rect(board_rect, sq_size, self.flipped, *to_sq).center();
+                let center = from_c + (to_c - from_c) * *t;
+                let padding = sq_size * 0.05;
+                let side = sq_size - 2.0 * padding;
+                let img_rect = egui::Rect::from_center_size(center, egui::vec2(side, side));
+                draw_piece_image(&painter, texture, img_rect);
+            }
+        }
+        if !glides.is_empty() {
+            // Animate at full frame rate for the glide's ~160ms, instead of
+            // the lazy 100-200ms idle repaint cadence.
+            ui.ctx().request_repaint();
         }
 
         // File labels
@@ -4621,8 +4740,8 @@ impl FocalorsApp {
                 if let Some(sq_idx) = board_square_from_pos(board_rect, sq_size, self.flipped, pos)
                 {
                     if let Some(from_sq) = self.selected_square {
-                        // Try to make a move
-                        let success = self.try_make_move(from_sq, sq_idx);
+                        // Try to make a move (click-moves glide)
+                        let success = self.try_make_move(from_sq, sq_idx, true);
                         self.selected_square = None;
                         if success {
                             // Engine responds
@@ -4666,7 +4785,7 @@ impl FocalorsApp {
                         self.flipped,
                         drag_state.pointer_pos,
                     ) {
-                        let success = self.try_make_move(drag_state.from_sq, target_sq);
+                        let success = self.try_make_move(drag_state.from_sq, target_sq, false);
                         if success {
                             self.start_engine_search();
                         }
@@ -4680,7 +4799,7 @@ impl FocalorsApp {
         }
     }
 
-    fn try_make_move(&mut self, from: u8, to: u8) -> bool {
+    fn try_make_move(&mut self, from: u8, to: u8, animate: bool) -> bool {
         let state = self.state.lock().unwrap();
         let moves = generate_legal_moves(&state.board);
         let in_puzzle = self.puzzle_trainer.is_some();
@@ -4697,10 +4816,10 @@ impl FocalorsApp {
                 }
 
                 if in_puzzle {
-                    self.handle_puzzle_move(mv);
+                    self.handle_puzzle_move(mv, animate);
                     return true;
                 }
-                return self.apply_human_move(mv);
+                return self.apply_human_move(mv, animate);
             }
         }
 
@@ -4921,6 +5040,9 @@ impl FocalorsApp {
                 }
 
                 let uci_str = final_move.to_uci();
+                if let Some(anim) = pending_animation(&s.board, final_move) {
+                    s.pending_animations.push(anim);
+                }
                 make_move(&mut s.board, final_move);
                 if s.local_game.active {
                     record_local_snapshot(&mut s, uci_str.clone());
@@ -5918,6 +6040,26 @@ fn board_square_from_pos(
     Some(display_rank * 8 + display_file)
 }
 
+/// Screen rect of a board square — the inverse of `board_square_from_pos`.
+fn board_square_rect(
+    board_rect: egui::Rect,
+    sq_size: f32,
+    flipped: bool,
+    sq_idx: u8,
+) -> egui::Rect {
+    let rank = sq_idx / 8;
+    let file = sq_idx % 8;
+    let screen_file = if flipped { 7 - file } else { file };
+    let screen_rank = if flipped { rank } else { 7 - rank };
+    egui::Rect::from_min_size(
+        egui::pos2(
+            board_rect.min.x + f32::from(screen_file) * sq_size,
+            board_rect.min.y + f32::from(screen_rank) * sq_size,
+        ),
+        egui::vec2(sq_size, sq_size),
+    )
+}
+
 fn draw_piece_image(
     painter: &egui::Painter,
     texture: &egui::TextureHandle,
@@ -6441,6 +6583,39 @@ pub fn run_gui() {
 mod tests {
     use super::uci_arrow_squares;
     use crate::types::Square;
+
+    #[test]
+    fn pending_animation_derives_piece_and_castling_rook() {
+        crate::attacks::init();
+        let board = crate::board::Board::startpos();
+
+        // Normal move: the moving piece, no rook companion.
+        let e2e4 = crate::moves::Move::new(
+            Square::from_algebraic("e2").unwrap(),
+            Square::from_algebraic("e4").unwrap(),
+        );
+        let anim = super::pending_animation(&board, e2e4).unwrap();
+        assert_eq!(anim.piece, (crate::types::Color::White, crate::types::Piece::Pawn));
+        assert_eq!(anim.rook, None);
+
+        // Castling arithmetic (pending_animation doesn't re-check legality;
+        // callers only hand it moves that were actually applied). Kings sit
+        // on e1/e8 in the start position, so all four castles resolve.
+        let castle = |from: &str, to: &str| {
+            crate::moves::Move::new_castling(
+                Square::from_algebraic(from).unwrap(),
+                Square::from_algebraic(to).unwrap(),
+            )
+        };
+        let rook_path = |mv| super::pending_animation(&board, mv).unwrap().rook.unwrap();
+        assert_eq!(rook_path(castle("e1", "g1")), (7, 5)); // h1 -> f1
+        assert_eq!(rook_path(castle("e1", "c1")), (0, 3)); // a1 -> d1
+        assert_eq!(rook_path(castle("e8", "g8")), (63, 61)); // h8 -> f8
+        assert_eq!(rook_path(castle("e8", "c8")), (56, 59)); // a8 -> d8
+
+        // Null move never animates.
+        assert!(super::pending_animation(&board, crate::moves::Move::NULL).is_none());
+    }
 
     #[test]
     fn uci_arrow_squares_parses_plain_and_promotion() {
