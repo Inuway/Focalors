@@ -4792,6 +4792,18 @@ impl FocalorsApp {
 
             let (board, settings) = {
                 let mut s = state.lock().unwrap();
+                // A superseded worker must not touch state at ALL. The stale
+                // exit paths (and SearchGuard) deliberately skip cleanup on a
+                // generation mismatch, assuming the newer worker still runs;
+                // now that book replies finish in microseconds, a newer worker
+                // can complete entirely before a delayed stale worker's first
+                // lock, and an unguarded write here would wedge
+                // searching=true forever in an active game.
+                if let Some(ref request) = local_request
+                    && s.local_search_generation != request.generation
+                {
+                    return;
+                }
                 s.search_info.searching = true;
                 s.status_message = if force {
                     "Engine thinking...".to_string()
