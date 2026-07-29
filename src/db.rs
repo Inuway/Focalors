@@ -634,6 +634,7 @@ impl Database {
              FROM move_analysis ma
              JOIN games g ON ma.game_id = g.id
              WHERE g.user_accuracy IS NOT NULL
+               AND ma.side = g.user_color
                AND ma.game_id IN (
                    SELECT id FROM games WHERE user_accuracy IS NOT NULL
                    ORDER BY played_at DESC LIMIT ?1
@@ -653,12 +654,14 @@ impl Database {
     pub fn get_phase_weakness(&self, n: u32) -> SqlResult<(i32, i32, i32)> {
         let mut stmt = self.conn.prepare(
             "SELECT
-                SUM(CASE WHEN move_number <= 15 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN move_number BETWEEN 16 AND 35 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN move_number > 35 THEN 1 ELSE 0 END)
-             FROM move_analysis
-             WHERE classification IN ('blunder', 'mistake')
-               AND game_id IN (
+                SUM(CASE WHEN ma.move_number <= 15 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN ma.move_number BETWEEN 16 AND 35 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN ma.move_number > 35 THEN 1 ELSE 0 END)
+             FROM move_analysis ma
+             JOIN games g ON ma.game_id = g.id
+             WHERE ma.classification IN ('blunder', 'mistake')
+               AND ma.side = g.user_color
+               AND ma.game_id IN (
                    SELECT id FROM games WHERE user_accuracy IS NOT NULL
                    ORDER BY played_at DESC LIMIT ?1
                )",
@@ -1039,5 +1042,73 @@ mod tests {
         let board = Board::from_fen("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1").unwrap();
         assert_eq!(uci_to_san(&board, "e1g1"), "O-O");
         assert_eq!(uci_to_san(&board, "e1c1"), "O-O-O");
+    }
+}
+
+#[cfg(test)]
+mod coaching_stats_tests {
+    use super::*;
+    use crate::analysis::{MoveAnalysis, MoveClass};
+    use crate::types::Color;
+
+    fn ma(move_number: usize, side: Color, class: MoveClass) -> MoveAnalysis {
+        MoveAnalysis {
+            move_number,
+            side,
+            move_san: "x".to_string(),
+            eval_before: 0,
+            eval_after: 0,
+            best_move_uci: "e2e4".to_string(),
+            best_eval: 0,
+            cpl: 0,
+            classification: class,
+            explanation: None,
+        }
+    }
+
+    /// The coaching aggregates must count ONLY the user's own moves.
+    /// Regression test for the missing side filter that silently mixed the
+    /// engine's moves into the user's Move Breakdown, phase weakness, and
+    /// the tips derived from them.
+    #[test]
+    fn coaching_stats_count_only_the_users_moves() {
+        let db = Database {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.init_schema().unwrap();
+        let game_id = db
+            .save_game("white", "win", None, None, None, "", Some(2))
+            .unwrap();
+        db.update_game_accuracy(game_id, 90.0).unwrap();
+
+        let moves = vec![
+            ma(1, Color::White, MoveClass::Blunder), // user's: counted
+            ma(1, Color::Black, MoveClass::Blunder), // engine's: excluded
+            ma(2, Color::White, MoveClass::Best),
+            ma(2, Color::Black, MoveClass::Best),
+        ];
+        let ucis: Vec<String> = ["e2e4", "e7e5", "d2d4", "d7d5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        db.save_move_analysis(game_id, &ucis, &moves).unwrap();
+
+        let stats = db.get_classification_stats(10).unwrap();
+        let count = |key: &str| {
+            stats
+                .iter()
+                .find(|(c, _)| c == key)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
+        };
+        assert_eq!(count("blunder"), 1, "only the user's blunder counts");
+        assert_eq!(count("best"), 1, "only the user's best move counts");
+
+        let (opening, middle, end) = db.get_phase_weakness(10).unwrap();
+        assert_eq!(
+            (opening, middle, end),
+            (1, 0, 0),
+            "phase weakness must exclude the engine's blunder"
+        );
     }
 }
