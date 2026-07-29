@@ -352,13 +352,17 @@ impl Database {
         Ok(())
     }
 
-    /// Get recent game results (for auto-adjust). Returns list of result strings
-    /// ("win"/"loss"/"draw"), newest first.
-    pub fn get_recent_results(&self, n: u32) -> SqlResult<Vec<String>> {
+    /// Get recent game results (for auto-adjust), restricted to games played
+    /// at the given difficulty label (e.g. "Adaptive"). Returns result
+    /// strings ("win"/"loss"/"draw"), newest first. The restriction matters:
+    /// the auto-adjust window must reflect games against the adaptive
+    /// engine, not whatever the user played at other difficulties between.
+    pub fn get_recent_results(&self, n: u32, engine_level: &str) -> SqlResult<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT result FROM games ORDER BY played_at DESC LIMIT ?1",
+            "SELECT result FROM games WHERE engine_level = ?2
+             ORDER BY played_at DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![n], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![n, engine_level], |row| row.get::<_, String>(0))?;
         rows.collect()
     }
 
@@ -1110,5 +1114,29 @@ mod coaching_stats_tests {
             (1, 0, 0),
             "phase weakness must exclude the engine's blunder"
         );
+    }
+
+    /// The auto-adjust window must only see games played at the requested
+    /// difficulty. Regression test for the missing engine_level filter that
+    /// let games at other difficulties pollute the adaptive window.
+    #[test]
+    fn recent_results_filter_by_difficulty() {
+        let db = Database {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.init_schema().unwrap();
+        for (result, level) in [
+            ("win", "Adaptive"),
+            ("loss", "Master"),
+            ("win", "Adaptive"),
+            ("loss", "Beginner"),
+        ] {
+            db.save_game("white", result, None, None, Some(level), "", Some(2))
+                .unwrap();
+        }
+        let adaptive = db.get_recent_results(10, "Adaptive").unwrap();
+        assert_eq!(adaptive, vec!["win", "win"], "only Adaptive games count");
+        let master = db.get_recent_results(10, "Master").unwrap();
+        assert_eq!(master, vec!["loss"]);
     }
 }

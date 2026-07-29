@@ -1752,7 +1752,6 @@ impl FocalorsApp {
                             .map_or(0, |(_, n)| *n)
                     };
                     let rows = [
-                        ("Book", lookup("book"), class_book()),
                         ("Best", lookup("best"), class_best()),
                         ("Good", lookup("good"), class_good()),
                         ("Inaccuracy", lookup("inaccuracy"), class_inaccuracy()),
@@ -2497,7 +2496,9 @@ impl FocalorsApp {
 
             // Auto-adjust: if playing on Adaptive, check if level should change
             if was_adaptive {
-                if let Ok(recent) = db.get_recent_results(10) {
+                if let Ok(recent) =
+                    db.get_recent_results(10, LocalDifficulty::Adaptive.label())
+                {
                     if let Some(new_level) = crate::strength::evaluate_auto_adjust(self.adaptive_level, &recent) {
                         let old = self.adaptive_level;
                         self.adaptive_level = new_level;
