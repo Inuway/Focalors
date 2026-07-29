@@ -1,0 +1,112 @@
+# Focalors opening book.
+#
+# One position per line:  <history in UCI from startpos>|<reply>:<weight> ...
+# The history is replayed to find the position; lookups are keyed by
+# Zobrist hash, so transpositions into a listed position also hit.
+# Weights are relative (need not sum to 100). '#' starts a comment.
+# Every move is legality-checked at load; the book unit tests fail on any
+# typo, illegal move, or two rows reaching the same position.
+#
+# Curation policy: sound mainline theory only, a few moves deep, with
+# weighted variety on the big branch points. The coach should play openings
+# it could defend in a lesson.
+
+# ── White's first move ─────────────────────────────────────────────────
+|e2e4:40 d2d4:35 g1f3:15 c2c4:10
+
+# ── 1.e4 ───────────────────────────────────────────────────────────────
+e2e4|e7e5:35 c7c5:30 e7e6:20 c7c6:15
+
+# Open games: 1.e4 e5
+e2e4 e7e5|g1f3:100
+e2e4 e7e5 g1f3|b8c6:80 g8f6:20
+e2e4 e7e5 g1f3 b8c6|f1b5:50 f1c4:35 d2d4:15
+# Ruy Lopez
+e2e4 e7e5 g1f3 b8c6 f1b5|a7a6:70 g8f6:30
+e2e4 e7e5 g1f3 b8c6 f1b5 a7a6|b5a4:85 b5c6:15
+e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4|g8f6:100
+e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6|e1g1:100
+# Italian Game
+e2e4 e7e5 g1f3 b8c6 f1c4|f8c5:60 g8f6:40
+e2e4 e7e5 g1f3 b8c6 f1c4 f8c5|c2c3:60 d2d3:40
+e2e4 e7e5 g1f3 b8c6 f1c4 g8f6|d2d3:70 f3g5:30
+# Scotch
+e2e4 e7e5 g1f3 b8c6 d2d4|e5d4:100
+e2e4 e7e5 g1f3 b8c6 d2d4 e5d4|f3d4:100
+# Petrov
+e2e4 e7e5 g1f3 g8f6|f3e5:70 d2d4:30
+e2e4 e7e5 g1f3 g8f6 f3e5|d7d6:100
+e2e4 e7e5 g1f3 g8f6 f3e5 d7d6|e5f3:100
+
+# Sicilian: 1.e4 c5
+e2e4 c7c5|g1f3:80 b1c3:20
+e2e4 c7c5 g1f3|d7d6:40 b8c6:30 e7e6:30
+e2e4 c7c5 g1f3 d7d6|d2d4:100
+e2e4 c7c5 g1f3 d7d6 d2d4|c5d4:100
+e2e4 c7c5 g1f3 d7d6 d2d4 c5d4|f3d4:100
+e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4|g8f6:100
+e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6|b1c3:100
+e2e4 c7c5 g1f3 b8c6|d2d4:100
+e2e4 c7c5 g1f3 b8c6 d2d4|c5d4:100
+e2e4 c7c5 g1f3 b8c6 d2d4 c5d4|f3d4:100
+e2e4 c7c5 g1f3 e7e6|d2d4:100
+e2e4 c7c5 g1f3 e7e6 d2d4|c5d4:100
+e2e4 c7c5 g1f3 e7e6 d2d4 c5d4|f3d4:100
+e2e4 c7c5 b1c3|b8c6:60 e7e6:40
+
+# French: 1.e4 e6
+e2e4 e7e6|d2d4:100
+e2e4 e7e6 d2d4|d7d5:100
+e2e4 e7e6 d2d4 d7d5|b1c3:50 b1d2:30 e4e5:20
+e2e4 e7e6 d2d4 d7d5 b1c3|g8f6:60 f8b4:40
+e2e4 e7e6 d2d4 d7d5 b1d2|c7c5:55 g8f6:45
+e2e4 e7e6 d2d4 d7d5 e4e5|c7c5:100
+
+# Caro-Kann: 1.e4 c6
+e2e4 c7c6|d2d4:100
+e2e4 c7c6 d2d4|d7d5:100
+e2e4 c7c6 d2d4 d7d5|b1c3:40 e4e5:35 e4d5:25
+e2e4 c7c6 d2d4 d7d5 b1c3|d5e4:100
+e2e4 c7c6 d2d4 d7d5 b1c3 d5e4|c3e4:100
+e2e4 c7c6 d2d4 d7d5 e4e5|c8f5:100
+e2e4 c7c6 d2d4 d7d5 e4d5|c6d5:100
+
+# ── 1.d4 ───────────────────────────────────────────────────────────────
+d2d4|d7d5:45 g8f6:45 e7e6:10
+d2d4 d7d5|c2c4:70 g1f3:30
+# Queen's Gambit
+d2d4 d7d5 c2c4|e7e6:50 c7c6:35 d5c4:15
+d2d4 d7d5 c2c4 e7e6|b1c3:60 g1f3:40
+d2d4 d7d5 c2c4 e7e6 b1c3|g8f6:100
+d2d4 d7d5 c2c4 e7e6 b1c3 g8f6|c1g5:55 g1f3:45
+d2d4 d7d5 c2c4 c7c6|g1f3:60 b1c3:40
+d2d4 d7d5 c2c4 c7c6 g1f3|g8f6:100
+d2d4 d7d5 c2c4 d5c4|g1f3:70 e2e4:30
+d2d4 d7d5 c2c4 d5c4 g1f3|g8f6:100
+d2d4 d7d5 g1f3|g8f6:100
+# Indian defences
+d2d4 g8f6|c2c4:70 g1f3:30
+d2d4 g8f6 c2c4|e7e6:45 g7g6:40 c7c5:15
+d2d4 g8f6 c2c4 e7e6|g1f3:55 b1c3:45
+d2d4 g8f6 c2c4 e7e6 b1c3|f8b4:70 d7d5:30
+d2d4 g8f6 c2c4 e7e6 g1f3|b7b6:40 d7d5:35 f8b4:25
+d2d4 g8f6 c2c4 g7g6|b1c3:70 g1f3:30
+d2d4 g8f6 c2c4 g7g6 b1c3|f8g7:100
+d2d4 g8f6 c2c4 g7g6 b1c3 f8g7|e2e4:70 g1f3:30
+d2d4 g8f6 c2c4 g7g6 b1c3 f8g7 e2e4|d7d6:100
+d2d4 g8f6 g1f3|g7g6:40 e7e6:35 d7d5:25
+d2d4 e7e6|c2c4:60 e2e4:40
+
+# ── 1.Nf3 ──────────────────────────────────────────────────────────────
+g1f3|d7d5:40 g8f6:40 c7c5:20
+g1f3 d7d5|d2d4:50 g2g3:30 c2c4:20
+g1f3 g8f6|c2c4:40 g2g3:30 d2d4:30
+g1f3 c7c5|c2c4:50 g2g3:30 e2e4:20
+
+# ── 1.c4 ───────────────────────────────────────────────────────────────
+c2c4|e7e5:35 g8f6:30 c7c5:20 e7e6:15
+c2c4 e7e5|b1c3:70 g2g3:30
+c2c4 e7e5 b1c3|g8f6:60 b8c6:40
+c2c4 g8f6|b1c3:50 g1f3:50
+c2c4 c7c5|g1f3:50 b1c3:30 g2g3:20
+c2c4 e7e6|d2d4:50 b1c3:30 g1f3:20

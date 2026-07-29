@@ -8,6 +8,7 @@
 mod analysis;
 mod attacks;
 mod board;
+mod book;
 mod db;
 mod eval;
 mod gui;

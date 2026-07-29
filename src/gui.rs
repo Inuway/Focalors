@@ -4801,65 +4801,81 @@ impl FocalorsApp {
                 (s.board.clone(), s.engine_settings.clone())
             };
 
-            // Build position history for repetition detection
-            let position_hashes: Vec<u64> = {
-                let s = state.lock().unwrap();
-                s.local_history.iter().map(|snap| snap.board.hash).collect()
+            // Opening book: local games answer known opening positions with
+            // an instant, weighted-random book reply instead of a full
+            // search. Off book (or on any anomaly) this is None and the
+            // normal search below runs, so the book can only ever skip
+            // work, never change it. UCI mode and selfmatch never get here.
+            let book_move = if local_request.is_some() {
+                crate::book::pick_book_move(&board)
+            } else {
+                None
             };
 
-            // Use persistent searcher for TT reuse across moves
-            let searcher_arc = state.lock().unwrap().persistent_searcher.clone();
-            let mut searcher = searcher_arc.lock().unwrap();
-            searcher.set_position_history(position_hashes.clone());
+            let (final_move, search_result) = if let Some(book_mv) = book_move {
+                (book_mv, None)
+            } else {
+                // Build position history for repetition detection
+                let position_hashes: Vec<u64> = {
+                    let s = state.lock().unwrap();
+                    s.local_history.iter().map(|snap| snap.board.hash).collect()
+                };
 
-            let result = if let Some(ref request) = local_request {
-                if request.depth_cap.is_none() {
-                    // Master / time-bound Custom: Lazy SMP across all cores.
-                    // The TT is shared with the persistent searcher so cross-
-                    // move TT reuse still works.
-                    let tt = searcher.tt.clone();
-                    let use_nnue = searcher.use_nnue;
-                    let n_threads = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1);
-                    crate::search::search_lazy_smp(
-                        tt,
+                // Use persistent searcher for TT reuse across moves
+                let searcher_arc = state.lock().unwrap().persistent_searcher.clone();
+                let mut searcher = searcher_arc.lock().unwrap();
+                searcher.set_position_history(position_hashes.clone());
+
+                let result = if let Some(ref request) = local_request {
+                    if request.depth_cap.is_none() {
+                        // Master / time-bound Custom: Lazy SMP across all cores.
+                        // The TT is shared with the persistent searcher so cross-
+                        // move TT reuse still works.
+                        let tt = searcher.tt.clone();
+                        let use_nnue = searcher.use_nnue;
+                        let n_threads = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1);
+                        crate::search::search_lazy_smp(
+                            tt,
+                            &board,
+                            use_nnue,
+                            n_threads,
+                            request.soft_time_ms,
+                            request.hard_time_ms,
+                            request.depth_cap,
+                            position_hashes,
+                        )
+                    } else {
+                        // Beginner / Club / Tournament / depth-bound Custom:
+                        // single-thread is more efficient for shallow depth caps.
+                        searcher.search_with_time_management_capped(
+                            &board,
+                            request.soft_time_ms,
+                            request.hard_time_ms,
+                            request.depth_cap,
+                        )
+                    }
+                } else if settings.use_time_limit {
+                    searcher.search_timed(&board, settings.think_time_ms)
+                } else {
+                    searcher.search(&board, settings.max_depth)
+                };
+
+                // Apply weighted move selection for difficulty levels that use it
+                let final_move = if let Some(ref request) = local_request {
+                    crate::strength::select_move(
+                        &mut searcher,
                         &board,
-                        use_nnue,
-                        n_threads,
-                        request.soft_time_ms,
-                        request.hard_time_ms,
-                        request.depth_cap,
-                        position_hashes,
+                        result.best_move,
+                        result.score,
+                        result.depth,
+                        &request.strength_config,
                     )
                 } else {
-                    // Beginner / Club / Tournament / depth-bound Custom:
-                    // single-thread is more efficient for shallow depth caps.
-                    searcher.search_with_time_management_capped(
-                        &board,
-                        request.soft_time_ms,
-                        request.hard_time_ms,
-                        request.depth_cap,
-                    )
-                }
-            } else if settings.use_time_limit {
-                searcher.search_timed(&board, settings.think_time_ms)
-            } else {
-                searcher.search(&board, settings.max_depth)
-            };
-
-            // Apply weighted move selection for difficulty levels that use it
-            let final_move = if let Some(ref request) = local_request {
-                crate::strength::select_move(
-                    &mut searcher,
-                    &board,
-                    result.best_move,
-                    result.score,
-                    result.depth,
-                    &request.strength_config,
-                )
-            } else {
-                result.best_move
+                    result.best_move
+                };
+                (final_move, Some(result))
             };
 
             let mut s = state.lock().unwrap();
@@ -4868,10 +4884,14 @@ impl FocalorsApp {
                     return;
                 }
             }
-            s.search_info.depth = result.depth;
-            s.search_info.score = result.score;
-            s.search_info.nodes = result.nodes;
-            s.search_info.best_move = final_move.to_uci();
+            // Book moves leave the previous search_info (and thus the eval
+            // bar) untouched; there is no new search data to show.
+            if let Some(ref result) = search_result {
+                s.search_info.depth = result.depth;
+                s.search_info.score = result.score;
+                s.search_info.nodes = result.nodes;
+                s.search_info.best_move = final_move.to_uci();
+            }
             s.search_info.searching = false;
 
             if s.local_game.active && s.local_game.outcome.is_some() {
@@ -4898,10 +4918,14 @@ impl FocalorsApp {
                     }
                 } else {
                     s.move_history.push(uci_str.clone());
-                    s.status_message = format!(
-                        "Engine played: {} (depth {}, {} cp, {} nodes)",
-                        uci_str, result.depth, result.score, result.nodes
-                    );
+                    s.status_message = if let Some(ref result) = search_result {
+                        format!(
+                            "Engine played: {} (depth {}, {} cp, {} nodes)",
+                            uci_str, result.depth, result.score, result.nodes
+                        )
+                    } else {
+                        format!("Engine played: {uci_str}")
+                    };
                 }
             }
         });
