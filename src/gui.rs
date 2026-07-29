@@ -4815,14 +4815,14 @@ impl FocalorsApp {
 
             // Opening book: local games answer known opening positions with
             // an instant, weighted-random book reply instead of a full
-            // search. Off book (or on any anomaly) this is None and the
-            // normal search below runs, so the book can only ever skip
-            // work, never change it. UCI mode and selfmatch never get here.
-            let book_move = if local_request.is_some() {
-                crate::book::pick_book_move(&board)
-            } else {
-                None
-            };
+            // search. Book depth scales with difficulty (a beginner "knows"
+            // one move of theory, Master the whole book). Off book, past the
+            // level's budget, or on any anomaly this is None and the normal
+            // search below runs, so the book can only ever skip work, never
+            // change it. UCI mode and selfmatch never get here.
+            let book_move = local_request
+                .as_ref()
+                .and_then(|req| crate::book::pick_book_move(&board, req.strength_config.level));
 
             let (final_move, search_result) = if let Some(book_mv) = book_move {
                 (book_mv, None)

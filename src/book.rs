@@ -104,10 +104,30 @@ fn build_book(data: &str) -> (Book, Vec<String>) {
     (Book { positions }, errors)
 }
 
-/// Weighted-random book reply for this position, or `None` when off book.
-/// The returned move is re-validated against the live board's legal moves
-/// (via `parse_move`), so a stale or corrupt entry degrades to `None`.
-pub fn pick_book_move(board: &Board) -> Option<Move> {
+/// How many plies of book "memory" each difficulty level gets, like a human:
+/// a beginner knows a first move, a club player a couple of moves of theory,
+/// a master the whole (small) book. Counted in total game plies, both sides,
+/// so the engine leaves book at the same point of the game regardless of
+/// color. Beyond the budget the engine is on its own, exactly as pre-book.
+fn max_book_plies(level: u32) -> u32 {
+    match level {
+        0..=4 => 2,    // Beginner band: knows a first move
+        5..=9 => 4,    // Club band: two moves of theory
+        10..=15 => 8,  // Tournament band: four moves
+        _ => u32::MAX, // Master band and Custom: the full book
+    }
+}
+
+/// Weighted-random book reply for this position, or `None` when off book or
+/// past the level's book-ply budget. The returned move is re-validated
+/// against the live board's legal moves (via `parse_move`), so a stale or
+/// corrupt entry degrades to `None`.
+pub fn pick_book_move(board: &Board, level: u32) -> Option<Move> {
+    let ply = (u32::from(board.fullmove_number).saturating_sub(1)) * 2
+        + u32::from(board.side_to_move == crate::types::Color::Black);
+    if ply >= max_book_plies(level) {
+        return None;
+    }
     let entries = book().positions.get(&board.hash)?;
     let total: u64 = entries.iter().map(|(_, w)| u64::from(*w)).sum();
     if total == 0 {
@@ -166,7 +186,7 @@ mod tests {
         let board = Board::startpos();
         let legal = generate_legal_moves(&board);
         for _ in 0..50 {
-            let mv = pick_book_move(&board).expect("startpos must be in book");
+            let mv = pick_book_move(&board, 20).expect("startpos must be in book");
             let found = (0..legal.len()).any(|i| legal[i] == mv);
             assert!(found, "book returned illegal move {}", mv.to_uci());
         }
@@ -181,7 +201,7 @@ mod tests {
             let mv = crate::uci::parse_move(&board, uci).unwrap();
             make_move(&mut board, mv);
         }
-        assert!(pick_book_move(&board).is_some(), "Sicilian should be in book");
+        assert!(pick_book_move(&board, 20).is_some(), "Sicilian should be in book");
 
         // Transposition: 1.d4 e6 2.e4 reaches the French (1.e4 e6 2.d4)
         // by a move order the book never lists explicitly.
@@ -191,9 +211,39 @@ mod tests {
             make_move(&mut board, mv);
         }
         assert!(
-            pick_book_move(&board).is_some(),
+            pick_book_move(&board, 20).is_some(),
             "transposed French position should hit the book"
         );
+    }
+
+    #[test]
+    fn book_depth_scales_with_level() {
+        crate::attacks::init();
+
+        // Ply 0 (startpos): every level may use its "known" first move.
+        let board = Board::startpos();
+        assert!(pick_book_move(&board, 1).is_some(), "beginner knows a first move");
+
+        // Ply 2 (after 1.e4 e5): beginner budget (2 plies) is spent,
+        // club (4) and master still have theory.
+        let mut board = Board::startpos();
+        for uci in ["e2e4", "e7e5"] {
+            let mv = crate::uci::parse_move(&board, uci).unwrap();
+            make_move(&mut board, mv);
+        }
+        assert!(pick_book_move(&board, 1).is_none(), "beginner is out of book");
+        assert!(pick_book_move(&board, 5).is_some(), "club still in book");
+        assert!(pick_book_move(&board, 20).is_some(), "master still in book");
+
+        // Ply 4 (after 1.e4 e5 2.Nf3 Nc6): club budget (4) is spent,
+        // tournament (8) and master still have theory.
+        for uci in ["g1f3", "b8c6"] {
+            let mv = crate::uci::parse_move(&board, uci).unwrap();
+            make_move(&mut board, mv);
+        }
+        assert!(pick_book_move(&board, 5).is_none(), "club is out of book");
+        assert!(pick_book_move(&board, 12).is_some(), "tournament still in book");
+        assert!(pick_book_move(&board, 20).is_some(), "master still in book");
     }
 
     #[test]
@@ -204,6 +254,6 @@ mod tests {
             let mv = crate::uci::parse_move(&board, uci).unwrap();
             make_move(&mut board, mv);
         }
-        assert!(pick_book_move(&board).is_none());
+        assert!(pick_book_move(&board, 20).is_none());
     }
 }
