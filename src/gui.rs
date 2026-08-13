@@ -1807,6 +1807,7 @@ impl FocalorsApp {
                     let rows = [
                         ("Best", lookup("best"), class_best()),
                         ("Good", lookup("good"), class_good()),
+                        ("Book", lookup("book"), class_book()),
                         ("Inaccuracy", lookup("inaccuracy"), class_inaccuracy()),
                         ("Mistake", lookup("mistake"), class_mistake()),
                         ("Blunder", lookup("blunder"), class_blunder()),
@@ -2391,38 +2392,39 @@ impl FocalorsApp {
         // the replay panel shows it immediately instead of pretending the
         // game has never been analyzed.
         if let Some(ref db) = self.db {
+            // Saved move rows are the "was analyzed" marker; the accuracy may
+            // legitimately be NULL (a game whose gradable moves were all
+            // book/forced stores no accuracy).
             let saved_accuracy = db.get_game_accuracy(game_id).ok().flatten();
-            if let Some(accuracy) = saved_accuracy {
-                if let Ok(moves) = db.get_move_analysis(game_id) {
-                    if !moves.is_empty() {
-                        let user_color = if game.user_color == "white" {
-                            Color::White
-                        } else {
-                            Color::Black
-                        };
-                        let mut eval_history = Vec::with_capacity(moves.len() + 1);
-                        eval_history.push(moves[0].eval_before);
-                        for m in &moves {
-                            eval_history.push(m.eval_after);
-                        }
-                        let analysis = crate::analysis::GameAnalysis {
-                            moves,
-                            user_color,
-                            user_accuracy: accuracy,
-                            eval_history,
-                        };
-                        // Empty puzzles + uci_moves so persist_completed_analysis
-                        // knows this snapshot is already saved and skips re-saving.
-                        *self.analysis_state.lock().unwrap() =
-                            AnalysisState::Complete {
-                                analysis,
-                                puzzles: Vec::new(),
-                                uci_moves: Vec::new(),
-                                game_id: Some(game_id),
-                            };
-                        self.analysis_target_game_id = Some(game_id);
-                        self.analysis_review_cursor = 0;
+            if let Ok(moves) = db.get_move_analysis(game_id) {
+                if !moves.is_empty() {
+                    let user_color = if game.user_color == "white" {
+                        Color::White
+                    } else {
+                        Color::Black
+                    };
+                    let mut eval_history = Vec::with_capacity(moves.len() + 1);
+                    eval_history.push(moves[0].eval_before);
+                    for m in &moves {
+                        eval_history.push(m.eval_after);
                     }
+                    let analysis = crate::analysis::GameAnalysis {
+                        moves,
+                        user_color,
+                        user_accuracy: saved_accuracy,
+                        eval_history,
+                    };
+                    // Empty puzzles + uci_moves so persist_completed_analysis
+                    // knows this snapshot is already saved and skips re-saving.
+                    *self.analysis_state.lock().unwrap() =
+                        AnalysisState::Complete {
+                            analysis,
+                            puzzles: Vec::new(),
+                            uci_moves: Vec::new(),
+                            game_id: Some(game_id),
+                        };
+                    self.analysis_target_game_id = Some(game_id);
+                    self.analysis_review_cursor = 0;
                 }
             }
         }
@@ -2825,11 +2827,16 @@ impl FocalorsApp {
                         });
                         if let Some(gid) = game_id {
                             let _ = db.save_move_analysis(gid, uci_moves, &ga.moves);
-                            let _ = db.update_game_accuracy(gid, ga.user_accuracy);
+                            // No accuracy (all moves book/forced) stays NULL:
+                            // such games never enter the Progress aggregates,
+                            // which filter on user_accuracy IS NOT NULL.
+                            if let Some(acc) = ga.user_accuracy {
+                                let _ = db.update_game_accuracy(gid, acc);
+                            }
                         }
                     }
                 }
-                Some(ga.user_accuracy)
+                ga.user_accuracy
             } else {
                 None
             }
@@ -3234,12 +3241,21 @@ impl FocalorsApp {
                     want_analyze = true;
                 }
                 if let Some(ref ga) = analysis_for_this_game {
-                    ui.label(
-                        egui::RichText::new(format!("Accuracy: {:.1}%", ga.user_accuracy))
-                            .size(13.0)
-                            .strong()
-                            .color(accuracy_color(ga.user_accuracy)),
-                    );
+                    if let Some(acc) = ga.user_accuracy {
+                        ui.label(
+                            egui::RichText::new(format!("Accuracy: {acc:.1}%"))
+                                .size(13.0)
+                                .strong()
+                                .color(accuracy_color(acc)),
+                        );
+                    } else {
+                        // Nothing gradable: every user move was book/forced.
+                        ui.label(
+                            egui::RichText::new("Accuracy: n/a (all theory)")
+                                .size(13.0)
+                                .color(hydra_subtle_text()),
+                        );
+                    }
                 }
             });
         });
@@ -3360,7 +3376,7 @@ impl FocalorsApp {
                     ui.add_space(6.0);
 
                     // Summary counts
-                    let mut counts = [0u32; 5]; // best, good, inacc, mistake, blunder
+                    let mut counts = [0u32; 6]; // best, good, book, inacc, mistake, blunder
                     for m in &ga.moves {
                         if m.side != ga.user_color {
                             continue;
@@ -3368,16 +3384,17 @@ impl FocalorsApp {
                         match m.classification {
                             crate::analysis::MoveClass::Best => counts[0] += 1,
                             crate::analysis::MoveClass::Good => counts[1] += 1,
-                            crate::analysis::MoveClass::Inaccuracy => counts[2] += 1,
-                            crate::analysis::MoveClass::Mistake => counts[3] += 1,
-                            crate::analysis::MoveClass::Blunder => counts[4] += 1,
+                            crate::analysis::MoveClass::Book => counts[2] += 1,
+                            crate::analysis::MoveClass::Inaccuracy => counts[3] += 1,
+                            crate::analysis::MoveClass::Mistake => counts[4] += 1,
+                            crate::analysis::MoveClass::Blunder => counts[5] += 1,
                             _ => {}
                         }
                     }
                     ui.label(
                         egui::RichText::new(format!(
-                            "Best:{} Good:{} Inaccuracy:{} Mistake:{} Blunder:{}",
-                            counts[0], counts[1], counts[2], counts[3], counts[4],
+                            "Best:{} Good:{} Book:{} Inaccuracy:{} Mistake:{} Blunder:{}",
+                            counts[0], counts[1], counts[2], counts[3], counts[4], counts[5],
                         ))
                         .size(11.0)
                         .color(hydra_subtle_text()),
@@ -4944,6 +4961,21 @@ impl FocalorsApp {
                 .as_ref()
                 .and_then(|req| crate::book::pick_book_move(&board, req.strength_config.level));
 
+            // A book reply is computed in microseconds; pause briefly (never
+            // while holding the state lock) so the coach appears to consider
+            // the position instead of teleporting a piece. The pause runs on
+            // the engine's clock like a real short think, and shrinks with
+            // the time allocation when the engine is low. A stale worker
+            // sleeping here is harmless: the generation checks at entry and
+            // apply already cover it.
+            if book_move.is_some()
+                && let Some(ref request) = local_request
+            {
+                let delay_ms =
+                    crate::book::humanized_delay_ms().min(request.hard_time_ms / 4);
+                thread::sleep(Duration::from_millis(delay_ms));
+            }
+
             let (final_move, search_result) = if let Some(book_mv) = book_move {
                 (book_mv, None)
             } else {
@@ -5515,7 +5547,6 @@ fn hydra_danger() -> egui::Color32 {
 // the chess.com convention so users coming from that tool already recognize
 // the meaning of each color. Allow dead code until per-tab rebuilds wire
 // them in.
-#[allow(dead_code)]
 fn class_book() -> egui::Color32 {
     theme_rgb([170, 130, 90], [140, 100, 60])
 }
@@ -6506,6 +6537,7 @@ fn classification_color(class: crate::analysis::MoveClass) -> egui::Color32 {
     match class {
         MoveClass::Best | MoveClass::Brilliant => egui::Color32::from_rgb(100, 200, 100),
         MoveClass::Good | MoveClass::Forced => egui::Color32::from_rgb(180, 180, 180),
+        MoveClass::Book => egui::Color32::from_rgb(170, 130, 90),
         MoveClass::Inaccuracy => egui::Color32::from_rgb(230, 200, 80),
         MoveClass::Mistake => egui::Color32::from_rgb(220, 150, 50),
         MoveClass::Blunder => egui::Color32::from_rgb(220, 80, 80),

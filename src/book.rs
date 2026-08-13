@@ -144,6 +144,24 @@ pub fn pick_book_move(board: &Board, level: u32) -> Option<Move> {
     None
 }
 
+/// True when `uci` is one of the book's listed replies in the position with
+/// this Zobrist hash. Game analysis uses this to label opening theory as
+/// "Book"; it always consults the full book (theory is theory in review,
+/// whatever difficulty the game was played at), unlike `pick_book_move`,
+/// which budgets book depth by level.
+pub fn is_book_reply(position_hash: u64, uci: &str) -> bool {
+    book()
+        .positions
+        .get(&position_hash)
+        .is_some_and(|entries| entries.iter().any(|(reply, _)| reply == uci))
+}
+
+/// Randomized "thinking" pause (in ms) for an instant book reply, so the
+/// coach appears to glance at the board instead of teleporting a piece.
+pub fn humanized_delay_ms() -> u64 {
+    500 + time_entropy() % 701
+}
+
 /// One random draw per engine move: splitmix64 over the wall clock.
 /// No external RNG dependency, and quality is ample for picking among
 /// a handful of weighted opening moves.
@@ -244,6 +262,23 @@ mod tests {
         assert!(pick_book_move(&board, 5).is_none(), "club is out of book");
         assert!(pick_book_move(&board, 12).is_some(), "tournament still in book");
         assert!(pick_book_move(&board, 20).is_some(), "master still in book");
+    }
+
+    #[test]
+    fn is_book_reply_matches_listed_replies_only() {
+        crate::attacks::init();
+        let board = Board::startpos();
+        assert!(is_book_reply(board.hash, "e2e4"));
+        assert!(!is_book_reply(board.hash, "a2a3")); // legal but not book
+        assert!(!is_book_reply(0xDEAD_BEEF, "e2e4")); // unknown position
+    }
+
+    #[test]
+    fn humanized_delay_stays_in_range() {
+        for _ in 0..100 {
+            let ms = humanized_delay_ms();
+            assert!((500..=1200).contains(&ms), "delay {ms}ms out of range");
+        }
     }
 
     #[test]

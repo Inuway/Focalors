@@ -25,6 +25,7 @@ pub enum MoveClass {
     Blunder,
     Brilliant,
     Forced, // only one legal move
+    Book,   // known opening theory (listed in the curated book)
 }
 
 impl MoveClass {
@@ -41,6 +42,7 @@ impl MoveClass {
             MoveClass::Blunder => "??",
             MoveClass::Brilliant => "!!",
             MoveClass::Forced => "",
+            MoveClass::Book => "",
         }
     }
 
@@ -53,6 +55,7 @@ impl MoveClass {
             MoveClass::Blunder => "Blunder",
             MoveClass::Brilliant => "Brilliant",
             MoveClass::Forced => "Forced",
+            MoveClass::Book => "Book",
         }
     }
 
@@ -65,6 +68,7 @@ impl MoveClass {
             MoveClass::Blunder => "blunder",
             MoveClass::Brilliant => "brilliant",
             MoveClass::Forced => "forced",
+            MoveClass::Book => "book",
         }
     }
 
@@ -77,6 +81,7 @@ impl MoveClass {
             "blunder" => Some(MoveClass::Blunder),
             "brilliant" => Some(MoveClass::Brilliant),
             "forced" => Some(MoveClass::Forced),
+            "book" => Some(MoveClass::Book),
             _ => None,
         }
     }
@@ -263,7 +268,10 @@ pub struct MoveAnalysis {
 pub struct GameAnalysis {
     pub moves: Vec<MoveAnalysis>,
     pub user_color: Color,
-    pub user_accuracy: f64,     // 0-100
+    /// 0-100, or `None` when the user had no gradable moves (every move
+    /// was Book/Forced) — such games carry no accuracy rather than an
+    /// unearned 100, and are never persisted into the Progress aggregates.
+    pub user_accuracy: Option<f64>,
     pub eval_history: Vec<Score>, // eval at each position (from White's perspective)
 }
 
@@ -277,6 +285,8 @@ struct PreparedPosition {
     board_after: Board,
     played_mv: Move,
     is_forced: bool,
+    /// Move is listed opening theory (see `book::is_book_reply`).
+    is_book: bool,
     move_number: usize,
     side: Color,
     san: String,
@@ -321,6 +331,7 @@ pub fn analyze_game(
         };
 
         let is_forced = legal_moves.len() == 1;
+        let is_book = crate::book::is_book_reply(board.hash, uci_move);
         let san = crate::db::uci_to_san(&board, uci_move);
         let mut board_after = board.clone();
         make_move(&mut board_after, played_mv);
@@ -333,6 +344,7 @@ pub fn analyze_game(
             board_after: board_after.clone(),
             played_mv,
             is_forced,
+            is_book,
             move_number,
             side,
             san,
@@ -471,11 +483,19 @@ pub fn analyze_game(
 
         let classification = if prep.is_forced {
             MoveClass::Forced
+        } else if prep.is_book {
+            // Known theory is labeled, not graded. The searched evals still
+            // feed the graph as usual; only the verdict (and the accuracy
+            // treatment below) change.
+            MoveClass::Book
         } else {
             MoveClass::from_cpl(cpl, was_sacrifice)
         };
 
-        let explanation = if matches!(classification, MoveClass::Best | MoveClass::Forced) {
+        let explanation = if matches!(
+            classification,
+            MoveClass::Best | MoveClass::Forced | MoveClass::Book
+        ) {
             None
         } else {
             let bb = eval::eval_components(&prep.board);
@@ -543,10 +563,15 @@ pub fn analyze_game(
         var.sqrt().max(0.5)
     };
 
-    // Per-move (accuracy, weight) for the user's own non-forced moves.
+    // Per-move (accuracy, weight) for the user's own moves, skipping the
+    // ungradable classes: Forced (no choice was made) and Book (known
+    // theory is neither rewarded nor punished, so memorized lines can't
+    // pad accuracy and gambit lines can't dent it).
     let mut acc_weights: Vec<(f64, f64)> = Vec::with_capacity(analysis.len());
     for (i, m) in analysis.iter().enumerate() {
-        if m.side != user_color || matches!(m.classification, MoveClass::Forced) {
+        if m.side != user_color
+            || matches!(m.classification, MoveClass::Forced | MoveClass::Book)
+        {
             continue;
         }
         let wp_before_white = win_percentage(m.eval_before);
@@ -564,7 +589,9 @@ pub fn analyze_game(
         acc_weights.push((acc, weight_at(i + 1)));
     }
 
-    let user_accuracy = blend_accuracy(&acc_weights);
+    // No gradable moves at all (an opening that never left theory, or all
+    // forced) means no accuracy — not a perfect score.
+    let user_accuracy = (!acc_weights.is_empty()).then(|| blend_accuracy(&acc_weights));
 
     GameAnalysis {
         moves: analysis,
@@ -630,6 +657,9 @@ pub fn coach_line(ma: &MoveAnalysis, best_san: &str) -> String {
             "A solid move. {best_san} was the engine's slight preference, but this stays on track."
         ),
         MoveClass::Forced => "The only reasonable move in this position.".to_string(),
+        MoveClass::Book => {
+            "A book move. This is known opening theory, so it is not graded.".to_string()
+        }
         MoveClass::Inaccuracy | MoveClass::Mistake | MoveClass::Blunder => {
             let intro = match ma.classification {
                 MoveClass::Inaccuracy => "A little imprecise.",
@@ -743,7 +773,8 @@ fn class_intro(class: MoveClass, san: &str, cpl: Score) -> String {
         MoveClass::Inaccuracy => format!("{san} is an inaccuracy ({cpl} cp loss)."),
         MoveClass::Mistake => format!("{san} is a mistake (lost {cpl} cp)."),
         MoveClass::Blunder => format!("{san} is a blunder (lost {cpl} cp)."),
-        MoveClass::Best | MoveClass::Forced => String::new(),
+        // Never explained (see the explanation gate in analyze_game).
+        MoveClass::Best | MoveClass::Forced | MoveClass::Book => String::new(),
     }
 }
 
@@ -963,6 +994,7 @@ mod tests {
             MoveClass::Blunder,
             MoveClass::Brilliant,
             MoveClass::Forced,
+            MoveClass::Book,
         ] {
             let m = ma(Color::White, class, 100, 50, 120, 50);
             let line = coach_line(&m, "Nf3");
@@ -1156,5 +1188,44 @@ mod tests {
             last_eval > MATE_SCORE - 1000,
             "final eval-history entry should be mate-magnitude for white, got {last_eval}"
         );
+    }
+
+    #[test]
+    fn book_moves_are_labeled_and_excluded_from_accuracy() {
+        crate::attacks::init();
+        // 1.e4 e5 are listed theory; 2.Ba6?? bxa6 hangs a whole bishop.
+        let moves: Vec<String> = ["e2e4", "e7e5", "f1a6", "b7a6"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let result = analyze_game(&moves, Color::White, 8, false, &mut |_, _| {});
+
+        assert_eq!(result.moves[0].classification, MoveClass::Book, "1.e4 is theory");
+        assert_eq!(result.moves[1].classification, MoveClass::Book, "1...e5 is theory");
+        assert!(
+            matches!(
+                result.moves[2].classification,
+                MoveClass::Mistake | MoveClass::Blunder
+            ),
+            "Ba6 hangs a bishop, got {:?} (cpl={})",
+            result.moves[2].classification,
+            result.moves[2].cpl
+        );
+        // Book moves carry no coach explanation, like Best/Forced.
+        assert!(result.moves[0].explanation.is_none());
+
+        // White's accuracy must come from Ba6 alone. If the two book moves
+        // leaked into the average (as ~100% each), the blend would land far
+        // higher than a lone hung piece can.
+        let acc = result.user_accuracy.expect("Ba6 is gradable");
+        assert!(acc < 50.0, "book moves padded accuracy: {acc}");
+
+        // A game that never leaves theory has nothing gradable: no accuracy
+        // at all, never an unearned 100 that would pollute Progress stats.
+        let theory_only: Vec<String> =
+            ["e2e4", "e7e5"].iter().map(|s| s.to_string()).collect();
+        let r2 = analyze_game(&theory_only, Color::White, 8, false, &mut |_, _| {});
+        assert!(r2.moves.iter().all(|m| m.classification == MoveClass::Book));
+        assert_eq!(r2.user_accuracy, None);
     }
 }
