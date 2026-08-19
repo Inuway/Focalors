@@ -58,10 +58,12 @@ Same gate as any net change — a fixed-depth self-match against the
 current default:
 
 ```bash
-./target/release/focalors selfmatch 200 --depth 8 --challenger-net path/to/new.nnue
+./target/release/focalors selfmatch 1000 --depth 8 --challenger-net path/to/new.nnue
 ```
 
-Ship only on positive elo with high LOS.
+Ship only on positive elo with high LOS. 1000 games is the promotion
+standard: typical per-generation gains (+10-30 elo) sit below the noise
+floor of a short match.
 
 ## License & credits
 

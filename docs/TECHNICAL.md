@@ -57,8 +57,13 @@ The shipped NNUE net is embedded into the binary at build time, so a normal inst
 The training pipeline is three commands. Self-play generates positions:
 
 ```bash
-cargo run --release -- selfplay 100000 nets/gen2v2-data.bin --nnue nets/gen1v2.nnue
+cargo run --release -- selfplay 100000 nets/gen2v2-data.bin --nnue nets/gen1v2.nnue --depth 8
 ```
+
+`--depth 8` is the generation standard, not a tweak: the search depth is
+the label quality of every position in the dataset. The selfplay default
+(6) is fine for quick experiments, but every promoted generation was
+trained on depth-8 data.
 
 Then training turns positions into a network. `--mix` blends two datasets, `--resume` warm-starts from an existing net so you don't relearn from scratch:
 
@@ -123,7 +128,8 @@ The end-to-end loop with validation:
 
 ```bash
 # 1. Generate self-play training data with the current net
-cargo run --release -- selfplay 100000 nets/genN-data.bin --nnue nets/current.nnue
+#    (--depth 8: dataset label quality, see the training workflow above)
+cargo run --release -- selfplay 100000 nets/genN-data.bin --nnue nets/current.nnue --depth 8
 
 # 2. Train, warm-starting from the current net
 cargo run --release -- train nets/genN-data.bin \
@@ -134,7 +140,11 @@ cargo run --release -- train nets/genN-data.bin \
 # 3. Validate: does the candidate beat the current embedded net?
 #    Engine A = embedded default (current);  Engine B = candidate (challenger).
 #    NEGATIVE elo + high LOS for B ⇒ candidate is stronger.
-./target/release/focalors selfmatch 100 --challenger-net nets/genN.nnue
+#    1000 games, not 100: a mature generation gains perhaps +10-30 elo,
+#    and a 100-game match (CI half-width ±30-50) cannot resolve that.
+#    Historically about half of all candidates fail this gate — that is
+#    the loop working, not a broken run.
+./target/release/focalors selfmatch 1000 --challenger-net nets/genN.nnue
 
 # 4. Promote only if the validation match says the candidate is stronger.
 cargo run --release -- promote nets/genN.nnue
