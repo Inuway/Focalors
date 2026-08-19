@@ -3613,6 +3613,12 @@ impl FocalorsApp {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     hydra_badge(ui, &status_label, hydra_panel_alt_fill());
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                            .size(10.0)
+                            .color(hydra_subtle_text()),
+                    );
                 });
             });
         }
