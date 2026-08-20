@@ -34,7 +34,8 @@ required.
 `train-gpu` accepts the same flags as `train`: `--data`, `--mix`,
 `--resume`, `--warmup-lr-factor`, `--warmup-epochs`, `--epochs`,
 `--batch-size`, `--lr`, `--wdl`, `--output`, `--save-rate`
-(`--threads` is accepted-and-ignored; the GPU replaces the thread pool).
+(`--threads` sets the number of host threads used to marshal batches;
+it defaults to all cores).
 
 ## Design
 
@@ -44,10 +45,20 @@ required.
   (`trainer_gpu::tests::burn_forward_matches_cpu_forward`) asserts
   numerical agreement across seeds, guards against activation collapse,
   and includes a swapped-perspective negative control.
-- Memory scales with `--batch-size`: the feature-transformer gather
-  holds roughly `2 × batch × 32 × 256 × 4` bytes live for backward
-  (~1 GB at the default 16384). On GPUs with less than 8 GB, use
-  `--batch-size 8192` or `4096`.
+- The feature transformer is evaluated as a multi-hot matmul: active
+  feature indices are scattered into a `[batch, NUM_FEATURES]` matrix
+  which is multiplied by the FT weights. The obvious alternative — gather
+  the active rows and sum them — materializes `[batch × K, 256]` (536 MB
+  per perspective at the default batch size, retained by autodiff for the
+  backward pass) and makes training bandwidth-bound; the matmul form
+  measured ~15x faster end to end on an RTX 5060 Laptop, with all weight
+  differences at ±1 quantization level.
+- Memory scales with `--batch-size`: ~900 MB peak at the default 16384.
+  On GPUs with less than 4 GB, use `--batch-size 8192` or `4096`.
+- Batches are packed on worker threads and prefetched one ahead of the
+  device, so host marshalling overlaps device work instead of alternating
+  with it. On this workload the GPU is the limit and the packing is fully
+  hidden; the overlap is insurance for hosts with weak CPUs.
 - GPU *inference* is deliberately not supported: at this network size,
   CPU SIMD evaluates in nanoseconds and a host↔device round-trip would
   cost more than the compute. The GPU earns its keep in training only.

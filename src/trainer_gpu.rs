@@ -21,7 +21,7 @@ use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Int, Shape, Tensor, TensorData};
+use burn::tensor::{IndexingUpdateOp, Int, Shape, Tensor, TensorData};
 
 use crate::nnue::features::NUM_FEATURES;
 use crate::nnue::network::{FT_SIZE, L1_INPUT, L1_SIZE, L2_SIZE, QA, QB};
@@ -137,23 +137,33 @@ impl<B: Backend> NnueModel<B> {
     }
 
     /// Per-perspective accumulator: `ft_bias + sum_k(ft_weight[idx_k])`.
-    /// Padding rows are zeroed via `mask` so they contribute nothing.
+    ///
+    /// Expressed as a multi-hot matmul rather than a gather-and-sum. The
+    /// gather form (`ft_weight.select(0, idx)`) materializes `[B*K, FT_SIZE]`
+    /// — 536 MB per perspective at the default batch size, which autodiff
+    /// then retains for the backward pass — and made training bandwidth-bound
+    /// rather than compute-bound. Scattering the mask into `[B, NUM_FEATURES]`
+    /// and multiplying by the weight matrix computes the same sums with an
+    /// order of magnitude less memory traffic, on the one operation GPUs are
+    /// built for.
     fn accumulate(
         &self,
         idx: Tensor<B, 2, Int>, // [B, K]
         mask: Tensor<B, 2>,     // [B, K], 1.0 live / 0.0 pad
     ) -> Tensor<B, 2> {
-        let [batch, k] = idx.dims();
-        let w = self.ft_weight.val();
+        let [batch, _k] = idx.dims();
+        let device = idx.device();
 
-        let flat_idx: Tensor<B, 1, Int> = idx.reshape([batch * k]);
-        let gathered: Tensor<B, 2> = w.select(0, flat_idx); // [B*K, FT_SIZE]
-        let looked: Tensor<B, 3> = gathered.reshape([batch, k, FT_SIZE]);
+        // Multi-hot [B, NUM_FEATURES]. `scatter` accumulates by addition, so
+        // padding slots (index 0 carrying mask 0.0) contribute exactly zero
+        // even when feature 0 is genuinely active in that row. Live features
+        // are unique within a position, so no active index is written twice.
+        let multi_hot: Tensor<B, 2> =
+            Tensor::zeros([batch, NUM_FEATURES], &device)
+                .scatter(1, idx, mask, IndexingUpdateOp::Add);
 
-        let mask3: Tensor<B, 3> = mask.reshape([batch, k, 1]);
-        let masked = looked.mul(mask3);
-
-        let summed: Tensor<B, 2> = masked.sum_dim(1).reshape([batch, FT_SIZE]);
+        // [B, NUM_FEATURES] @ [NUM_FEATURES, FT_SIZE] -> [B, FT_SIZE]
+        let summed = multi_hot.matmul(self.ft_weight.val());
         let bias: Tensor<B, 2> = self.ft_bias.val().reshape([1, FT_SIZE]);
         summed.add(bias)
     }
@@ -223,10 +233,11 @@ pub fn load_raw_weights<B: Backend>(
 // Data pipeline: pad-to-batch-K_max Batcher producing per-batch tensors
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Per-batch packer. We invoke `Batcher::batch` directly on each
-/// `Vec<Sample>` slice (no `DataLoader` machinery) because the CPU
-/// trainer mirrors the same shape — shuffle the slice, step_by
-/// batch_size, pack and upload one batch at a time.
+/// Per-batch packer. No `DataLoader` machinery: the training loop mirrors
+/// the CPU trainer's shape — shuffle the slice, step_by batch_size — and
+/// drives [`NnueBatcher::pack`] and [`NnueBatcher::upload`] itself, so host
+/// marshalling can overlap device work. The [`Batcher`] trait impl below
+/// stays as the single-threaded entry point used by tests.
 #[derive(Clone, Debug)]
 pub(crate) struct NnueBatcher {
     /// WDL blend weight, captured at construction. We precompute the
@@ -251,10 +262,80 @@ pub(crate) struct NnueBatch<B: Backend> {
     pub len: usize,
 }
 
-impl<B: Backend> Batcher<B, Sample, NnueBatch<B>> for NnueBatcher {
-    fn batch(&self, items: Vec<Sample>, device: &B::Device) -> NnueBatch<B> {
+/// Host-side packed batch: exactly the buffers [`NnueBatch`]'s tensors are
+/// built from, but with no device involvement. Keeping the marshalling in
+/// plain `Vec`s is what lets it happen on a worker thread while the GPU is
+/// still busy with the previous batch (see the prefetch loop in `train_gpu`).
+pub(crate) struct PackedBatch {
+    stm_idx: Vec<i64>,
+    stm_mask: Vec<f32>,
+    opp_idx: Vec<i64>,
+    opp_mask: Vec<f32>,
+    target: Vec<f32>,
+    batch: usize,
+    k_max: usize,
+}
+
+/// Below this row count, handing work to threads costs more than the packing.
+const PARALLEL_PACK_MIN_ROWS: usize = 512;
+
+/// The five destination buffers for one run of rows. Bundling them keeps
+/// [`fill_rows`] to a readable signature and makes the disjoint split in
+/// [`RowSink::split_rows`] the only place row ownership is divided.
+struct RowSink<'a> {
+    stm_idx: &'a mut [i64],
+    stm_mask: &'a mut [f32],
+    opp_idx: &'a mut [i64],
+    opp_mask: &'a mut [f32],
+    target: &'a mut [f32],
+}
+
+impl<'a> RowSink<'a> {
+    /// Split off the first `rows` rows, returning (head, tail) over disjoint
+    /// memory. `mem::take` hands each buffer to `split_at_mut` by value so the
+    /// halves keep the original lifetime instead of borrowing `self`.
+    fn split_rows(&mut self, rows: usize, k_max: usize) -> (RowSink<'a>, RowSink<'a>) {
+        let wide = rows * k_max;
+        let (si, si_t) = std::mem::take(&mut self.stm_idx).split_at_mut(wide);
+        let (sm, sm_t) = std::mem::take(&mut self.stm_mask).split_at_mut(wide);
+        let (oi, oi_t) = std::mem::take(&mut self.opp_idx).split_at_mut(wide);
+        let (om, om_t) = std::mem::take(&mut self.opp_mask).split_at_mut(wide);
+        let (tg, tg_t) = std::mem::take(&mut self.target).split_at_mut(rows);
+        (
+            RowSink { stm_idx: si, stm_mask: sm, opp_idx: oi, opp_mask: om, target: tg },
+            RowSink { stm_idx: si_t, stm_mask: sm_t, opp_idx: oi_t, opp_mask: om_t, target: tg_t },
+        )
+    }
+}
+
+/// Fill one contiguous run of rows. Destination buffers arrive zeroed, and
+/// zero *is* the padding representation (index 0 with mask 0.0), so only real
+/// features get written — no padding loop, and row `i` is touched by exactly
+/// one worker, which is what makes the split in [`NnueBatcher::pack`] sound.
+fn fill_rows(items: &[Sample], k_max: usize, wdl_weight: f32, out: RowSink<'_>) {
+    for (row, s) in items.iter().enumerate() {
+        let base = row * k_max;
+        for (j, &f) in s.stm_features.iter().enumerate() {
+            out.stm_idx[base + j] = f as i64;
+            out.stm_mask[base + j] = 1.0;
+        }
+        for (j, &f) in s.opp_features.iter().enumerate() {
+            out.opp_idx[base + j] = f as i64;
+            out.opp_mask[base + j] = 1.0;
+        }
+        // WDL-blended target — same formula as the CPU trainer's loss.
+        out.target[row] = wdl_weight * s.result + (1.0 - wdl_weight) * sigmoid(s.score);
+    }
+}
+
+impl NnueBatcher {
+    /// Marshal samples into host buffers, splitting rows across up to
+    /// `threads` workers. The partition is disjoint by construction, so the
+    /// result is byte-identical regardless of thread count — asserted by
+    /// `pack_is_thread_count_independent`.
+    pub(crate) fn pack(&self, items: &[Sample], threads: usize) -> PackedBatch {
         let batch = items.len();
-        assert!(batch > 0, "NnueBatcher::batch called with empty items");
+        assert!(batch > 0, "NnueBatcher::pack called with empty items");
 
         // K_max across BOTH perspectives — keeps the two index tensors
         // the same width so we can reuse one shape constant.
@@ -265,58 +346,86 @@ impl<B: Backend> Batcher<B, Sample, NnueBatch<B>> for NnueBatcher {
             .unwrap_or(0)
             .max(1); // avoid a zero-width tensor on a degenerate batch
 
-        let mut stm_idx_buf: Vec<i64> = Vec::with_capacity(batch * k_max);
-        let mut stm_mask_buf: Vec<f32> = Vec::with_capacity(batch * k_max);
-        let mut opp_idx_buf: Vec<i64> = Vec::with_capacity(batch * k_max);
-        let mut opp_mask_buf: Vec<f32> = Vec::with_capacity(batch * k_max);
-        let mut target_buf: Vec<f32> = Vec::with_capacity(batch);
+        let mut packed = PackedBatch {
+            stm_idx: vec![0; batch * k_max],
+            stm_mask: vec![0.0; batch * k_max],
+            opp_idx: vec![0; batch * k_max],
+            opp_mask: vec![0.0; batch * k_max],
+            target: vec![0.0; batch],
+            batch,
+            k_max,
+        };
 
-        for s in &items {
-            for &f in &s.stm_features {
-                stm_idx_buf.push(f as i64);
-                stm_mask_buf.push(1.0);
-            }
-            for _ in s.stm_features.len()..k_max {
-                stm_idx_buf.push(0); // value irrelevant, masked out
-                stm_mask_buf.push(0.0);
-            }
-            for &f in &s.opp_features {
-                opp_idx_buf.push(f as i64);
-                opp_mask_buf.push(1.0);
-            }
-            for _ in s.opp_features.len()..k_max {
-                opp_idx_buf.push(0);
-                opp_mask_buf.push(0.0);
-            }
-            // WDL-blended target — same formula as the CPU trainer's loss.
-            let target_sig = sigmoid(s.score);
-            let target = self.wdl_weight * s.result + (1.0 - self.wdl_weight) * target_sig;
-            target_buf.push(target);
+        let mut sink = RowSink {
+            stm_idx: &mut packed.stm_idx,
+            stm_mask: &mut packed.stm_mask,
+            opp_idx: &mut packed.opp_idx,
+            opp_mask: &mut packed.opp_mask,
+            target: &mut packed.target,
+        };
+
+        let workers = threads.max(1).min(batch);
+        if workers == 1 || batch < PARALLEL_PACK_MIN_ROWS {
+            fill_rows(items, k_max, self.wdl_weight, sink);
+            return packed;
         }
 
-        let shape_2d = Shape::new([batch, k_max]);
-        let stm_idx = Tensor::<B, 2, Int>::from_data(
-            TensorData::new(stm_idx_buf, shape_2d.clone()),
-            device,
-        );
-        let stm_mask = Tensor::<B, 2>::from_data(
-            TensorData::new(stm_mask_buf, shape_2d.clone()),
-            device,
-        );
-        let opp_idx = Tensor::<B, 2, Int>::from_data(
-            TensorData::new(opp_idx_buf, shape_2d.clone()),
-            device,
-        );
-        let opp_mask = Tensor::<B, 2>::from_data(
-            TensorData::new(opp_mask_buf, shape_2d),
-            device,
-        );
-        let target = Tensor::<B, 1>::from_data(
-            TensorData::new(target_buf, Shape::new([batch])),
-            device,
-        );
+        // Hand each worker a disjoint run of rows.
+        let rows_per = batch.div_ceil(workers);
+        let wdl = self.wdl_weight;
+        let mut items_rest: &[Sample] = items;
 
-        NnueBatch { stm_idx, stm_mask, opp_idx, opp_mask, target, len: batch }
+        std::thread::scope(|scope| {
+            while !items_rest.is_empty() {
+                let n = rows_per.min(items_rest.len());
+                let (it, it_next) = items_rest.split_at(n);
+                let (head, tail) = sink.split_rows(n, k_max);
+                scope.spawn(move || fill_rows(it, k_max, wdl, head));
+                items_rest = it_next;
+                sink = tail;
+            }
+        });
+
+        packed
+    }
+
+    /// Upload host buffers to the training device. Once packing is prefetched
+    /// onto a worker, this is all the batch work left on the training thread.
+    pub(crate) fn upload<B: Backend>(packed: PackedBatch, device: &B::Device) -> NnueBatch<B> {
+        let shape_2d = Shape::new([packed.batch, packed.k_max]);
+        NnueBatch {
+            stm_idx: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(packed.stm_idx, shape_2d.clone()),
+                device,
+            ),
+            stm_mask: Tensor::<B, 2>::from_data(
+                TensorData::new(packed.stm_mask, shape_2d.clone()),
+                device,
+            ),
+            opp_idx: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(packed.opp_idx, shape_2d.clone()),
+                device,
+            ),
+            opp_mask: Tensor::<B, 2>::from_data(
+                TensorData::new(packed.opp_mask, shape_2d),
+                device,
+            ),
+            target: Tensor::<B, 1>::from_data(
+                TensorData::new(packed.target, Shape::new([packed.batch])),
+                device,
+            ),
+            len: packed.batch,
+        }
+    }
+}
+
+impl<B: Backend> Batcher<B, Sample, NnueBatch<B>> for NnueBatcher {
+    /// Burn's `Batcher` entry point: the single-threaded path, kept for tests
+    /// and any `DataLoader`-driven caller. The training loop instead calls
+    /// [`NnueBatcher::pack`] and [`NnueBatcher::upload`] separately so the
+    /// packing half can overlap with device work.
+    fn batch(&self, items: Vec<Sample>, device: &B::Device) -> NnueBatch<B> {
+        Self::upload(self.pack(&items, 1), device)
     }
 }
 
@@ -457,6 +566,21 @@ pub(crate) struct GpuTrainConfig {
     pub lr: f32,
     pub wdl_weight: f32,
     pub save_rate: usize,
+    /// Host threads used to marshal batches. Packing is the CPU-side half of
+    /// training and overlaps device work, so it scales with the machine, not
+    /// the GPU. Defaults to [`default_pack_threads`]; `--threads` overrides.
+    pub pack_threads: usize,
+}
+
+/// How many packed batches may sit ready ahead of the device. Two is enough
+/// to keep it fed without holding much host memory (~12 MB per batch at the
+/// default batch size).
+const PREFETCH_DEPTH: usize = 2;
+
+/// All cores by default — packing is pure host work done off the training
+/// thread, so it may use the whole machine.
+fn default_pack_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 fn train_gpu(config: &GpuTrainConfig) {
@@ -536,38 +660,61 @@ fn train_gpu(config: &GpuTrainConfig) {
         let mut epoch_loss = 0.0_f64;
         let mut epoch_count: u64 = 0;
 
-        for batch_start in (0..samples.len()).step_by(config.batch_size) {
-            let batch_end = (batch_start + config.batch_size).min(samples.len());
-            let batch_items: Vec<Sample> = samples[batch_start..batch_end].to_vec();
+        // Prefetch: a worker packs batch N+1 into host buffers while this
+        // thread is still training on batch N, so CPU marshalling overlaps
+        // device work instead of alternating with it. The channel bound caps
+        // how far ahead the packer may run, and thus host memory.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PackedBatch>(PREFETCH_DEPTH);
+        let samples_ref: &[Sample] = &samples;
+        let batcher_ref = &batcher;
+        let batch_size = config.batch_size;
+        let pack_threads = config.pack_threads;
 
-            let batch = batcher.batch(batch_items, &device);
-            let batch_len = batch.len;
+        model = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for start in (0..samples_ref.len()).step_by(batch_size) {
+                    let end = (start + batch_size).min(samples_ref.len());
+                    let packed = batcher_ref.pack(&samples_ref[start..end], pack_threads);
+                    // A send error means the training thread stopped early,
+                    // so there is nothing left to feed.
+                    if tx.send(packed).is_err() {
+                        return;
+                    }
+                }
+            });
 
-            let predicted_cp = model.forward(
-                batch.stm_idx,
-                batch.stm_mask,
-                batch.opp_idx,
-                batch.opp_mask,
-            );
+            let mut model = model;
+            for packed in rx {
+                let batch = NnueBatcher::upload::<TrainBackend>(packed, &device);
+                let batch_len = batch.len;
 
-            // Loss: MSE between sigmoid(pred / SIGMOID_SCALE) and the
-            // WDL-blended target (precomputed in the batcher).
-            let scaled = predicted_cp.div_scalar(SIGMOID_SCALE);
-            let pred_sig = burn::tensor::activation::sigmoid(scaled);
-            let diff = batch.target - pred_sig;
-            let loss = diff.powf_scalar(2.0).mean();
+                let predicted_cp = model.forward(
+                    batch.stm_idx,
+                    batch.stm_mask,
+                    batch.opp_idx,
+                    batch.opp_mask,
+                );
 
-            // `backward(&self)` borrows, so reading the scalar after
-            // it returns is fine.
-            let grads = GradientsParams::from_grads(loss.backward(), &model);
-            let loss_scalar: f32 = loss.into_scalar();
-            model = optim.step(current_lr, model, grads);
+                // Loss: MSE between sigmoid(pred / SIGMOID_SCALE) and the
+                // WDL-blended target (precomputed in the batcher).
+                let scaled = predicted_cp.div_scalar(SIGMOID_SCALE);
+                let pred_sig = burn::tensor::activation::sigmoid(scaled);
+                let diff = batch.target - pred_sig;
+                let loss = diff.powf_scalar(2.0).mean();
 
-            // CPU trainer reports per-sample mean loss; we accumulate
-            // `mean_loss * batch_len` and divide at end of epoch.
-            epoch_loss += (loss_scalar as f64) * (batch_len as f64);
-            epoch_count += batch_len as u64;
-        }
+                // `backward(&self)` borrows, so reading the scalar after
+                // it returns is fine.
+                let grads = GradientsParams::from_grads(loss.backward(), &model);
+                let loss_scalar: f32 = loss.into_scalar();
+                model = optim.step(current_lr, model, grads);
+
+                // CPU trainer reports per-sample mean loss; we accumulate
+                // `mean_loss * batch_len` and divide at end of epoch.
+                epoch_loss += (loss_scalar as f64) * (batch_len as f64);
+                epoch_count += batch_len as u64;
+            }
+            model
+        });
 
         let avg_loss = if epoch_count == 0 { 0.0 } else { epoch_loss / epoch_count as f64 };
         eprintln!("Epoch {epoch}/{}: loss = {avg_loss:.8}", config.epochs);
@@ -615,6 +762,7 @@ pub fn run_training_gpu(first_data_path: &str, args: &[String]) {
         lr: 0.001,
         wdl_weight: 0.5,
         save_rate: 5,
+        pack_threads: default_pack_threads(),
     };
     let mut i = 0;
     while i < args.len() {
@@ -676,9 +824,11 @@ pub fn run_training_gpu(first_data_path: &str, args: &[String]) {
                 i += 2;
             }
             "--threads" => {
-                // Accepted-and-ignored for CLI parity with the CPU
-                // trainer. GPU training uses one device — Burn handles
-                // intra-op parallelism via the backend kernels.
+                // Host threads for batch packing (the device itself is
+                // single — Burn handles intra-op parallelism in kernels).
+                if let Some(n) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
+                    config.pack_threads = n.max(1);
+                }
                 i += 2;
             }
             _ => {
@@ -939,6 +1089,126 @@ mod tests {
         let targets: Vec<f32> = batch.target.into_data().into_vec::<f32>().unwrap();
         assert!((targets[0] - (0.5 * 0.5 + 0.5 * 0.5)).abs() < 1e-6);
         assert!((targets[1] - (0.5 * 1.0 + 0.5 * 0.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pack_is_thread_count_independent() {
+        // Row `i` of every buffer belongs to sample `i` alone, so splitting
+        // rows across workers must not change a single byte. 1500 rows clears
+        // PARALLEL_PACK_MIN_ROWS, so the parallel path really is exercised.
+        let mut rng = Rng::new(0x51A7_C0DE_1234_5678);
+        let mut samples = Vec::with_capacity(1500);
+        for _ in 0..1500 {
+            // Deliberately ragged feature counts so k_max padding varies.
+            let n_stm = (rng.next_u64() % 30 + 1) as usize;
+            let n_opp = (rng.next_u64() % 30 + 1) as usize;
+            let mut stm_features = Vec::with_capacity(n_stm);
+            for _ in 0..n_stm {
+                stm_features.push((rng.next_u64() % NUM_FEATURES as u64) as usize);
+            }
+            let mut opp_features = Vec::with_capacity(n_opp);
+            for _ in 0..n_opp {
+                opp_features.push((rng.next_u64() % NUM_FEATURES as u64) as usize);
+            }
+            samples.push(Sample {
+                stm_features,
+                opp_features,
+                score: (rng.next_u64() % 2000) as f32 - 1000.0,
+                result: (rng.next_u64() % 3) as f32 / 2.0,
+            });
+        }
+
+        let batcher = NnueBatcher { wdl_weight: 0.5 };
+        let reference = batcher.pack(&samples, 1);
+        assert!(reference.k_max >= 2, "test data should be ragged");
+
+        for threads in [2, 3, 4, 8, 16, 64] {
+            let packed = batcher.pack(&samples, threads);
+            assert_eq!(packed.batch, reference.batch, "{threads} threads: batch");
+            assert_eq!(packed.k_max, reference.k_max, "{threads} threads: k_max");
+            assert_eq!(packed.stm_idx, reference.stm_idx, "{threads} threads: stm_idx");
+            assert_eq!(packed.stm_mask, reference.stm_mask, "{threads} threads: stm_mask");
+            assert_eq!(packed.opp_idx, reference.opp_idx, "{threads} threads: opp_idx");
+            assert_eq!(packed.opp_mask, reference.opp_mask, "{threads} threads: opp_mask");
+            assert_eq!(packed.target, reference.target, "{threads} threads: target");
+        }
+    }
+
+    #[test]
+    fn pack_pads_short_rows_and_blends_target() {
+        // Same invariants the Batcher-trait test asserts through tensors,
+        // checked directly on the host buffers the parallel path fills.
+        let s1 = Sample { stm_features: vec![3, 5], opp_features: vec![7], score: 0.0, result: 0.5 };
+        let s2 = Sample { stm_features: vec![1, 2, 4, 6], opp_features: vec![8, 9], score: 0.0, result: 1.0 };
+        let packed = NnueBatcher { wdl_weight: 0.5 }.pack(&[s1, s2], 4);
+
+        assert_eq!(packed.batch, 2);
+        assert_eq!(packed.k_max, 4, "K_max spans both perspectives");
+        assert_eq!(packed.stm_idx, vec![3, 5, 0, 0, 1, 2, 4, 6]);
+        assert_eq!(packed.stm_mask, vec![1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(packed.opp_idx, vec![7, 0, 0, 0, 8, 9, 0, 0]);
+        assert_eq!(packed.opp_mask, vec![1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]);
+        // wdl 0.5: 0.5*result + 0.5*sigmoid(0)
+        assert!((packed.target[0] - 0.5).abs() < 1e-6);
+        assert!((packed.target[1] - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn accumulate_sums_active_features_including_feature_zero() {
+        // The multi-hot path scatters mask values at the active indices, and
+        // every padding slot carries index 0 with value 0.0. If `scatter` ever
+        // stopped accumulating by addition (e.g. assign semantics), padding
+        // would clobber a genuinely-active feature 0 — silently, and only for
+        // positions that happen to use it. Row weights are `f + 1` so that
+        // dropping feature 0 changes the sum instead of hiding in a zero.
+        let device = test_device();
+        let mut ft_weights = vec![0.0_f32; NUM_FEATURES * FT_SIZE];
+        for f in 0..NUM_FEATURES {
+            for j in 0..FT_SIZE {
+                ft_weights[f * FT_SIZE + j] = (f + 1) as f32;
+            }
+        }
+        let raw = RawWeights {
+            ft_weights,
+            ft_biases: vec![0.0; FT_SIZE],
+            l1_weights: vec![0.0; L1_INPUT * L1_SIZE],
+            l1_biases: vec![0.0; L1_SIZE],
+            l2_weights: vec![0.0; L1_SIZE * L2_SIZE],
+            l2_biases: vec![0.0; L2_SIZE],
+            l3_weights: vec![0.0; L2_SIZE],
+            l3_bias: 0.0,
+        };
+        let mut model: NnueModel<TestBackend> = NnueModel::new(&device);
+        load_raw_weights(&mut model, raw, &device);
+
+        // Row 0: features {0, 5} then two padding slots -> (0+1) + (5+1) = 7.
+        // Row 1: features {2, 3, 7, 9}, no padding          -> 3+4+8+10 = 25.
+        let idx = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![0_i64, 5, 0, 0, 2, 3, 7, 9], Shape::new([2, 4])),
+            &device,
+        );
+        let mask = Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(
+                vec![1.0_f32, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+                Shape::new([2, 4]),
+            ),
+            &device,
+        );
+
+        let acc: Vec<f32> = model.accumulate(idx, mask).into_data().into_vec().unwrap();
+        assert_eq!(acc.len(), 2 * FT_SIZE);
+        for j in 0..FT_SIZE {
+            assert!(
+                (acc[j] - 7.0).abs() < 1e-4,
+                "row 0 dim {j}: expected 7 (feature 0 must survive padding), got {}",
+                acc[j]
+            );
+            assert!(
+                (acc[FT_SIZE + j] - 25.0).abs() < 1e-4,
+                "row 1 dim {j}: expected 25, got {}",
+                acc[FT_SIZE + j]
+            );
+        }
     }
 
     // ─── Phase 4: one Adam step reduces a synthetic loss ─────────────────
