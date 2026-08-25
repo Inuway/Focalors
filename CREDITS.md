@@ -22,10 +22,14 @@ Focalors is licensed under GPL-3.0-or-later (see [`LICENSE`](LICENSE)).
 
 ## NNUE network
 
-The current shipping NNUE network ([`nets/current.nnue`](nets/current.nnue), `gen10`)
-was trained by **Luc Vedrenne** ([@ListIndexOutOfRange](https://github.com/ListIndexOutOfRange))
-through 10 generations of self-play fine-tuning, contributed via
-[PR #2](https://github.com/Inuway/Focalors/pull/2).
+The shipping NNUE network ([`nets/current.nnue`](nets/current.nnue)) is
+trained in-house through generations of self-play fine-tuning. The
+lineage was founded by **Luc Vedrenne**
+([@ListIndexOutOfRange](https://github.com/ListIndexOutOfRange)), who
+trained its first 10 generations and contributed them - together with
+the generation recipe still in use - via
+[PR #2](https://github.com/Inuway/Focalors/pull/2). Every net shipped
+since descends directly from that work.
 
 ## GPU training pipeline (optional `gpu-training` feature)
 
@@ -36,5 +40,6 @@ licensed under Apache-2.0 OR MIT. Burn is pulled in **only** when the
 does not depend on Burn. See
 [`docs/GPU_TRAINING.md`](docs/GPU_TRAINING.md).
 
-CPU training (used to produce all shipping nets to date) does not depend
-on Burn — see [`src/trainer.rs`](src/trainer.rs).
+The pure-Rust CPU trainer ([`src/trainer.rs`](src/trainer.rs)) does not
+depend on Burn and produces byte-identical nets; either trainer can be
+used interchangeably.
