@@ -8,7 +8,7 @@ The thing I wanted to figure out is whether you can have both a strong engine *a
 
 ![Focalors showcase with the redesigned local play and statistics views](assets/screenshots/showcase.png)
 
-## Elo 2300-2400~? (And why it's not (very) important)
+## Elo 2200-2400~? (And why it's not (very) important)
 My goal is a full chess learning experience without a permanent internet connection or a subscription - your games, data and progress live on your machine, always accessible. Focalors does not aim to compete with state-of-the-art engines like Stockfish. It just needs to be strong enough to teach human understandable positions and help average players, advanced ones, and possibly even masters improve. (With the sole exception of Satoru Gojo aka Magnus Carlsen) I love chess and wanna do a small contribution to people trying to get further into the game.
 
 ## The net trains itself
