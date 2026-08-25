@@ -8,9 +8,12 @@ The thing I wanted to figure out is whether you can have both a strong engine *a
 
 ![Focalors showcase with the redesigned local play and statistics views](assets/screenshots/showcase.png)
 
-## Elo 2200-2400~? (And why it's not (very) important)
-My goal with this project is to make the learning experience for chess possible without the need of having a permanent internet connection or paying a subscription. As earlier mentioned, I want users to be capable of having the full control over their data, games and progress, all on their own machine, always accessible. While of course the strength of the engine is to be further improved, this project does not aim to be "the strongest" or compete with state-of-the-art engines such as Stockfish. The engine just needs to be strong enough to teach human understandable positions and help the average, advanced, or possibly even masters improve their understanding. (With the sole exception of Satoru Gojo aka Magnus Carlsen) I love chess and wanna do a small contribution to people trying to get further into the game. (The shipping net is trained fully in-house these days, generation by generation through self-play — standing on the first ten generations trained by [Luc Vedrenne](https://github.com/ListIndexOutOfRange), whose contribution got the whole training loop started; see [CREDITS.md](CREDITS.md). More to that in TECHNICAL.md further mentioned below)
+## Elo 2300-2400~? (And why it's not (very) important)
+My goal is a full chess learning experience without a permanent internet connection or a subscription - your games, data and progress live on your machine, always accessible. Focalors does not aim to compete with state-of-the-art engines like Stockfish. It just needs to be strong enough to teach human understandable positions and help average players, advanced ones, and possibly even masters improve. (With the sole exception of Satoru Gojo aka Magnus Carlsen) I love chess and wanna do a small contribution to people trying to get further into the game.
 
+## The net trains itself
+
+The part I'm quietly proud of: the entire NNUE training pipeline lives in this repo, written from scratch - the self-play data generator, both trainers (CPU and GPU), and the statistical promotion gate. No bullet, no external trainer. The engine plays a hundred thousand games against itself, a candidate net trains on those games, and it only replaces the current net if it wins a long head-to-head match. The very first net was trained from scratch right here; [Luc Vedrenne](https://github.com/ListIndexOutOfRange) then contributed ten generations of fine-tuning on top (roughly +270 elo, see [CREDITS.md](CREDITS.md)), and every generation since is trained in-house again. How the loop works: [docs/TECHNICAL.md](docs/TECHNICAL.md).
 
 ## Running it
 
@@ -31,4 +34,4 @@ If you want to plug Focalors into another chess GUI, `focalors uci` runs the sta
 
 ## License
 
-GPL-3.0-or-later. The chess piece graphics in [`assets/pieces/`](assets/pieces/) are CC BY-SA 3.0 by Colin M.L. Burnett — see [CREDITS.md](CREDITS.md) for the full attribution.
+GPL-3.0-or-later. The chess piece graphics in [`assets/pieces/`](assets/pieces/) are CC BY-SA 3.0 by Colin M.L. Burnett - see [CREDITS.md](CREDITS.md) for the full attribution.

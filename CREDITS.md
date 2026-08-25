@@ -23,13 +23,14 @@ Focalors is licensed under GPL-3.0-or-later (see [`LICENSE`](LICENSE)).
 ## NNUE network
 
 The shipping NNUE network ([`nets/current.nnue`](nets/current.nnue)) is
-trained in-house through generations of self-play fine-tuning. The
-lineage was founded by **Luc Vedrenne**
-([@ListIndexOutOfRange](https://github.com/ListIndexOutOfRange)), who
-trained its first 10 generations and contributed them - together with
-the generation recipe still in use - via
-[PR #2](https://github.com/Inuway/Focalors/pull/2). Every net shipped
-since descends directly from that work.
+trained in-house through generations of self-play fine-tuning, starting
+from an initial net trained from scratch for this project.
+**Luc Vedrenne**
+([@ListIndexOutOfRange](https://github.com/ListIndexOutOfRange))
+contributed ten generations of that fine-tuning (a chained estimate of
+roughly +270 elo across the accepted promotions), together with the
+generation recipe still in use, via
+[PR #2](https://github.com/Inuway/Focalors/pull/2).
 
 ## GPU training pipeline (optional `gpu-training` feature)
 
