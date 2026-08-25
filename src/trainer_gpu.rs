@@ -795,7 +795,7 @@ pub fn run_training_gpu(first_data_path: &str, args: &[String]) {
         epochs: 20,
         batch_size: 16384,
         lr: 0.001,
-        wdl_weight: 0.5,
+        wdl_weight: crate::trainer::DEFAULT_WDL_WEIGHT,
         save_rate: 5,
         pack_threads: default_pack_threads(),
     };
@@ -844,7 +844,7 @@ pub fn run_training_gpu(first_data_path: &str, args: &[String]) {
                 i += 2;
             }
             "--wdl" => {
-                config.wdl_weight = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0.5);
+                config.wdl_weight = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(crate::trainer::DEFAULT_WDL_WEIGHT);
                 i += 2;
             }
             "--output" => {

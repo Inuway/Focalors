@@ -78,9 +78,12 @@ current default:
 ./target/release/focalors selfmatch 1000 --depth 8 --challenger-net path/to/new.nnue
 ```
 
-Ship only on positive elo with high LOS. 1000 games is the promotion
-standard: typical per-generation gains (+10-30 elo) sit below the noise
-floor of a short match.
+Ship only on positive elo with high LOS, and only after an independent
+confirmation match (2000 games, fresh run) replicates the screening
+result — matches sample their own random openings, which adds variance
+beyond the printed CI. 1000 games is the screening standard: typical
+per-generation gains (+10-30 elo) sit below the noise floor of a short
+match.
 
 ## License & credits
 

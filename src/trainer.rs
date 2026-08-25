@@ -14,6 +14,14 @@ use crate::nnue::features::NUM_FEATURES;
 /// trainer that targets this engine's nets.
 pub const SIGMOID_SCALE: f32 = 400.0;
 
+/// Default weight of the game result in the WDL-blended training target
+/// (`target = wdl*result + (1-wdl)*sigmoid(score)`). Swept empirically at
+/// gen14 on ~63%-draw depth-8 selfplay data: 0.5 trained a flatter eval
+/// that gated ~-13 vs its parent, 0.10 gated ~+30 (pooled, 3000 games),
+/// 0.0 gave most of that back. The optimum tracks the draw rate of the
+/// data — re-sweep this when selfplay gets significantly drawier.
+pub const DEFAULT_WDL_WEIGHT: f32 = 0.1;
+
 // ════════════════════════════════════════════════════════════════════════════
 // Data structures
 // ════════════════════════════════════════════════════════════════════════════
@@ -1045,7 +1053,7 @@ pub fn run_training(first_data_path: &str, args: &[String]) {
         epochs: 20,
         batch_size: 16384,
         lr: 0.001,
-        wdl_weight: 0.5,
+        wdl_weight: DEFAULT_WDL_WEIGHT,
         save_rate: 5,
         num_threads: default_threads,
     };
@@ -1093,7 +1101,7 @@ pub fn run_training(first_data_path: &str, args: &[String]) {
                 i += 2;
             }
             "--wdl" => {
-                config.wdl_weight = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0.5);
+                config.wdl_weight = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_WDL_WEIGHT);
                 i += 2;
             }
             "--output" => {

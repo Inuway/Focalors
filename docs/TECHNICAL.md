@@ -65,6 +65,17 @@ the label quality of every position in the dataset. The selfplay default
 (6) is fine for quick experiments, but every promoted generation was
 trained on depth-8 data.
 
+The training target blends the search score with the game result:
+`target = wdl*result + (1-wdl)*sigmoid(score)`, set by `--wdl`
+(default 0.1). The default is empirical, swept at gen14: on mature
+selfplay data (~63% draws) the historical 0.5 pulled every eval toward
+"draw", training a flatter net that consistently gated ~-13 elo below
+its parent; 0.1 gated ~+30 on the same data, and 0.0 (pure score
+distillation) gave most of that back. The optimum tracks the draw rate
+of the data — if selfplay gets significantly drawier in future
+generations, re-sweep this dial before concluding the loop has
+plateaued.
+
 Then training turns positions into a network. `--mix` blends two datasets, `--resume` warm-starts from an existing net so you don't relearn from scratch:
 
 ```bash
@@ -144,9 +155,16 @@ cargo run --release -- train nets/genN-data.bin \
 #    and a 100-game match (CI half-width ±30-50) cannot resolve that.
 #    Historically about half of all candidates fail this gate — that is
 #    the loop working, not a broken run.
-./target/release/focalors selfmatch 1000 --challenger-net nets/genN.nnue
+./target/release/focalors selfmatch 1000 --depth 8 --challenger-net nets/genN.nnue
 
-# 4. Promote only if the validation match says the candidate is stronger.
+# 4. Confirm before promoting: each match samples its own random
+#    openings, which adds variance beyond the printed CI (the same net
+#    has measured +53 and +22 in back-to-back 1000/2000-game matches).
+#    The 1000-game screen ranks candidates; an independent longer match
+#    must replicate the win before anything is promoted.
+./target/release/focalors selfmatch 2000 --depth 8 --challenger-net nets/genN.nnue
+
+# 5. Promote only if both matches agree the candidate is stronger.
 cargo run --release -- promote nets/genN.nnue
 cargo build --release
 ```
