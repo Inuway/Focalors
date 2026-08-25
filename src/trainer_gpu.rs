@@ -229,6 +229,40 @@ pub fn load_raw_weights<B: Backend>(
     model.l3.bias = Some(p1(vec![raw.l3_bias], [1], device));
 }
 
+/// Clamp model weights to the ranges the quantized export can represent —
+/// the same bounds, applied at the same point (after every optimizer
+/// step), as the CPU trainer's `TrainNet::clamp_to_quantizable`. Without
+/// this, training grows weights past the integer boundary and the export
+/// silently flattens them, so the shipped net computes a different
+/// function than the f32 net the loss was measured on.
+///
+/// Clamping runs on the inner (non-autodiff) tensors and re-marks
+/// `require_grad`, mirroring how Burn's own optimizer adaptor writes
+/// updated params back — the clamp must be a graph leaf, not a tracked op.
+fn clamp_to_quantizable<B: AutodiffBackend>(mut model: NnueModel<B>) -> NnueModel<B> {
+    fn clamp_param<B: AutodiffBackend, const D: usize>(
+        param: Param<Tensor<B, D>>,
+        bound: f32,
+    ) -> Param<Tensor<B, D>> {
+        param.map(|t| {
+            let require_grad = t.is_require_grad();
+            let mut out = Tensor::from_inner(t.inner().clamp(-bound, bound));
+            if require_grad {
+                out = out.require_grad();
+            }
+            out
+        })
+    }
+    const I16_BOUND: f32 = 32767.0;
+    const I8_BOUND: f32 = 127.0;
+    model.ft_weight = clamp_param(model.ft_weight, I16_BOUND);
+    model.ft_bias = clamp_param(model.ft_bias, I16_BOUND);
+    model.l1.weight = clamp_param(model.l1.weight, I8_BOUND);
+    model.l2.weight = clamp_param(model.l2.weight, I8_BOUND);
+    model.l3.weight = clamp_param(model.l3.weight, I8_BOUND);
+    model
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Data pipeline: pad-to-batch-K_max Batcher producing per-batch tensors
 // ════════════════════════════════════════════════════════════════════════════
@@ -707,6 +741,7 @@ fn train_gpu(config: &GpuTrainConfig) {
                 let grads = GradientsParams::from_grads(loss.backward(), &model);
                 let loss_scalar: f32 = loss.into_scalar();
                 model = optim.step(current_lr, model, grads);
+                model = clamp_to_quantizable(model);
 
                 // CPU trainer reports per-sample mean loss; we accumulate
                 // `mean_loss * batch_len` and divide at end of epoch.
@@ -1218,6 +1253,45 @@ mod tests {
     // sigmoid loss + backward + step) is exercised verbatim.
 
     type AutodiffNd = Autodiff<NdArray>;
+
+    #[test]
+    fn clamp_to_quantizable_bounds_all_layers() {
+        let device = NdArrayDevice::Cpu;
+        let mut raw = random_raw_weights(0xC1A);
+        raw.ft_weights[0] = 40_000.0;
+        raw.ft_biases[0] = -40_000.0;
+        raw.l1_weights[0] = 200.0;
+        raw.l2_weights[0] = -200.0;
+        raw.l3_weights[0] = 300.0;
+        raw.l3_weights[1] = -300.0;
+        let untouched = raw.l3_weights[2];
+
+        let mut model: NnueModel<AutodiffNd> = NnueModel::new(&device);
+        load_raw_weights(&mut model, raw, &device);
+        let require_grad_before = model.l3.weight.val().is_require_grad();
+
+        let model = clamp_to_quantizable(model);
+
+        let l3: Vec<f32> = model.l3.weight.val().into_data().into_vec().unwrap();
+        assert_eq!(l3[0], 127.0);
+        assert_eq!(l3[1], -127.0);
+        assert_eq!(l3[2], untouched, "in-range weights must not move");
+        let ft: Vec<f32> = model.ft_weight.val().into_data().into_vec().unwrap();
+        assert_eq!(ft[0], 32767.0);
+        let ftb: Vec<f32> = model.ft_bias.val().into_data().into_vec().unwrap();
+        assert_eq!(ftb[0], -32767.0);
+        let l1: Vec<f32> = model.l1.weight.val().into_data().into_vec().unwrap();
+        assert_eq!(l1[0], 127.0);
+        let l2: Vec<f32> = model.l2.weight.val().into_data().into_vec().unwrap();
+        assert_eq!(l2[0], -127.0);
+
+        // The clamp must hand back graph leaves with the same trainability
+        // the optimizer adaptor restores, or the next backward skips them.
+        assert_eq!(
+            model.l3.weight.val().is_require_grad(),
+            require_grad_before
+        );
+    }
 
     #[test]
     fn single_step_reduces_loss() {

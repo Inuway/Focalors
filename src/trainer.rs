@@ -156,6 +156,33 @@ impl TrainNet {
         }
     }
 
+    /// Clamp weights to the ranges the quantized export can represent
+    /// (symmetric i16/i8 bounds). Applied after every optimizer step so
+    /// training routes capacity within representable range instead of
+    /// growing weights the export would silently flatten — without this,
+    /// the exported net computes a different function than the f32 net
+    /// the loss was measured on (observed from gen10 onward: l3 weights
+    /// saturating at the i8 boundary).
+    fn clamp_to_quantizable(&mut self) {
+        const I16_BOUND: f32 = 32767.0;
+        const I8_BOUND: f32 = 127.0;
+        for w in &mut self.ft_weights {
+            *w = w.clamp(-I16_BOUND, I16_BOUND);
+        }
+        for w in &mut self.ft_biases {
+            *w = w.clamp(-I16_BOUND, I16_BOUND);
+        }
+        for w in &mut self.l1_weights {
+            *w = w.clamp(-I8_BOUND, I8_BOUND);
+        }
+        for w in &mut self.l2_weights {
+            *w = w.clamp(-I8_BOUND, I8_BOUND);
+        }
+        for w in &mut self.l3_weights {
+            *w = w.clamp(-I8_BOUND, I8_BOUND);
+        }
+    }
+
     fn random_init(rng: &mut Rng) -> Self {
         let mut net = Self::zeros();
 
@@ -962,6 +989,7 @@ fn train(config: &TrainConfig) {
 
             grad.scale(1.0 / batch_len as f32);
             adam.step(&mut net, &grad);
+            net.clamp_to_quantizable();
         }
 
         let avg_loss = epoch_loss / epoch_count as f64;
@@ -1194,6 +1222,29 @@ mod tests {
         let bytes = quantize(&net);
         let loaded = crate::nnue::network::Network::from_bytes(&bytes);
         assert!(loaded.is_ok(), "Quantized net should be loadable");
+    }
+
+    #[test]
+    fn clamp_to_quantizable_bounds_all_layers() {
+        let mut rng = Rng::new(777);
+        let mut net = TrainNet::random_init(&mut rng);
+        net.ft_weights[0] = 40_000.0;
+        net.ft_biases[0] = -40_000.0;
+        net.l1_weights[0] = 200.0;
+        net.l2_weights[0] = -200.0;
+        net.l3_weights[0] = 300.0;
+        net.l3_weights[1] = -300.0;
+        let untouched = net.l3_weights[2];
+
+        net.clamp_to_quantizable();
+
+        assert_eq!(net.ft_weights[0], 32767.0);
+        assert_eq!(net.ft_biases[0], -32767.0);
+        assert_eq!(net.l1_weights[0], 127.0);
+        assert_eq!(net.l2_weights[0], -127.0);
+        assert_eq!(net.l3_weights[0], 127.0);
+        assert_eq!(net.l3_weights[1], -127.0);
+        assert_eq!(net.l3_weights[2], untouched, "in-range weights must not move");
     }
 
     #[test]

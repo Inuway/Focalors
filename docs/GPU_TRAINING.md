@@ -55,6 +55,12 @@ it defaults to all cores).
   differences at ±1 quantization level.
 - Memory scales with `--batch-size`: ~900 MB peak at the default 16384.
   On GPUs with less than 4 GB, use `--batch-size 8192` or `4096`.
+- Both trainers clamp weights to the quantizable ranges (i16 for the
+  feature transformer, i8 for l1–l3) after every optimizer step, so
+  training routes capacity within what the `.nnue` export can represent.
+  Without this, grown weights get silently flattened at export and the
+  shipped net computes a different function than the f32 net the loss
+  was measured on — observed as l3 saturation from gen10 onward.
 - Batches are packed on worker threads and prefetched one ahead of the
   device, so host marshalling overlaps device work instead of alternating
   with it. On this workload the GPU is the limit and the packing is fully
