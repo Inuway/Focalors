@@ -666,6 +666,9 @@ pub struct FocalorsApp {
     local_difficulty: LocalDifficulty,
     adaptive_level: u32,
     auto_adjust_message: Option<(String, std::time::Instant)>,
+    /// Rating before/after the most recently saved live game, shown in
+    /// the session card under the outcome banner.
+    last_rating_change: Option<(i32, i32)>,
     show_eval_panel: bool,
     session_start_rating: i32,
     session_start_games: i32,
@@ -870,6 +873,7 @@ impl FocalorsApp {
             local_difficulty: LocalDifficulty::default(),
             adaptive_level,
             auto_adjust_message: None,
+            last_rating_change: None,
             show_eval_panel: false,
             session_start_rating,
             session_start_games,
@@ -2565,6 +2569,7 @@ impl FocalorsApp {
 
         // Save to DB
         drop(state); // release lock before DB operations
+        self.last_rating_change = None;
         if let Ok(game_id) = db.save_game(
             user_color,
             result,
@@ -2585,6 +2590,7 @@ impl FocalorsApp {
             let engine_elo = crate::strength::estimated_elo(numeric_level);
             if let Ok((old_rating, new_rating)) = db.update_rating_after_game(result, engine_elo) {
                 let _ = db.update_game_rating(game_id, numeric_level, old_rating, new_rating);
+                self.last_rating_change = Some((old_rating, new_rating));
                 let delta = new_rating - old_rating;
                 let sign = if delta >= 0 { "+" } else { "" };
                 let mut s = self.state.lock().unwrap();
@@ -2732,79 +2738,50 @@ impl FocalorsApp {
         });
     }
 
-    fn draw_analysis_button(&mut self, ui: &mut egui::Ui) {
-        let state = self.state.lock().unwrap();
-        let analysis = self.analysis_state.lock().unwrap();
-
-        // Show "Review this game" + "Analyze Game" buttons when the game is
-        // over and not already analyzing.
-        if state.local_game.active
-            && state.local_game.outcome.is_some()
-            && matches!(*analysis, AnalysisState::Idle)
-        {
+    /// Hand a finished live game over to Game Review in one step: leave
+    /// the live-play screen, open the just-saved game in the replay panel
+    /// and start the analysis worker so progress and the result render on
+    /// the Analyze page. The game is already in the DB by the time the
+    /// outcome banner shows (auto-save runs before any drawing), so the
+    /// most recent saved game is this one.
+    fn review_finished_game(&mut self) {
+        let (uci_moves, user_color) = {
+            let state = self.state.lock().unwrap();
             let uci_moves: Vec<String> = state
                 .local_history
                 .iter()
                 .filter_map(|s| s.move_uci.clone())
                 .collect();
-            let user_color = state.local_game.human_color;
-            drop(state);
-            drop(analysis);
-
-            if uci_moves.is_empty() {
-                return;
-            }
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .button(
-                        egui::RichText::new("Review this game")
-                            .size(13.0)
-                            .strong(),
-                    )
-                    .clicked()
-                {
-                    self.open_review_for_most_recent_game();
-                }
-                if ui.button("Analyze Game").clicked() {
-                    // Load the just-saved game into Analyze, set the target
-                    // game for persistence, navigate, then kick off the
-                    // analysis. Progress + result render on the Analyze page.
-                    let recent_id = self
-                        .db
-                        .as_ref()
-                        .and_then(|db| db.get_recent_games(1).ok())
-                        .and_then(|g| g.into_iter().next())
-                        .map(|g| g.id);
-                    if let Some(id) = recent_id {
-                        self.start_replay(id);
-                        self.analysis_target_game_id = Some(id);
-                        self.home_page = HomePage::Analyze;
-                    }
-                    self.start_analysis(uci_moves, user_color);
-                }
-            });
+            (uci_moves, state.local_game.human_color)
+        };
+        if uci_moves.is_empty() {
             return;
         }
-        drop(state);
-        drop(analysis);
-    }
-
-    /// Look up the most recently saved game and open it in the replay panel.
-    /// Used by the "Review this game" button shown right after a live game
-    /// finishes (the just-saved game is the most recent one).
-    fn open_review_for_most_recent_game(&mut self) {
         let game_id = self
             .db
             .as_ref()
             .and_then(|db| db.get_recent_games(1).ok())
             .and_then(|g| g.into_iter().next())
             .map(|g| g.id);
+
+        self.abort_local_game();
+
         if let Some(id) = game_id {
             self.start_replay(id);
-            self.home_page = HomePage::Analyze;
+            self.analysis_target_game_id = Some(id);
         }
+        // A fresh game never has saved analysis, but start_replay hydrates
+        // one when it exists; only spawn the worker when it did not.
+        let already_analyzed = matches!(
+            *self.analysis_state.lock().unwrap(),
+            AnalysisState::Complete { game_id: Some(id), .. } if Some(id) == game_id
+        );
+        if !already_analyzed {
+            self.start_analysis(uci_moves, user_color);
+        }
+        self.home_page = HomePage::Analyze;
+        self.state.lock().unwrap().status_message =
+            "Game saved. Reviewing your last game.".to_string();
     }
 
     fn draw_analysis_progress(&self, ui: &mut egui::Ui) {
@@ -5314,6 +5291,9 @@ impl FocalorsApp {
             let mut navigate_to = None;
             let mut resume = false;
             let mut abort = false;
+            let mut want_review = false;
+            // Index 0 is the start-position seed; anything past it is a move.
+            let has_moves = history_len > 1;
 
             hydra_card_frame().show(ui, |ui| {
                 ui.label(
@@ -5391,26 +5371,33 @@ impl FocalorsApp {
                         self.flipped = !self.flipped;
                     }
 
-                    let can_resign = local_game.outcome.is_none() && !searching;
-                    let resign_clicked = ui
-                        .add_enabled_ui(can_resign, |ui| {
-                            ui.add_sized([138.0, 34.0], danger_button("Resign"))
-                                .clicked()
-                        })
-                        .inner;
-                    if resign_clicked {
-                        let mut s = self.state.lock().unwrap();
-                        self.pending_promotion = None;
-                        self.selected_square = None;
-                        self.drag_state = None;
-                        set_local_game_outcome(
-                            &mut s,
-                            GameOutcome::Resignation(local_game.human_color.flip()),
-                        );
-                    }
+                    if local_game.outcome.is_some() {
+                        // The game is over: nothing left to resign or end,
+                        // so the danger buttons give way to a plain exit.
+                        if ui.add_sized([138.0, 34.0], secondary_button("Back to Home")).clicked() {
+                            abort = true;
+                        }
+                    } else {
+                        let resign_clicked = ui
+                            .add_enabled_ui(!searching, |ui| {
+                                ui.add_sized([138.0, 34.0], danger_button("Resign"))
+                                    .clicked()
+                            })
+                            .inner;
+                        if resign_clicked {
+                            let mut s = self.state.lock().unwrap();
+                            self.pending_promotion = None;
+                            self.selected_square = None;
+                            self.drag_state = None;
+                            set_local_game_outcome(
+                                &mut s,
+                                GameOutcome::Resignation(local_game.human_color.flip()),
+                            );
+                        }
 
-                    if ui.add_sized([138.0, 34.0], danger_button("End Game")).clicked() {
-                        abort = true;
+                        if ui.add_sized([138.0, 34.0], danger_button("End Game")).clicked() {
+                            abort = true;
+                        }
                     }
                 });
 
@@ -5483,11 +5470,39 @@ impl FocalorsApp {
                         .strong()
                         .size(15.0),
                 );
+
+                if local_game.outcome.is_some() {
+                    if let Some((old, new)) = self.last_rating_change {
+                        let delta = new - old;
+                        let sign = if delta >= 0 { "+" } else { "" };
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(format!("Rating {old} -> {new} ({sign}{delta})"))
+                                .size(12.0)
+                                .color(hydra_subtle_text()),
+                        );
+                    }
+                    if has_moves {
+                        ui.add_space(10.0);
+                        if ui
+                            .add_sized([ui.available_width(), 34.0], primary_button("Review this game"))
+                            .clicked()
+                        {
+                            want_review = true;
+                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Opens Game Review and runs the analysis.")
+                                .size(11.0)
+                                .color(hydra_subtle_text()),
+                        );
+                    }
+                }
             });
 
-            self.draw_analysis_button(ui);
-
-            if abort {
+            if want_review {
+                self.review_finished_game();
+            } else if abort {
                 self.abort_local_game();
             }
             if let Some(target_index) = navigate_to {
