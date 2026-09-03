@@ -1606,31 +1606,36 @@ impl FocalorsApp {
             return;
         }
 
-        // Naked section header + list; no card wrap.
-        ui.label(egui::RichText::new("Your Openings").size(14.0).strong());
-        ui.add_space(4.0);
-        for (name, total, wins, losses, draws) in &stats {
-            let win_rate = if *total > 0 { *wins as f64 / *total as f64 * 100.0 } else { 0.0 };
-            let color = if win_rate >= 60.0 {
-                hydra_success()
-            } else if win_rate <= 35.0 {
-                hydra_danger()
-            } else {
-                hydra_text()
-            };
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(name).size(11.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{total}g  W{wins}/L{losses}/D{draws}  ({win_rate:.0}%)"
-                        ))
-                        .size(10.0)
-                        .color(color),
-                    );
+        ui.label(hydra_heading("Your Openings", 14.0));
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .id_salt("overview_openings")
+            .max_height(OPENINGS_LIST_MAX_H)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+            for (name, total, wins, losses, draws) in &stats {
+                let win_rate = if *total > 0 { *wins as f64 / *total as f64 * 100.0 } else { 0.0 };
+                let color = if win_rate >= 60.0 {
+                    hydra_success()
+                } else if win_rate <= 35.0 {
+                    hydra_danger()
+                } else {
+                    hydra_text()
+                };
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(name).size(11.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{total}g  W{wins}/L{losses}/D{draws}  ({win_rate:.0}%)"
+                            ))
+                            .size(10.0)
+                            .color(color),
+                        );
+                    });
                 });
+            }
             });
-        }
     }
 
     // ── Eval explanation panel ────────────────────────────────────────
@@ -3607,11 +3612,7 @@ impl FocalorsApp {
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Welcome back, {profile_name}"))
-                            .size(26.0)
-                            .strong(),
-                    );
+                    ui.label(hydra_heading(format!("Welcome back, {profile_name}"), 26.0));
                     ui.label(
                         egui::RichText::new("Train, play, and review chess in one focused workspace.")
                             .size(12.0)
@@ -3711,16 +3712,34 @@ impl FocalorsApp {
 
                 // ── Recent games + Your openings ───────────────────────
                 if has_games {
-                    ui.add_space(14.0);
+                    ui.add_space(SECTION_GAP);
                     let total_w = ui.available_width();
                     if total_w > 760.0 {
-                        ui.columns(2, |cols| {
-                            self.draw_recent_games_compact(&mut cols[0]);
-                            self.draw_opening_stats(&mut cols[1]);
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing.x = CARD_GAP;
+                            ui.columns(2, |cols| {
+                                hydra_card_frame().show(&mut cols[0], |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.set_min_height(OVERVIEW_ROW_H);
+                                    self.draw_recent_games_compact(ui);
+                                });
+                                hydra_card_frame().show(&mut cols[1], |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.set_min_height(OVERVIEW_ROW_H);
+                                    self.draw_opening_stats(ui);
+                                });
+                            });
                         });
                     } else {
-                        self.draw_recent_games_compact(ui);
-                        self.draw_opening_stats(ui);
+                        hydra_card_frame().show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            self.draw_recent_games_compact(ui);
+                        });
+                        ui.add_space(CARD_GAP);
+                        hydra_card_frame().show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            self.draw_opening_stats(ui);
+                        });
                     }
                 }
             }
@@ -3734,9 +3753,7 @@ impl FocalorsApp {
                 } else {
                     hydra_card_frame().show(ui, |ui| {
                         ui.label(
-                            egui::RichText::new("Puzzle Trainer")
-                                .size(16.0)
-                                .strong()
+                            hydra_heading("Puzzle Trainer", 16.0)
                                 .color(hydra_accent()),
                         );
                         ui.add_space(4.0);
@@ -3804,7 +3821,6 @@ impl FocalorsApp {
         } else {
             0
         };
-        let rating_spark: Vec<f64> = rating_history.iter().map(|(_, _, r)| *r as f64).collect();
 
         let (recent_acc, prior_acc, acc_spark) = if accuracy_history.is_empty() {
             (0.0_f64, 0.0_f64, Vec::<f64>::new())
@@ -3833,97 +3849,42 @@ impl FocalorsApp {
             0.0
         };
 
-        // KPI row: no per-tile card chrome. Each column is just a label,
-        // value, and (optionally) sparkline laid out vertically — the page
-        // spacing is what separates them, not boxes.
-        ui.columns(4, |cols| {
-            // RATING
-            {
-                let ui = &mut cols[0];
-                ui.label(
-                    egui::RichText::new("RATING")
-                        .size(10.0).color(hydra_subtle_text()).strong(),
+        // Four equal KPI tiles, identical to the Statistics page so the two
+        // read as one app. Trend lines live on Statistics, not here.
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = CARD_GAP;
+            ui.columns(4, |cols| {
+                hydra_stat_tile(
+                    &mut cols[0],
+                    "RATING",
+                    &format!("{current_rating}"),
+                    (rating_delta != 0)
+                        .then(|| (rating_delta > 0, format!("{}", rating_delta.abs()))),
+                    &format!("{} rated games", rating_history.len()),
                 );
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{current_rating}")).size(24.0).strong());
-                    if rating_delta != 0 {
-                        let color = if rating_delta > 0 { hydra_success() } else { hydra_danger() };
-                        let arrow = if rating_delta > 0 { "▲" } else { "▼" };
-                        ui.label(
-                            egui::RichText::new(format!("{arrow} {}", rating_delta.abs()))
-                                .size(11.0).color(color).strong(),
-                        );
-                    }
-                });
-                if rating_spark.len() >= 2 {
-                    sparkline(ui, "home_rating_kpi", &rating_spark, hydra_accent(), 32.0);
-                }
-            }
-            // ACCURACY
-            {
-                let ui = &mut cols[1];
-                ui.label(
-                    egui::RichText::new("ACCURACY")
-                        .size(10.0).color(hydra_subtle_text()).strong(),
+                hydra_stat_tile(
+                    &mut cols[1],
+                    "ACCURACY",
+                    &if acc_spark.is_empty() { "—".to_owned() } else { format!("{recent_acc:.1}%") },
+                    (!acc_spark.is_empty() && acc_delta.abs() > 0.5)
+                        .then(|| (acc_delta > 0.0, format!("{:.1}", acc_delta.abs()))),
+                    "average of the last 10 analyzed",
                 );
-                ui.horizontal(|ui| {
-                    if acc_spark.is_empty() {
-                        ui.label(egui::RichText::new("—").size(24.0).strong());
-                    } else {
-                        ui.label(
-                            egui::RichText::new(format!("{recent_acc:.1}%"))
-                                .size(24.0).strong().color(accuracy_color(recent_acc)),
-                        );
-                        if acc_delta.abs() > 0.5 {
-                            let color = if acc_delta > 0.0 { hydra_success() } else { hydra_danger() };
-                            let arrow = if acc_delta > 0.0 { "▲" } else { "▼" };
-                            ui.label(
-                                egui::RichText::new(format!("{arrow} {:.1}", acc_delta.abs()))
-                                    .size(11.0).color(color).strong(),
-                            );
-                        }
-                    }
-                });
-                if acc_spark.len() >= 2 {
-                    sparkline(ui, "home_acc_kpi", &acc_spark, hydra_success(), 32.0);
-                }
-            }
-            // WIN RATE
-            {
-                let ui = &mut cols[2];
-                ui.label(
-                    egui::RichText::new("WIN RATE")
-                        .size(10.0).color(hydra_subtle_text()).strong(),
+                hydra_stat_tile(
+                    &mut cols[2],
+                    "WIN RATE",
+                    &if total_games > 0 { format!("{win_rate:.0}%") } else { "—".to_owned() },
+                    None,
+                    &format!("{total_w}W  {total_d}D  {total_l}L"),
                 );
-                if total_games > 0 {
-                    ui.label(egui::RichText::new(format!("{win_rate:.0}%")).size(24.0).strong());
-                } else {
-                    ui.label(egui::RichText::new("—").size(24.0).strong());
-                }
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("{total_w}W  {total_d}D  {total_l}L"))
-                        .size(11.0).color(hydra_subtle_text()),
+                hydra_stat_tile(
+                    &mut cols[3],
+                    "PUZZLES",
+                    &if puzzle_total > 0 { format!("{puzzle_rate:.0}%") } else { "—".to_owned() },
+                    None,
+                    &format!("{puzzle_solved}/{puzzle_total} solved"),
                 );
-            }
-            // PUZZLES
-            {
-                let ui = &mut cols[3];
-                ui.label(
-                    egui::RichText::new("PUZZLES")
-                        .size(10.0).color(hydra_subtle_text()).strong(),
-                );
-                if puzzle_total > 0 {
-                    ui.label(egui::RichText::new(format!("{puzzle_rate:.0}%")).size(24.0).strong());
-                } else {
-                    ui.label(egui::RichText::new("—").size(24.0).strong());
-                }
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("{puzzle_solved}/{puzzle_total} solved"))
-                        .size(11.0).color(hydra_subtle_text()),
-                );
-            }
+            });
         });
     }
 
@@ -3938,11 +3899,8 @@ impl FocalorsApp {
             .cloned()
             .collect();
         let mut replay_id: Option<i64> = None;
-        // Naked section — header + list, no card. The page bg does the
-        // structural work via spacing rather than wrapping each block in a
-        // box.
-        ui.label(egui::RichText::new("Recent Games").size(14.0).strong());
-        ui.add_space(4.0);
+        ui.label(hydra_heading("Recent Games", 14.0));
+        ui.add_space(8.0);
         if games_snapshot.is_empty() {
             ui.label(
                 egui::RichText::new("No games yet — play one to fill this in.")
@@ -3994,9 +3952,7 @@ impl FocalorsApp {
     fn draw_local_setup_card(&mut self, ui: &mut egui::Ui, searching: bool) {
         hydra_card_frame().show(ui, |ui| {
             ui.label(
-                egui::RichText::new("Local Play")
-                    .strong()
-                    .size(16.0)
+                hydra_heading("Local Play", 16.0)
                     .color(hydra_accent()),
             );
             ui.label(
@@ -5761,6 +5717,11 @@ const STAT_TILE_H: f32 = 84.0;
 /// Minimum height of a chart/list card so both cards in a row share a
 /// bottom edge regardless of content.
 const ROW_CARD_H: f32 = 310.0;
+/// Minimum height of the Overview's Recent Games / Your Openings cards.
+const OVERVIEW_ROW_H: f32 = 280.0;
+/// The openings list scrolls past this height so a long list cannot
+/// stretch its card past its row partner.
+const OPENINGS_LIST_MAX_H: f32 = 196.0;
 
 /// One KPI tile: muted caps label, big value, optional colored delta
 /// (`(is_up, text)`), muted sub-line. Fills its column width.
