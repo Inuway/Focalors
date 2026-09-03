@@ -1119,9 +1119,7 @@ impl FocalorsApp {
             .show(ctx, |ui| {
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("Set up your profile")
-                        .size(16.0)
-                        .strong(),
+                    hydra_heading("Set up your profile", 16.0),
                 );
                 ui.add_space(4.0);
                     ui.label("This helps Focalors track your progress over time.");
@@ -1146,7 +1144,7 @@ impl FocalorsApp {
                 ui.add_space(16.0);
                 let name_valid = !self.welcome_name.trim().is_empty();
                 ui.add_enabled_ui(name_valid, |ui| {
-                    if ui.button(egui::RichText::new("Get Started").strong().size(14.0)).clicked() {
+                    if ui.button(hydra_heading("Get Started", 14.0)).clicked() {
                         if let Some(ref db) = self.db {
                             let name = self.welcome_name.trim().to_string();
                             if db.update_profile(&name, self.welcome_rating_choice).is_ok() {
@@ -1564,7 +1562,7 @@ impl FocalorsApp {
         let session_rating_delta = current_rating_p - self.session_start_rating;
         if session_games > 0 || self.session_best_accuracy.is_some() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("This Session").size(13.0).strong());
+                ui.label(hydra_heading("This Session", 13.0));
                 ui.label(
                     egui::RichText::new(format!("· Games: {session_games}"))
                         .size(11.0).color(hydra_subtle_text()),
@@ -1648,13 +1646,11 @@ impl FocalorsApp {
             let total_pawns = breakdown.total as f64 / 100.0;
             let sign = if total_pawns >= 0.0 { "+" } else { "" };
             ui.label(
-                egui::RichText::new(format!("Eval: {sign}{total_pawns:.2}"))
-                    .size(14.0)
-                    .strong()
+                hydra_heading(format!("Eval: {sign}{total_pawns:.2}"), 14.0)
                     .color(if breakdown.total > 50 {
-                        egui::Color32::from_rgb(100, 200, 100)
+                        hydra_success()
                     } else if breakdown.total < -50 {
-                        egui::Color32::from_rgb(220, 100, 80)
+                        hydra_danger()
                     } else {
                         hydra_text()
                     }),
@@ -2081,7 +2077,7 @@ impl FocalorsApp {
 
         hydra_card_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Puzzle Trainer").size(15.0).strong());
+                ui.label(hydra_heading("Puzzle Trainer", 15.0));
                 if let Some(ref ts) = theme_str {
                     let theme = crate::puzzles::PuzzleTheme::from_db_str(ts);
                     ui.separator();
@@ -2267,7 +2263,7 @@ impl FocalorsApp {
     fn draw_game_history(&mut self, ui: &mut egui::Ui) {
         hydra_card_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Recent Games").size(14.0).strong());
+                ui.label(hydra_heading("Recent Games", 14.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Hide").clicked() {
                         self.home_page = HomePage::Overview;
@@ -2301,9 +2297,9 @@ impl FocalorsApp {
                             _ => "?",
                         };
                         let result_color = match game.result.as_str() {
-                            "win" => egui::Color32::from_rgb(100, 200, 100),
-                            "loss" => egui::Color32::from_rgb(200, 100, 100),
-                            _ => egui::Color32::from_rgb(200, 200, 100),
+                            "win" => hydra_success(),
+                            "loss" => hydra_danger(),
+                            _ => class_inaccuracy(),
                         };
                         let reason = game.result_reason.as_deref().unwrap_or("");
                         let tc = game.time_control.as_deref().unwrap_or("");
@@ -2878,7 +2874,7 @@ impl FocalorsApp {
         // ── Empty state — no game loaded ────────────────────────────────
         if self.replay_game.is_none() {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Analyze a Game").size(22.0).strong());
+                ui.label(hydra_heading("Analyze a Game", 22.0));
                 ui.label(
                     egui::RichText::new("Pick a recent game or paste a PGN")
                         .color(hydra_subtle_text()),
@@ -2930,7 +2926,7 @@ impl FocalorsApp {
                 hydra_card_frame().show(&mut cols[0], |ui| {
                     ui.set_min_height(420.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Your Recent Games").size(14.0).strong());
+                        ui.label(hydra_heading("Your Recent Games", 14.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Open History").clicked() {
                                 goto_history = true;
@@ -3011,7 +3007,7 @@ impl FocalorsApp {
                 // ── RIGHT: PGN paste with live validation ──────────────
                 hydra_card_frame().show(&mut cols[1], |ui| {
                     ui.set_min_height(420.0);
-                    ui.label(egui::RichText::new("Import PGN").size(14.0).strong());
+                    ui.label(hydra_heading("Import PGN", 14.0));
                     ui.label(
                         egui::RichText::new("Paste a game's PGN to run a full engine review.")
                             .size(11.0).color(hydra_subtle_text()),
@@ -3232,9 +3228,7 @@ impl FocalorsApp {
         // ── Header strip ────────────────────────────────────────────────
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("Game Review")
-                    .size(18.0)
-                    .strong()
+                hydra_heading("Game Review", 18.0)
                     .color(hydra_accent()),
             );
             ui.label(
@@ -3360,9 +3354,13 @@ impl FocalorsApp {
                         .map(|(i, &e)| [i as f64, (e as f64 / 100.0).clamp(-5.0, 5.0)])
                         .collect();
                     let line = egui_plot::Line::new("eval", egui_plot::PlotPoints::new(points))
-                        .color(hydra_accent());
+                        .color(hydra_accent())
+                        .width(2.0)
+                        .fill(0.0)
+                        .fill_alpha(0.14);
                     let zero = egui_plot::HLine::new("zero", 0.0)
-                        .color(egui::Color32::from_gray(80));
+                        .color(hydra_border())
+                        .width(1.0);
                     egui_plot::Plot::new("analyze_eval_graph")
                         .height(140.0)
                         .include_y(-3.0)
@@ -3370,17 +3368,21 @@ impl FocalorsApp {
                         .allow_drag(false)
                         .allow_zoom(false)
                         .allow_scroll(false)
-                        .show_axes(true)
-                        .y_axis_label("Eval")
+                        .show_x(false)
+                        .show_y(false)
+                        .show_background(false)
+                        .show_grid(false)
+                        .show_axes([false, true])
                         .show(ui, |plot_ui| {
-                            plot_ui.line(line);
                             plot_ui.hline(zero);
+                            plot_ui.line(line);
                             if new_cursor > 0 {
                                 let vline = egui_plot::VLine::new(
                                     "cursor",
                                     new_cursor as f64,
                                 )
-                                .color(egui::Color32::from_rgb(255, 200, 50));
+                                .color(hydra_warning())
+                                .width(1.5);
                                 plot_ui.vline(vline);
                             }
                         });
@@ -3507,9 +3509,7 @@ impl FocalorsApp {
                         // 18px margins.
                         ui.set_max_width(370.0);
                         ui.label(
-                            egui::RichText::new(ma.classification.label())
-                                .size(13.0)
-                                .strong()
+                            hydra_heading(ma.classification.label(), 13.0)
                                 .color(classification_color(ma.classification)),
                         );
                         ui.add_space(2.0);
@@ -4274,9 +4274,7 @@ impl eframe::App for FocalorsApp {
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("FOCALORS")
-                        .strong()
-                        .size(18.0)
+                    hydra_heading("FOCALORS", 18.0)
                         .color(hydra_accent()),
                 );
                 ui.label(
@@ -5249,9 +5247,7 @@ impl FocalorsApp {
 
             hydra_card_frame().show(ui, |ui| {
                 ui.label(
-                    egui::RichText::new("Game Session")
-                        .strong()
-                        .size(16.0)
+                    hydra_heading("Game Session", 16.0)
                         .color(hydra_accent()),
                 );
                 ui.add_space(10.0);
@@ -6624,24 +6620,24 @@ fn format_eval(cp: crate::eval::Score) -> String {
 fn classification_color(class: crate::analysis::MoveClass) -> egui::Color32 {
     use crate::analysis::MoveClass;
     match class {
-        MoveClass::Best | MoveClass::Brilliant => egui::Color32::from_rgb(100, 200, 100),
-        MoveClass::Good | MoveClass::Forced => egui::Color32::from_rgb(180, 180, 180),
-        MoveClass::Book => egui::Color32::from_rgb(170, 130, 90),
-        MoveClass::Inaccuracy => egui::Color32::from_rgb(230, 200, 80),
-        MoveClass::Mistake => egui::Color32::from_rgb(220, 150, 50),
-        MoveClass::Blunder => egui::Color32::from_rgb(220, 80, 80),
+        MoveClass::Best | MoveClass::Brilliant => class_best(),
+        MoveClass::Good | MoveClass::Forced => hydra_subtle_text(),
+        MoveClass::Book => class_book(),
+        MoveClass::Inaccuracy => class_inaccuracy(),
+        MoveClass::Mistake => class_mistake(),
+        MoveClass::Blunder => class_blunder(),
     }
 }
 
 fn accuracy_color(accuracy: f64) -> egui::Color32 {
     if accuracy >= 90.0 {
-        egui::Color32::from_rgb(100, 200, 100)
+        class_best()
     } else if accuracy >= 70.0 {
-        egui::Color32::from_rgb(200, 200, 80)
+        class_inaccuracy()
     } else if accuracy >= 50.0 {
-        egui::Color32::from_rgb(220, 150, 50)
+        class_mistake()
     } else {
-        egui::Color32::from_rgb(220, 80, 80)
+        class_blunder()
     }
 }
 
