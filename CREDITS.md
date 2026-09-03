@@ -20,6 +20,13 @@ license.
 These piece images retain their original CC BY-SA 3.0 license; the rest of
 Focalors is licensed under GPL-3.0-or-later (see [`LICENSE`](LICENSE)).
 
+## Typeface
+
+The UI font is **Inter** by Rasmus Andersson and the Inter Project Authors
+(<https://github.com/rsms/inter>), embedded from
+[`assets/fonts/`](assets/fonts/) (Regular and SemiBold) under the
+[SIL Open Font License 1.1](assets/fonts/LICENSE-Inter.txt).
+
 ## NNUE network
 
 The shipping NNUE network ([`nets/current.nnue`](nets/current.nnue)) is

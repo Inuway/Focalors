@@ -742,6 +742,7 @@ impl FocalorsApp {
 
         // Load piece textures from embedded PNGs
         let ctx = &cc.egui_ctx;
+        install_fonts(ctx);
         let mut piece_textures = HashMap::new();
         piece_textures.insert(
             (Color::White, Piece::King),
@@ -1186,7 +1187,7 @@ impl FocalorsApp {
         let (puzzle_total, puzzle_solved) = db.get_puzzle_counts().ok().unwrap_or((0, 0));
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Statistics").size(22.0).strong());
+            ui.label(hydra_heading("Statistics", 22.0));
             ui.label(egui::RichText::new("Last 50 games").color(hydra_subtle_text()));
         });
         ui.add_space(16.0);
@@ -1238,7 +1239,7 @@ impl FocalorsApp {
             // RATING
             {
                 let ui = &mut cols[0];
-                ui.label(egui::RichText::new("RATING").size(10.0).color(hydra_subtle_text()).strong());
+                ui.label(hydra_heading("RATING", 10.0).color(hydra_subtle_text()));
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(format!("{current_rating}")).size(24.0).strong());
                     if rating_delta != 0 {
@@ -1257,7 +1258,7 @@ impl FocalorsApp {
             // ACCURACY
             {
                 let ui = &mut cols[1];
-                ui.label(egui::RichText::new("ACCURACY").size(10.0).color(hydra_subtle_text()).strong());
+                ui.label(hydra_heading("ACCURACY", 10.0).color(hydra_subtle_text()));
                 ui.horizontal(|ui| {
                     if acc_spark.is_empty() {
                         ui.label(egui::RichText::new("—").size(24.0).strong());
@@ -1283,7 +1284,7 @@ impl FocalorsApp {
             // WIN RATE
             {
                 let ui = &mut cols[2];
-                ui.label(egui::RichText::new("WIN RATE").size(10.0).color(hydra_subtle_text()).strong());
+                ui.label(hydra_heading("WIN RATE", 10.0).color(hydra_subtle_text()));
                 if total_games > 0 {
                     ui.label(egui::RichText::new(format!("{win_rate:.0}%")).size(24.0).strong());
                 } else {
@@ -1298,7 +1299,7 @@ impl FocalorsApp {
             // PUZZLES
             {
                 let ui = &mut cols[3];
-                ui.label(egui::RichText::new("PUZZLES").size(10.0).color(hydra_subtle_text()).strong());
+                ui.label(hydra_heading("PUZZLES", 10.0).color(hydra_subtle_text()));
                 if puzzle_total > 0 {
                     ui.label(egui::RichText::new(format!("{puzzle_rate:.0}%")).size(24.0).strong());
                 } else {
@@ -1318,7 +1319,7 @@ impl FocalorsApp {
             // Rating Over Time
             {
                 let ui = &mut cols[0];
-                ui.label(egui::RichText::new("Rating Over Time").size(14.0).strong());
+                ui.label(hydra_heading("Rating Over Time", 14.0));
                 ui.add_space(6.0);
                 if rating_history.len() >= 2 {
                     let points: Vec<[f64; 2]> = rating_history
@@ -1353,7 +1354,7 @@ impl FocalorsApp {
             // Results
             {
                 let ui = &mut cols[1];
-                ui.label(egui::RichText::new("Results").size(14.0).strong());
+                ui.label(hydra_heading("Results", 14.0));
                 ui.add_space(8.0);
                 if total_games > 0 {
                     let ((ww, wl, wd), (bw, bl, bd)) = by_color;
@@ -1389,7 +1390,7 @@ impl FocalorsApp {
             // Accuracy chart
             {
                 let ui = &mut cols[0];
-                ui.label(egui::RichText::new("Accuracy Trends").size(14.0).strong());
+                ui.label(hydra_heading("Accuracy Trends", 14.0));
                 ui.add_space(6.0);
                 if accuracy_history.len() >= 2 {
                     let acc_points: Vec<[f64; 2]> = accuracy_history
@@ -1445,7 +1446,7 @@ impl FocalorsApp {
             // Phase weakness
             {
                 let ui = &mut cols[1];
-                ui.label(egui::RichText::new("Phase Weakness").size(14.0).strong());
+                ui.label(hydra_heading("Phase Weakness", 14.0));
                 ui.add_space(8.0);
                 let total_phase_errors = phase_o + phase_m + phase_e;
                 if total_phase_errors > 0 {
@@ -1464,7 +1465,7 @@ impl FocalorsApp {
                         };
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(*label).size(12.0).strong());
+                            ui.label(hydra_heading(*label, 12.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(
                                     egui::RichText::new(format!("{count} errors"))
@@ -5903,6 +5904,53 @@ fn draw_engine_settings_controls(
         ui.add(egui::Slider::new(&mut analysis_depth, 1..=30));
         settings.analysis_depth = analysis_depth as u32;
     });
+}
+
+/// Embedded UI typeface: Inter (OFL, see assets/fonts/LICENSE-Inter.txt).
+/// Regular becomes the proportional default. SemiBold is registered as its
+/// own family for headings, because egui's `strong()` only changes the text
+/// color and never the weight, so a weight hierarchy needs a second face.
+const HEADING_FAMILY: &str = "InterSemiBold";
+
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Inter".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Inter-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        HEADING_FAMILY.to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Inter-SemiBold.ttf"
+        ))),
+    );
+    let proportional = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    proportional.insert(0, "Inter".to_owned());
+    // Headings: SemiBold first, then the same fallback chain (emoji, symbols).
+    let mut heading = proportional.clone();
+    heading.insert(0, HEADING_FAMILY.to_owned());
+    fonts
+        .families
+        .insert(egui::FontFamily::Name(HEADING_FAMILY.into()), heading);
+    ctx.set_fonts(fonts);
+}
+
+fn hydra_heading_family() -> egui::FontFamily {
+    egui::FontFamily::Name(HEADING_FAMILY.into())
+}
+
+/// Heading text: Inter SemiBold at `size` in the strong text color. Chain
+/// `.color(..)` after it to override the color (e.g. muted KPI labels).
+fn hydra_heading(text: impl Into<String>, size: f32) -> egui::RichText {
+    egui::RichText::new(text)
+        .size(size)
+        .family(hydra_heading_family())
+        .strong()
 }
 
 fn configure_theme(ctx: &egui::Context, theme: UiTheme) {
