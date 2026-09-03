@@ -2075,83 +2075,111 @@ impl FocalorsApp {
         let mut answer_clicked = false;
         let mut next_clicked = false;
 
-        hydra_card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(hydra_heading("Puzzle Trainer", 15.0));
-                if let Some(ref ts) = theme_str {
-                    let theme = crate::puzzles::PuzzleTheme::from_db_str(ts);
-                    ui.separator();
+        // Same shape as Game Review: the board on the left, a panel card on
+        // the right, the pair centered on wide screens.
+        ui.horizontal_top(|ui| {
+            let gap_w: f32 = 12.0;
+            let right_w: f32 = 380.0;
+            let avail = ui.available_width();
+            let board_w: f32 = (avail - gap_w - right_w).clamp(320.0, 720.0);
+            let total = board_w + gap_w + right_w;
+            if avail > total {
+                ui.add_space((avail - total) / 2.0);
+            }
+
+            ui.vertical(|ui| {
+                ui.set_max_width(board_w);
+                self.draw_board(ui, None);
+            });
+
+            ui.add_space(gap_w);
+
+            ui.vertical(|ui| {
+                ui.set_max_width(right_w);
+                hydra_card_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(hydra_heading("Puzzle Trainer", 15.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Exit").clicked() {
+                                exit_clicked = true;
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        if let Some(ref ts) = theme_str {
+                            let theme = crate::puzzles::PuzzleTheme::from_db_str(ts);
+                            hydra_badge(ui, theme.label(), hydra_accent());
+                        }
+                        if let Some(r) = rating {
+                            ui.label(
+                                egui::RichText::new(format!("Rating {r}"))
+                                    .size(11.0)
+                                    .color(hydra_subtle_text()),
+                            );
+                        }
+                    });
+                    ui.add_space(SECTION_GAP);
+
+                    let stm = if stm_white { "White" } else { "Black" };
+                    ui.label(hydra_heading(format!("{stm} to move"), 14.0));
                     ui.label(
-                        egui::RichText::new(theme.label())
+                        egui::RichText::new("Find the best move on the board.")
                             .size(12.0)
-                            .color(egui::Color32::from_rgb(100, 180, 255)),
-                    );
-                }
-                if let Some(r) = rating {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("Rating: {r}"))
-                            .size(11.0)
                             .color(hydra_subtle_text()),
                     );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Exit").clicked() {
-                        exit_clicked = true;
+
+                    if let Some((ref msg, color, when)) = self.puzzle_message {
+                        if when.elapsed().as_secs() < 5 {
+                            ui.add_space(8.0);
+                            ui.label(hydra_heading(msg.clone(), 13.0).color(color));
+                        }
+                    }
+                    ui.add_space(SECTION_GAP);
+
+                    if !solved && !show_answer {
+                        ui.horizontal(|ui| {
+                            if !show_hint && ui.button("Show Hint").clicked() {
+                                hint_clicked = true;
+                            }
+                            if wrong_attempts >= 1 && ui.button("Show Answer").clicked() {
+                                answer_clicked = true;
+                            }
+                        });
+                    }
+                    if (solved || show_answer)
+                        && ui
+                            .add_sized([ui.available_width(), 38.0], primary_button("Next Puzzle"))
+                            .clicked()
+                    {
+                        next_clicked = true;
+                    }
+
+                    if !theme_stats.is_empty() {
+                        ui.add_space(SECTION_GAP);
+                        ui.label(hydra_heading("SOLVE RATES", 10.0).color(hydra_subtle_text()));
+                        ui.add_space(4.0);
+                        for (theme, attempts, solved) in &theme_stats {
+                            let label = crate::puzzles::PuzzleTheme::from_db_str(theme).label();
+                            let rate = if *attempts > 0 {
+                                format!("{solved}/{attempts} · {:.0}%", *solved as f64 / *attempts as f64 * 100.0)
+                            } else {
+                                "0/0".to_string()
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(label).size(11.0));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(
+                                        egui::RichText::new(rate)
+                                            .size(11.0)
+                                            .color(hydra_subtle_text()),
+                                    );
+                                });
+                            });
+                        }
                     }
                 });
             });
-
-            let stm = if stm_white { "White" } else { "Black" };
-            ui.label(
-                egui::RichText::new(format!("{stm} to move. Find the best move!"))
-                    .size(12.0),
-            );
-
-            if let Some((ref msg, color, when)) = self.puzzle_message {
-                if when.elapsed().as_secs() < 5 {
-                    ui.label(egui::RichText::new(msg).size(13.0).strong().color(color));
-                }
-            }
-
-            if !solved && !show_answer {
-                ui.horizontal(|ui| {
-                    if !show_hint {
-                        if ui.small_button("Show Hint").clicked() {
-                            hint_clicked = true;
-                        }
-                    }
-                    if wrong_attempts >= 1 {
-                        if ui.small_button("Show Answer").clicked() {
-                            answer_clicked = true;
-                        }
-                    }
-                });
-            }
-
-            if solved || show_answer {
-                if ui.button("Next Puzzle").clicked() {
-                    next_clicked = true;
-                }
-            }
-
-            if !theme_stats.is_empty() {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Solve Rates").size(11.0).strong());
-                for (theme, attempts, solved) in &theme_stats {
-                    let label = crate::puzzles::PuzzleTheme::from_db_str(theme).label();
-                    let rate = if *attempts > 0 {
-                        format!("{}/{} ({:.0}%)", solved, attempts, *solved as f64 / *attempts as f64 * 100.0)
-                    } else {
-                        "0/0".to_string()
-                    };
-                    ui.label(
-                        egui::RichText::new(format!("  {label}: {rate}"))
-                            .size(10.0)
-                            .color(hydra_subtle_text()),
-                    );
-                }
-            }
         });
 
         // Process deferred actions
@@ -2165,7 +2193,7 @@ impl FocalorsApp {
                 let theme = crate::puzzles::PuzzleTheme::from_db_str(ts);
                 self.puzzle_message = Some((
                     theme.hint().to_string(),
-                    egui::Color32::from_rgb(200, 200, 100),
+                    hydra_warning(),
                     std::time::Instant::now(),
                 ));
             }
@@ -2176,7 +2204,7 @@ impl FocalorsApp {
         if answer_clicked {
             self.puzzle_message = Some((
                 format!("Answer: {solution_uci}"),
-                egui::Color32::from_rgb(200, 150, 100),
+                class_mistake(),
                 std::time::Instant::now(),
             ));
             if let Some(ref mut t) = self.puzzle_trainer {
@@ -2185,16 +2213,6 @@ impl FocalorsApp {
         }
         if next_clicked {
             self.start_puzzle_trainer();
-        }
-
-        // Render the chess board below the metadata card. The board reads
-        // self.state.board, which load_puzzle / handle_puzzle_move keep in
-        // sync with the puzzle's current position. Skip on the exit frame
-        // since puzzle_trainer was just cleared and the user is leaving
-        // this surface anyway.
-        if !exit_clicked {
-            ui.add_space(12.0);
-            self.draw_board(ui, None);
         }
     }
 
@@ -2220,7 +2238,7 @@ impl FocalorsApp {
             }
             self.puzzle_message = Some((
                 "Correct!".to_string(),
-                egui::Color32::from_rgb(80, 200, 80),
+                hydra_success(),
                 std::time::Instant::now(),
             ));
             let mut board = puzzle_board;
@@ -2251,7 +2269,7 @@ impl FocalorsApp {
             }
             self.puzzle_message = Some((
                 "Not quite. Try again!".to_string(),
-                egui::Color32::from_rgb(220, 100, 80),
+                hydra_danger(),
                 std::time::Instant::now(),
             ));
             self.state.lock().unwrap().board = puzzle_board;
@@ -2261,119 +2279,127 @@ impl FocalorsApp {
     // ── Game history panel ──────────────────────────────────────────────
 
     fn draw_game_history(&mut self, ui: &mut egui::Ui) {
-        hydra_card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(hydra_heading("Recent Games", 14.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Hide").clicked() {
-                        self.home_page = HomePage::Overview;
-                    }
-                });
+        ui.horizontal(|ui| {
+            ui.label(hydra_heading("Game History", 22.0));
+            ui.label(
+                egui::RichText::new(format!("{} games", self.recent_games.len()))
+                    .color(hydra_subtle_text()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Back to Overview").clicked() {
+                    self.home_page = HomePage::Overview;
+                }
             });
-            ui.add_space(4.0);
+        });
+        ui.add_space(SECTION_GAP);
 
-            if self.recent_games.is_empty() {
+        if self.recent_games.is_empty() {
+            hydra_card_frame().show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.label(
                     egui::RichText::new("No games yet. Play your first game!")
                         .size(12.0)
                         .color(hydra_subtle_text()),
                 );
-                return;
-            }
+            });
+            return;
+        }
 
-            // Take a snapshot of game ids and metadata so we can borrow self
-            // mutably for the thumbnail cache inside the loop.
-            let games_snapshot: Vec<crate::db::SavedGame> = self.recent_games.clone();
+        // Snapshot so the thumbnail cache can borrow self mutably in the loop.
+        let games_snapshot: Vec<crate::db::SavedGame> = self.recent_games.clone();
+        let mut replay_id = None;
 
-            let mut replay_id = None;
-            egui::ScrollArea::vertical()
-                .max_height(560.0)
-                .show(ui, |ui| {
-                    for game in &games_snapshot {
-                        let result_icon = match game.result.as_str() {
-                            "win" => "W",
-                            "loss" => "L",
-                            "draw" => "D",
-                            _ => "?",
-                        };
-                        let result_color = match game.result.as_str() {
-                            "win" => hydra_success(),
-                            "loss" => hydra_danger(),
-                            _ => class_inaccuracy(),
-                        };
-                        let reason = game.result_reason.as_deref().unwrap_or("");
-                        let tc = game.time_control.as_deref().unwrap_or("");
-                        let level = game.engine_level.as_deref().unwrap_or("");
-                        let moves = game.move_count.unwrap_or(0);
-                        let date = &game.played_at[..10.min(game.played_at.len())];
+        // As many card columns as fit, one to three.
+        let cols_n = ((ui.available_width() + CARD_GAP) / (HISTORY_TILE_MIN_W + CARD_GAP))
+            .floor()
+            .clamp(1.0, 3.0) as usize;
 
-                        ui.horizontal(|ui| {
-                            // Final-position thumbnail (left of the row)
-                            let thumb = self.thumbnail_for_game(game);
-                            if let Some(ref board) = thumb {
-                                draw_board_thumbnail(ui, board, 120.0);
-                            } else {
-                                ui.allocate_space(egui::vec2(120.0, 120.0));
-                            }
+        egui::ScrollArea::vertical()
+            .id_salt("history_grid")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(CARD_GAP, CARD_GAP);
+                for row in games_snapshot.chunks(cols_n) {
+                    ui.columns(cols_n, |cols| {
+                        for (i, game) in row.iter().enumerate() {
+                            let result_icon = match game.result.as_str() {
+                                "win" => "W",
+                                "loss" => "L",
+                                "draw" => "D",
+                                _ => "?",
+                            };
+                            let result_color = match game.result.as_str() {
+                                "win" => hydra_success(),
+                                "loss" => hydra_danger(),
+                                _ => class_inaccuracy(),
+                            };
+                            let reason = game.result_reason.as_deref().unwrap_or("");
+                            let tc = game.time_control.as_deref().unwrap_or("");
+                            let level = game.engine_level.as_deref().unwrap_or("");
+                            let moves = game.move_count.unwrap_or(0);
+                            let date = &game.played_at[..10.min(game.played_at.len())];
 
-                            ui.add_space(8.0);
-
-                            // Game metadata on the right
-                            ui.vertical(|ui| {
+                            hydra_card_frame().show(&mut cols[i], |ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(result_icon)
-                                            .strong()
-                                            .size(14.0)
-                                            .color(result_color)
-                                            .monospace(),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} as {}",
-                                            date, game.user_color
-                                        ))
-                                        .size(12.0)
-                                        .strong(),
-                                    );
-                                });
-                                if !reason.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(reason)
+                                    let thumb = self.thumbnail_for_game(game);
+                                    if let Some(ref board) = thumb {
+                                        draw_board_thumbnail(ui, board, 120.0);
+                                    } else {
+                                        ui.allocate_space(egui::vec2(120.0, 120.0));
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(" {result_icon} "))
+                                                    .color(hydra_text_on_accent())
+                                                    .background_color(result_color)
+                                                    .strong()
+                                                    .monospace(),
+                                            );
+                                            ui.label(hydra_heading(
+                                                format!("{} as {}", date, game.user_color),
+                                                12.0,
+                                            ));
+                                        });
+                                        if !reason.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(reason)
+                                                    .size(11.0)
+                                                    .color(hydra_subtle_text()),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}{} ({} moves)",
+                                                if tc.is_empty() { "" } else { tc },
+                                                if level.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    format!(" vs {level}")
+                                                },
+                                                moves,
+                                            ))
                                             .size(11.0)
                                             .color(hydra_subtle_text()),
-                                    );
-                                }
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}{} ({} moves)",
-                                        if tc.is_empty() { "" } else { tc },
-                                        if level.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!(" vs {level}")
-                                        },
-                                        moves,
-                                    ))
-                                    .size(11.0)
-                                    .color(hydra_subtle_text()),
-                                );
-                                ui.add_space(4.0);
-                                if ui.small_button("Open in Analyze").clicked() {
-                                    replay_id = Some(game.id);
-                                }
+                                        );
+                                        ui.add_space(6.0);
+                                        if ui.small_button("Open in Analyze").clicked() {
+                                            replay_id = Some(game.id);
+                                        }
+                                    });
+                                });
                             });
-                        });
-                        ui.add_space(4.0);
-                        ui.separator();
-                    }
-                });
+                        }
+                    });
+                }
+            });
 
-            if let Some(id) = replay_id {
-                self.start_replay(id);
-                self.home_page = HomePage::Analyze;
-            }
-        });
+        if let Some(id) = replay_id {
+            self.start_replay(id);
+            self.home_page = HomePage::Analyze;
+        }
     }
 
     /// Get (or compute and cache) the final-position board for a game,
@@ -2921,10 +2947,12 @@ impl FocalorsApp {
                 self.pgn_import_parsed = None;
             }
 
+            ui.spacing_mut().item_spacing.x = CARD_GAP;
             ui.columns(2, |cols| {
                 // ── LEFT: recent games list ────────────────────────────
                 hydra_card_frame().show(&mut cols[0], |ui| {
-                    ui.set_min_height(420.0);
+                    ui.set_min_width(ui.available_width());
+                    ui.set_min_height(ANALYZE_ROW_H);
                     ui.horizontal(|ui| {
                         ui.label(hydra_heading("Your Recent Games", 14.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2948,7 +2976,11 @@ impl FocalorsApp {
                             );
                         });
                     } else {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("analyze_recent")
+                            .max_height(ANALYZE_ROW_H - 96.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
                             for game in &games_snapshot {
                                 let result_color = match game.result.as_str() {
                                     "win" => hydra_success(),
@@ -3006,7 +3038,8 @@ impl FocalorsApp {
 
                 // ── RIGHT: PGN paste with live validation ──────────────
                 hydra_card_frame().show(&mut cols[1], |ui| {
-                    ui.set_min_height(420.0);
+                    ui.set_min_width(ui.available_width());
+                    ui.set_min_height(ANALYZE_ROW_H);
                     ui.label(hydra_heading("Import PGN", 14.0));
                     ui.label(
                         egui::RichText::new("Paste a game's PGN to run a full engine review.")
@@ -3017,7 +3050,7 @@ impl FocalorsApp {
                     ui.add(
                         egui::TextEdit::multiline(&mut self.pgn_import_text)
                             .font(egui::TextStyle::Monospace)
-                            .desired_rows(12)
+                            .desired_rows(18)
                             .desired_width(f32::INFINITY)
                             .hint_text(
                                 "[Event \"…\"]\n[White \"…\"]\n…\n\n1. e4 e5 2. Nf3 Nc6 …",
@@ -3580,10 +3613,7 @@ impl FocalorsApp {
     }
 
     fn draw_idle_home(&mut self, ui: &mut egui::Ui) {
-        let (searching, status_message) = {
-            let state = self.state.lock().unwrap();
-            (state.search_info.searching, state.status_message.clone())
-        };
+        let searching = self.state.lock().unwrap().search_info.searching;
 
         let ctx = ui.ctx().clone();
         let status_label = "Offline local play ready".to_string();
@@ -3685,15 +3715,6 @@ impl FocalorsApp {
                 // ── Local play setup ───────────────────────────────────
                 self.draw_local_setup_card(ui, searching);
 
-                if !status_message.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(status_message)
-                            .size(11.0)
-                            .color(hydra_subtle_text()),
-                    );
-                }
-
                 if let Some((ref msg, when)) = self.auto_adjust_message {
                     if when.elapsed().as_secs() < 8 {
                         ui.add_space(6.0);
@@ -3751,23 +3772,72 @@ impl FocalorsApp {
                 if self.puzzle_trainer.is_some() {
                     self.draw_puzzle_trainer(ui);
                 } else {
+                    let (puzzle_total, puzzle_solved) = self
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.get_puzzle_counts().ok())
+                        .unwrap_or((0, 0));
+                    let weakest_theme = self
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.get_theme_stats().ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(_, attempts, _)| *attempts >= 1)
+                        .min_by(|a, b| {
+                            let ra = a.2 as f64 / a.1 as f64;
+                            let rb = b.2 as f64 / b.1 as f64;
+                            ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(theme, attempts, solved)| {
+                            format!(
+                                "{} ({solved}/{attempts})",
+                                crate::puzzles::PuzzleTheme::from_db_str(&theme).label()
+                            )
+                        });
+                    let solve_rate = if puzzle_total > 0 {
+                        format!("{:.0}% solve rate", puzzle_solved as f64 / puzzle_total as f64 * 100.0)
+                    } else {
+                        "no attempts yet".to_owned()
+                    };
                     hydra_card_frame().show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.label(
                             hydra_heading("Puzzle Trainer", 16.0)
                                 .color(hydra_accent()),
                         );
-                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Drill positions extracted from your own analyzed games: every puzzle is a moment you got wrong.",
+                            )
+                            .size(12.0)
+                            .color(hydra_subtle_text()),
+                        );
+                        ui.add_space(SECTION_GAP);
                         if has_puzzles {
-                            ui.label(
-                                egui::RichText::new(
-                                    "Drill positions saved from your analyzed games.",
-                                )
-                                .size(12.0)
-                                .color(hydra_subtle_text()),
-                            );
-                            ui.add_space(12.0);
+                            ui.columns(3, |cols| {
+                                hydra_fact(
+                                    &mut cols[0],
+                                    "SAVED PUZZLES",
+                                    &format!("{puzzle_total}"),
+                                    "waiting in your queue",
+                                );
+                                hydra_fact(
+                                    &mut cols[1],
+                                    "SOLVED",
+                                    &format!("{puzzle_solved}"),
+                                    &solve_rate,
+                                );
+                                hydra_fact(
+                                    &mut cols[2],
+                                    "WEAKEST THEME",
+                                    weakest_theme.as_deref().unwrap_or("—"),
+                                    "practice this one first",
+                                );
+                            });
+                            ui.add_space(SECTION_GAP);
                             if ui
-                                .add_sized([ui.available_width().min(240.0), 38.0], primary_button("Start Puzzle Session"))
+                                .add_sized([ui.available_width().min(280.0), 40.0], primary_button("Start Puzzle Session"))
                                 .clicked()
                             {
                                 self.start_puzzle_trainer();
@@ -5709,6 +5779,11 @@ const PROGRESS_ROW_H: f32 = 356.0;
 /// The openings list scrolls past this height so a long list cannot
 /// stretch its card past its row partner.
 const OPENINGS_LIST_MAX_H: f32 = 196.0;
+/// Analyze page: both cards share this height; the games list scrolls
+/// inside it and the PGN box grows to fill it.
+const ANALYZE_ROW_H: f32 = 560.0;
+/// Narrowest a History game card may get before the grid drops a column.
+const HISTORY_TILE_MIN_W: f32 = 420.0;
 
 /// One KPI tile: muted caps label, big value, optional colored delta
 /// (`(is_up, text)`), muted sub-line. Fills its column width.
@@ -5773,6 +5848,15 @@ fn chart_legend_row(ui: &mut egui::Ui, entries: &[(egui::Color32, &str)]) {
             }
         }
     });
+}
+
+/// A labelled fact without card chrome: muted caps label, value, muted
+/// sub-line. For fact rows inside a card (no nested cards).
+fn hydra_fact(ui: &mut egui::Ui, label: &str, value: &str, sub: &str) {
+    ui.label(hydra_heading(label, 10.0).color(hydra_subtle_text()));
+    ui.add_space(2.0);
+    ui.label(hydra_heading(value, 20.0));
+    ui.label(egui::RichText::new(sub).size(11.0).color(hydra_subtle_text()));
 }
 
 fn hydra_card_frame() -> egui::Frame {
