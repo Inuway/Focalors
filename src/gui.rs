@@ -1425,7 +1425,7 @@ impl FocalorsApp {
                             .show_y(false)
                             .show_background(false)
                             .show_grid([false, true])
-                            .y_grid_spacer(egui_plot::uniform_grid_spacer(|_| [10.0, 25.0, 50.0]))
+                            .y_grid_spacer(egui_plot::uniform_grid_spacer(|_| [25.0, 50.0, 100.0]))
                             .show(ui, |plot_ui| {
                                 plot_ui.hline(best_line);
                                 plot_ui.line(line_acc);
@@ -1458,14 +1458,16 @@ impl FocalorsApp {
                         ];
                         for (label, count, sub) in &phases {
                             let pct = *count as f64 / total_phase_errors as f64;
-                            let color = if *count == max_count {
-                                class_blunder()
-                            } else {
-                                hydra_accent()
-                            };
+                            // Bars share one hue so length is the only signal;
+                            // the weakest phase is named instead of recolored.
+                            let color = hydra_accent();
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 ui.label(hydra_heading(*label, 12.0));
+                                if *count == max_count {
+                                    ui.add_space(4.0);
+                                    hydra_badge(ui, "WEAKEST", hydra_danger());
+                                }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     ui.label(
                                         egui::RichText::new(format!("{count} errors"))
@@ -5794,12 +5796,33 @@ fn hydra_stat_tile(
 
 /// Inline chart legend: a colored dot and muted label per series.
 fn chart_legend_row(ui: &mut egui::Ui, entries: &[(egui::Color32, &str)]) {
+    // `horizontal` keeps the parent's direction, so inside a right-to-left
+    // header the pieces are placed right-to-left too: emit them reversed
+    // there so the dot still reads before its label and entries keep order.
+    let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
+    let dot = |ui: &mut egui::Ui, color: egui::Color32| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, color);
+    };
+    let text = |ui: &mut egui::Ui, label: &str| {
+        ui.label(egui::RichText::new(label).size(10.0).color(hydra_subtle_text()));
+    };
     ui.horizontal(|ui| {
-        for (color, label) in entries {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 4.0, *color);
-            ui.label(egui::RichText::new(*label).size(10.0).color(hydra_subtle_text()));
-            ui.add_space(6.0);
+        let ordered: Vec<&(egui::Color32, &str)> = if rtl {
+            entries.iter().rev().collect()
+        } else {
+            entries.iter().collect()
+        };
+        for (color, label) in ordered {
+            if rtl {
+                ui.add_space(6.0);
+                text(ui, label);
+                dot(ui, *color);
+            } else {
+                dot(ui, *color);
+                text(ui, label);
+                ui.add_space(6.0);
+            }
         }
     });
 }
