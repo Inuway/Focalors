@@ -1288,19 +1288,29 @@ impl FocalorsApp {
                             .enumerate()
                             .map(|(i, (_, _, after))| [i as f64 + 1.0, *after as f64])
                             .collect();
+                        let lo = rating_history.iter().map(|(_, _, r)| *r).min().unwrap_or(1200);
+                        let hi = rating_history.iter().map(|(_, _, r)| *r).max().unwrap_or(1200);
+                        // Pad relative to the actual spread so small swings are
+                        // still readable instead of a flat line in a huge range.
+                        let pad = ((hi - lo) as f64 * 0.35).max(25.0);
+                        let floor = lo as f64 - pad;
                         let line = egui_plot::Line::new("rating", egui_plot::PlotPoints::new(points))
-                            .color(hydra_accent());
-                        let min_r = rating_history.iter().map(|(_, _, r)| *r).min().unwrap_or(800) - 50;
-                        let max_r = rating_history.iter().map(|(_, _, r)| *r).max().unwrap_or(1600) + 50;
+                            .color(hydra_accent())
+                            .width(2.0)
+                            .fill(floor as f32)
+                            .fill_alpha(0.14);
                         egui_plot::Plot::new("rating_chart")
-                            .height(190.0)
-                            .include_y(min_r as f64)
-                            .include_y(max_r as f64)
+                            .height(230.0)
+                            .include_y(floor)
+                            .include_y(hi as f64 + pad)
                             .allow_drag(false)
                             .allow_zoom(false)
                             .allow_scroll(false)
-                            .show_axes(true)
-                            .y_axis_label("Elo")
+                            .show_x(false)
+                            .show_y(false)
+                            .show_background(false)
+                            .show_grid([false, true])
+                            .y_grid_spacer(egui_plot::uniform_grid_spacer(|_| [25.0, 50.0, 100.0]))
                             .show(ui, |plot_ui| {
                                 plot_ui.line(line);
                             });
@@ -1354,7 +1364,15 @@ impl FocalorsApp {
                 hydra_card_frame().show(&mut cols[0], |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.set_min_height(ROW_CARD_H);
-                    ui.label(hydra_heading("Accuracy Trends", 14.0));
+                    ui.horizontal(|ui| {
+                        ui.label(hydra_heading("Accuracy Trends", 14.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            chart_legend_row(
+                                ui,
+                                &[(hydra_subtle_text(), "per game"), (hydra_accent(), "5-game avg")],
+                            );
+                        });
+                    });
                     ui.add_space(6.0);
                     if accuracy_history.len() >= 2 {
                         let acc_points: Vec<[f64; 2]> = accuracy_history
@@ -1372,33 +1390,51 @@ impl FocalorsApp {
                                 [(i + 1) as f64, avg]
                             })
                             .collect();
+                        let best = accuracy_history
+                            .iter()
+                            .map(|(_, a)| *a)
+                            .fold(f64::MIN, f64::max);
+                        let lowest = accuracy_history
+                            .iter()
+                            .map(|(_, a)| *a)
+                            .fold(f64::MAX, f64::min);
+                        // Floor at the nearest 10 below the worst game (never
+                        // below 0) so the lines use the card instead of
+                        // hugging the top of a fixed 0-100 box.
+                        let floor = ((lowest / 10.0).floor() * 10.0 - 10.0).max(0.0);
                         let line_acc = egui_plot::Line::new("accuracy", egui_plot::PlotPoints::new(acc_points))
-                            .color(egui::Color32::from_rgb(100, 180, 255))
-                            .name("Per game");
+                            .color(hydra_subtle_text())
+                            .width(1.0);
                         let line_avg = egui_plot::Line::new("rolling_avg", egui_plot::PlotPoints::new(rolling))
-                            .color(egui::Color32::from_rgb(255, 180, 50))
-                            .name("5-game avg");
+                            .color(hydra_accent())
+                            .width(2.0)
+                            .fill(floor as f32)
+                            .fill_alpha(0.14);
+                        let best_line = egui_plot::HLine::new("best", best)
+                            .color(class_best())
+                            .width(1.0)
+                            .style(egui_plot::LineStyle::Dashed { length: 6.0 });
                         egui_plot::Plot::new("accuracy_chart")
-                            .height(170.0)
-                            .include_y(0.0)
+                            .height(210.0)
+                            .include_y(floor)
                             .include_y(100.0)
                             .allow_drag(false)
                             .allow_zoom(false)
                             .allow_scroll(false)
-                            .show_axes(true)
-                            .legend(egui_plot::Legend::default())
+                            .show_x(false)
+                            .show_y(false)
+                            .show_background(false)
+                            .show_grid([false, true])
+                            .y_grid_spacer(egui_plot::uniform_grid_spacer(|_| [10.0, 25.0, 50.0]))
                             .show(ui, |plot_ui| {
+                                plot_ui.hline(best_line);
                                 plot_ui.line(line_acc);
                                 plot_ui.line(line_avg);
                             });
-                        if let Some(best) = accuracy_history
-                            .iter().map(|(_, a)| *a).max_by(|a, b| a.partial_cmp(b).unwrap())
-                        {
-                            ui.label(
-                                egui::RichText::new(format!("Personal best: {best:.1}%"))
-                                    .size(11.0).color(class_best()),
-                            );
-                        }
+                        ui.label(
+                            egui::RichText::new(format!("Personal best: {best:.1}%"))
+                                .size(11.0).color(hydra_subtle_text()),
+                        );
                     } else {
                         ui.add_space(80.0);
                         ui.label(
@@ -1467,53 +1503,56 @@ impl FocalorsApp {
 
         // ── Row 4: Puzzle theme heatmap (naked section) ────────────────
         if !theme_stats.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label(hydra_heading("Puzzle Themes", 14.0));
-                ui.label(
-                    egui::RichText::new("(sorted weakest first)")
-                        .size(10.0).color(hydra_subtle_text()),
-                );
-            });
-            ui.add_space(8.0);
-            let mut themes: Vec<_> = theme_stats.iter().filter(|(_, a, _)| *a >= 1).collect();
-            themes.sort_by(|a, b| {
-                let ra = a.2 as f64 / a.1 as f64;
-                let rb = b.2 as f64 / b.1 as f64;
-                ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            ui.horizontal_wrapped(|ui| {
-                for (theme, attempts, solved) in &themes {
-                    let rate = *solved as f64 / *attempts as f64;
-                    let color = if rate < 0.4 {
-                        class_blunder()
-                    } else if rate < 0.6 {
-                        class_mistake()
-                    } else if rate < 0.75 {
-                        class_inaccuracy()
-                    } else {
-                        class_best()
-                    };
-                    let label = crate::puzzles::PuzzleTheme::from_db_str(theme).label();
-                    let tile = egui::Frame::new()
-                        .fill(color.gamma_multiply(0.18))
-                        .stroke(egui::Stroke::new(1.0_f32, color))
-                        .corner_radius(6)
-                        .inner_margin(egui::Margin::same(8));
-                    tile.show(ui, |ui| {
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(label).size(11.0).strong());
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{:.0}% · {solved}/{attempts}",
-                                    rate * 100.0
-                                ))
-                                .size(10.0).color(hydra_subtle_text()),
-                            );
+            hydra_card_frame().show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(hydra_heading("Puzzle Themes", 14.0));
+                    ui.label(
+                        egui::RichText::new("(sorted weakest first)")
+                            .size(10.0).color(hydra_subtle_text()),
+                    );
+                });
+                ui.add_space(8.0);
+                let mut themes: Vec<_> = theme_stats.iter().filter(|(_, a, _)| *a >= 1).collect();
+                themes.sort_by(|a, b| {
+                    let ra = a.2 as f64 / a.1 as f64;
+                    let rb = b.2 as f64 / b.1 as f64;
+                    ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for (theme, attempts, solved) in &themes {
+                        let rate = *solved as f64 / *attempts as f64;
+                        let color = if rate < 0.4 {
+                            class_blunder()
+                        } else if rate < 0.6 {
+                            class_mistake()
+                        } else if rate < 0.75 {
+                            class_inaccuracy()
+                        } else {
+                            class_best()
+                        };
+                        let label = crate::puzzles::PuzzleTheme::from_db_str(theme).label();
+                        let tile = egui::Frame::new()
+                            .fill(color.gamma_multiply(0.18))
+                            .stroke(egui::Stroke::new(1.0_f32, color))
+                            .corner_radius(6)
+                            .inner_margin(egui::Margin::same(8));
+                        tile.show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(label).size(11.0).strong());
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{:.0}% · {solved}/{attempts}",
+                                        rate * 100.0
+                                    ))
+                                    .size(10.0).color(hydra_subtle_text()),
+                                );
+                            });
                         });
-                    });
-                }
+                    }
+                });
             });
-            subtle_row_separator(ui);
+            ui.add_space(SECTION_GAP);
         }
 
         // ── Session Summary (compact naked footer) ────────────────────
@@ -5719,7 +5758,7 @@ const SECTION_GAP: f32 = 16.0;
 const STAT_TILE_H: f32 = 84.0;
 /// Minimum height of a chart/list card so both cards in a row share a
 /// bottom edge regardless of content.
-const ROW_CARD_H: f32 = 250.0;
+const ROW_CARD_H: f32 = 310.0;
 
 /// One KPI tile: muted caps label, big value, optional colored delta
 /// (`(is_up, text)`), muted sub-line. Fills its column width.
@@ -5750,6 +5789,18 @@ fn hydra_stat_tile(
         });
         ui.add_space(2.0);
         ui.label(egui::RichText::new(sub).size(11.0).color(hydra_subtle_text()));
+    });
+}
+
+/// Inline chart legend: a colored dot and muted label per series.
+fn chart_legend_row(ui: &mut egui::Ui, entries: &[(egui::Color32, &str)]) {
+    ui.horizontal(|ui| {
+        for (color, label) in entries {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 4.0, *color);
+            ui.label(egui::RichText::new(*label).size(10.0).color(hydra_subtle_text()));
+            ui.add_space(6.0);
+        }
     });
 }
 
