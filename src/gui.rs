@@ -1204,7 +1204,6 @@ impl FocalorsApp {
         } else {
             0
         };
-        let rating_spark: Vec<f64> = rating_history.iter().map(|(_, _, r)| *r as f64).collect();
 
         let (recent_acc, prior_acc, acc_spark) = if accuracy_history.is_empty() {
             (0.0_f64, 0.0_f64, Vec::<f64>::new())
@@ -1233,277 +1232,243 @@ impl FocalorsApp {
             0.0
         };
 
-        // KPI row — no per-tile cards. Just naked stat columns; the page
-        // spacing separates them.
-        ui.columns(4, |cols| {
-            // RATING
-            {
-                let ui = &mut cols[0];
-                ui.label(hydra_heading("RATING", 10.0).color(hydra_subtle_text()));
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{current_rating}")).size(24.0).strong());
-                    if rating_delta != 0 {
-                        let color = if rating_delta > 0 { hydra_success() } else { hydra_danger() };
-                        let arrow = if rating_delta > 0 { "▲" } else { "▼" };
-                        ui.label(
-                            egui::RichText::new(format!("{arrow} {}", rating_delta.abs()))
-                                .size(11.0).color(color).strong(),
-                        );
-                    }
-                });
-                if rating_spark.len() >= 2 {
-                    sparkline(ui, "rating_kpi", &rating_spark, hydra_accent(), 32.0);
-                }
-            }
-            // ACCURACY
-            {
-                let ui = &mut cols[1];
-                ui.label(hydra_heading("ACCURACY", 10.0).color(hydra_subtle_text()));
-                ui.horizontal(|ui| {
-                    if acc_spark.is_empty() {
-                        ui.label(egui::RichText::new("—").size(24.0).strong());
-                    } else {
-                        ui.label(
-                            egui::RichText::new(format!("{recent_acc:.1}%"))
-                                .size(24.0).strong().color(accuracy_color(recent_acc)),
-                        );
-                        if acc_delta.abs() > 0.5 {
-                            let color = if acc_delta > 0.0 { hydra_success() } else { hydra_danger() };
-                            let arrow = if acc_delta > 0.0 { "▲" } else { "▼" };
-                            ui.label(
-                                egui::RichText::new(format!("{arrow} {:.1}", acc_delta.abs()))
-                                    .size(11.0).color(color).strong(),
-                            );
-                        }
-                    }
-                });
-                if acc_spark.len() >= 2 {
-                    sparkline(ui, "acc_kpi", &acc_spark, hydra_success(), 32.0);
-                }
-            }
-            // WIN RATE
-            {
-                let ui = &mut cols[2];
-                ui.label(hydra_heading("WIN RATE", 10.0).color(hydra_subtle_text()));
-                if total_games > 0 {
-                    ui.label(egui::RichText::new(format!("{win_rate:.0}%")).size(24.0).strong());
-                } else {
-                    ui.label(egui::RichText::new("—").size(24.0).strong());
-                }
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("{total_w}W  {total_d}D  {total_l}L"))
-                        .size(11.0).color(hydra_subtle_text()),
+        // ── Row 1: four equal KPI tiles ──────────────────────────────
+        // Every tile gets the same treatment (label, value, delta, sub-line);
+        // the trend lines live in the charts below instead of being
+        // duplicated as sparklines here.
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = CARD_GAP;
+            ui.columns(4, |cols| {
+                hydra_stat_tile(
+                    &mut cols[0],
+                    "RATING",
+                    &format!("{current_rating}"),
+                    (rating_delta != 0)
+                        .then(|| (rating_delta > 0, format!("{}", rating_delta.abs()))),
+                    &format!("{} rated games", rating_history.len()),
                 );
-            }
-            // PUZZLES
-            {
-                let ui = &mut cols[3];
-                ui.label(hydra_heading("PUZZLES", 10.0).color(hydra_subtle_text()));
-                if puzzle_total > 0 {
-                    ui.label(egui::RichText::new(format!("{puzzle_rate:.0}%")).size(24.0).strong());
-                } else {
-                    ui.label(egui::RichText::new("—").size(24.0).strong());
-                }
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("{puzzle_solved}/{puzzle_total} solved"))
-                        .size(11.0).color(hydra_subtle_text()),
+                hydra_stat_tile(
+                    &mut cols[1],
+                    "ACCURACY",
+                    &if acc_spark.is_empty() { "—".to_owned() } else { format!("{recent_acc:.1}%") },
+                    (!acc_spark.is_empty() && acc_delta.abs() > 0.5)
+                        .then(|| (acc_delta > 0.0, format!("{:.1}", acc_delta.abs()))),
+                    "average of the last 10 analyzed",
                 );
-            }
+                hydra_stat_tile(
+                    &mut cols[2],
+                    "WIN RATE",
+                    &if total_games > 0 { format!("{win_rate:.0}%") } else { "—".to_owned() },
+                    None,
+                    &format!("{total_w}W  {total_d}D  {total_l}L"),
+                );
+                hydra_stat_tile(
+                    &mut cols[3],
+                    "PUZZLES",
+                    &if puzzle_total > 0 { format!("{puzzle_rate:.0}%") } else { "—".to_owned() },
+                    None,
+                    &format!("{puzzle_solved}/{puzzle_total} solved"),
+                );
+            });
         });
-        subtle_row_separator(ui);
+        ui.add_space(SECTION_GAP);
 
-        // ── Row 2: Rating chart + Results (naked sections) ────────────
-        ui.columns(2, |cols| {
-            // Rating Over Time
-            {
-                let ui = &mut cols[0];
-                ui.label(hydra_heading("Rating Over Time", 14.0));
-                ui.add_space(6.0);
-                if rating_history.len() >= 2 {
-                    let points: Vec<[f64; 2]> = rating_history
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (_, _, after))| [i as f64 + 1.0, *after as f64])
-                        .collect();
-                    let line = egui_plot::Line::new("rating", egui_plot::PlotPoints::new(points))
-                        .color(hydra_accent());
-                    let min_r = rating_history.iter().map(|(_, _, r)| *r).min().unwrap_or(800) - 50;
-                    let max_r = rating_history.iter().map(|(_, _, r)| *r).max().unwrap_or(1600) + 50;
-                    egui_plot::Plot::new("rating_chart")
-                        .height(190.0)
-                        .include_y(min_r as f64)
-                        .include_y(max_r as f64)
-                        .allow_drag(false)
-                        .allow_zoom(false)
-                        .allow_scroll(false)
-                        .show_axes(true)
-                        .y_axis_label("Elo")
-                        .show(ui, |plot_ui| {
-                            plot_ui.line(line);
-                        });
-                } else {
-                    ui.add_space(80.0);
-                    ui.label(
-                        egui::RichText::new("Play a few games to see your rating trend.")
-                            .color(hydra_subtle_text()),
-                    );
-                }
-            }
-            // Results
-            {
-                let ui = &mut cols[1];
-                ui.label(hydra_heading("Results", 14.0));
-                ui.add_space(8.0);
-                if total_games > 0 {
-                    let ((ww, wl, wd), (bw, bl, bd)) = by_color;
-                    draw_result_bar(ui, "Overall", total_w as u32, total_l as u32, total_d as u32);
-                    if (ww + wl + wd) > 0 {
-                        draw_result_bar(ui, "As White", ww as u32, wl as u32, wd as u32);
-                    }
-                    if (bw + bl + bd) > 0 {
-                        draw_result_bar(ui, "As Black", bw as u32, bl as u32, bd as u32);
-                    }
-                    if !by_tc.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("By Time Control")
-                                .size(11.0).color(hydra_subtle_text()).strong(),
-                        );
-                        for (tc, w, l, d) in &by_tc {
-                            draw_result_bar(ui, tc, *w as u32, *l as u32, *d as u32);
-                        }
-                    }
-                } else {
-                    ui.add_space(80.0);
-                    ui.label(
-                        egui::RichText::new("No completed games yet.").color(hydra_subtle_text()),
-                    );
-                }
-            }
-        });
-        subtle_row_separator(ui);
-
-        // ── Row 3: Accuracy chart + Phase weakness (naked sections) ───
-        ui.columns(2, |cols| {
-            // Accuracy chart
-            {
-                let ui = &mut cols[0];
-                ui.label(hydra_heading("Accuracy Trends", 14.0));
-                ui.add_space(6.0);
-                if accuracy_history.len() >= 2 {
-                    let acc_points: Vec<[f64; 2]> = accuracy_history
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (_, acc))| [i as f64 + 1.0, *acc])
-                        .collect();
-                    let rolling: Vec<[f64; 2]> = accuracy_history
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| {
-                            let start = i.saturating_sub(4);
-                            let window = &accuracy_history[start..=i];
-                            let avg = window.iter().map(|(_, a)| a).sum::<f64>() / window.len() as f64;
-                            [(i + 1) as f64, avg]
-                        })
-                        .collect();
-                    let line_acc = egui_plot::Line::new("accuracy", egui_plot::PlotPoints::new(acc_points))
-                        .color(egui::Color32::from_rgb(100, 180, 255))
-                        .name("Per game");
-                    let line_avg = egui_plot::Line::new("rolling_avg", egui_plot::PlotPoints::new(rolling))
-                        .color(egui::Color32::from_rgb(255, 180, 50))
-                        .name("5-game avg");
-                    egui_plot::Plot::new("accuracy_chart")
-                        .height(170.0)
-                        .include_y(0.0)
-                        .include_y(100.0)
-                        .allow_drag(false)
-                        .allow_zoom(false)
-                        .allow_scroll(false)
-                        .show_axes(true)
-                        .legend(egui_plot::Legend::default())
-                        .show(ui, |plot_ui| {
-                            plot_ui.line(line_acc);
-                            plot_ui.line(line_avg);
-                        });
-                    if let Some(best) = accuracy_history
-                        .iter().map(|(_, a)| *a).max_by(|a, b| a.partial_cmp(b).unwrap())
-                    {
-                        ui.label(
-                            egui::RichText::new(format!("Personal best: {best:.1}%"))
-                                .size(11.0).color(class_best()),
-                        );
-                    }
-                } else {
-                    ui.add_space(80.0);
-                    ui.label(
-                        egui::RichText::new("Analyze games to see accuracy trends.")
-                            .color(hydra_subtle_text()),
-                    );
-                }
-            }
-            // Phase weakness
-            {
-                let ui = &mut cols[1];
-                ui.label(hydra_heading("Phase Weakness", 14.0));
-                ui.add_space(8.0);
-                let total_phase_errors = phase_o + phase_m + phase_e;
-                if total_phase_errors > 0 {
-                    let max_count = phase_o.max(phase_m).max(phase_e);
-                    let phases = [
-                        ("Opening", phase_o, "moves 1-15"),
-                        ("Middlegame", phase_m, "moves 16-35"),
-                        ("Endgame", phase_e, "moves 36+"),
-                    ];
-                    for (label, count, sub) in &phases {
-                        let pct = *count as f64 / total_phase_errors as f64;
-                        let color = if *count == max_count {
-                            class_blunder()
-                        } else {
-                            hydra_accent()
-                        };
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(hydra_heading(*label, 12.0));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{count} errors"))
-                                        .size(11.0).color(hydra_subtle_text()),
-                                );
+        // ── Row 2: Rating chart + Results ────────────────────────────
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = CARD_GAP;
+            ui.columns(2, |cols| {
+                hydra_card_frame().show(&mut cols[0], |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.set_min_height(ROW_CARD_H);
+                    ui.label(hydra_heading("Rating Over Time", 14.0));
+                    ui.add_space(6.0);
+                    if rating_history.len() >= 2 {
+                        let points: Vec<[f64; 2]> = rating_history
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (_, _, after))| [i as f64 + 1.0, *after as f64])
+                            .collect();
+                        let line = egui_plot::Line::new("rating", egui_plot::PlotPoints::new(points))
+                            .color(hydra_accent());
+                        let min_r = rating_history.iter().map(|(_, _, r)| *r).min().unwrap_or(800) - 50;
+                        let max_r = rating_history.iter().map(|(_, _, r)| *r).max().unwrap_or(1600) + 50;
+                        egui_plot::Plot::new("rating_chart")
+                            .height(190.0)
+                            .include_y(min_r as f64)
+                            .include_y(max_r as f64)
+                            .allow_drag(false)
+                            .allow_zoom(false)
+                            .allow_scroll(false)
+                            .show_axes(true)
+                            .y_axis_label("Elo")
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(line);
                             });
-                        });
-                        ui.label(egui::RichText::new(*sub).size(10.0).color(hydra_subtle_text()));
-                        let bar_w = ui.available_width();
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(bar_w, 10.0),
-                            egui::Sense::hover(),
+                    } else {
+                        ui.add_space(80.0);
+                        ui.label(
+                            egui::RichText::new("Play a few games to see your rating trend.")
+                                .color(hydra_subtle_text()),
                         );
-                        ui.painter().rect_filled(rect, 5.0, hydra_panel_alt_fill());
-                        let fill_w = bar_w * pct as f32;
-                        if fill_w > 0.0 {
-                            let fill_rect = egui::Rect::from_min_size(
-                                rect.min,
-                                egui::vec2(fill_w, 10.0),
-                            );
-                            ui.painter().rect_filled(fill_rect, 5.0, color);
-                        }
                     }
-                } else {
-                    ui.add_space(80.0);
-                    ui.label(
-                        egui::RichText::new("Analyze games to see phase weaknesses.")
-                            .color(hydra_subtle_text()),
-                    );
-                }
-            }
+                });
+                hydra_card_frame().show(&mut cols[1], |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.set_min_height(ROW_CARD_H);
+                    ui.label(hydra_heading("Results", 14.0));
+                    ui.add_space(8.0);
+                    if total_games > 0 {
+                        let ((ww, wl, wd), (bw, bl, bd)) = by_color;
+                        draw_result_bar(ui, "Overall", total_w as u32, total_l as u32, total_d as u32);
+                        // Per-color bars only add information once both colors
+                        // have games; otherwise they just repeat "Overall".
+                        if (ww + wl + wd) > 0 && (bw + bl + bd) > 0 {
+                            draw_result_bar(ui, "As White", ww as u32, wl as u32, wd as u32);
+                            draw_result_bar(ui, "As Black", bw as u32, bl as u32, bd as u32);
+                        }
+                        let tc_games: i64 = by_tc.iter().map(|(_, w, l, d)| (*w + *l + *d) as i64).sum();
+                        if !by_tc.is_empty() && (by_tc.len() > 1 || tc_games != total_games as i64) {
+                            ui.add_space(8.0);
+                            ui.label(
+                                hydra_heading("By Time Control", 11.0).color(hydra_subtle_text()),
+                            );
+                            for (tc, w, l, d) in &by_tc {
+                                draw_result_bar(ui, tc, *w as u32, *l as u32, *d as u32);
+                            }
+                        }
+                    } else {
+                        ui.add_space(80.0);
+                        ui.label(
+                            egui::RichText::new("No completed games yet.").color(hydra_subtle_text()),
+                        );
+                    }
+                });
+            });
         });
-        subtle_row_separator(ui);
+        ui.add_space(SECTION_GAP);
+
+        // ── Row 3: Accuracy chart + Phase weakness ───────────────────
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = CARD_GAP;
+            ui.columns(2, |cols| {
+                hydra_card_frame().show(&mut cols[0], |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.set_min_height(ROW_CARD_H);
+                    ui.label(hydra_heading("Accuracy Trends", 14.0));
+                    ui.add_space(6.0);
+                    if accuracy_history.len() >= 2 {
+                        let acc_points: Vec<[f64; 2]> = accuracy_history
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (_, acc))| [i as f64 + 1.0, *acc])
+                            .collect();
+                        let rolling: Vec<[f64; 2]> = accuracy_history
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| {
+                                let start = i.saturating_sub(4);
+                                let window = &accuracy_history[start..=i];
+                                let avg = window.iter().map(|(_, a)| a).sum::<f64>() / window.len() as f64;
+                                [(i + 1) as f64, avg]
+                            })
+                            .collect();
+                        let line_acc = egui_plot::Line::new("accuracy", egui_plot::PlotPoints::new(acc_points))
+                            .color(egui::Color32::from_rgb(100, 180, 255))
+                            .name("Per game");
+                        let line_avg = egui_plot::Line::new("rolling_avg", egui_plot::PlotPoints::new(rolling))
+                            .color(egui::Color32::from_rgb(255, 180, 50))
+                            .name("5-game avg");
+                        egui_plot::Plot::new("accuracy_chart")
+                            .height(170.0)
+                            .include_y(0.0)
+                            .include_y(100.0)
+                            .allow_drag(false)
+                            .allow_zoom(false)
+                            .allow_scroll(false)
+                            .show_axes(true)
+                            .legend(egui_plot::Legend::default())
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(line_acc);
+                                plot_ui.line(line_avg);
+                            });
+                        if let Some(best) = accuracy_history
+                            .iter().map(|(_, a)| *a).max_by(|a, b| a.partial_cmp(b).unwrap())
+                        {
+                            ui.label(
+                                egui::RichText::new(format!("Personal best: {best:.1}%"))
+                                    .size(11.0).color(class_best()),
+                            );
+                        }
+                    } else {
+                        ui.add_space(80.0);
+                        ui.label(
+                            egui::RichText::new("Analyze games to see accuracy trends.")
+                                .color(hydra_subtle_text()),
+                        );
+                    }
+                });
+                hydra_card_frame().show(&mut cols[1], |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.set_min_height(ROW_CARD_H);
+                    ui.label(hydra_heading("Phase Weakness", 14.0));
+                    ui.add_space(8.0);
+                    let total_phase_errors = phase_o + phase_m + phase_e;
+                    if total_phase_errors > 0 {
+                        let max_count = phase_o.max(phase_m).max(phase_e);
+                        let phases = [
+                            ("Opening", phase_o, "moves 1-15"),
+                            ("Middlegame", phase_m, "moves 16-35"),
+                            ("Endgame", phase_e, "moves 36+"),
+                        ];
+                        for (label, count, sub) in &phases {
+                            let pct = *count as f64 / total_phase_errors as f64;
+                            let color = if *count == max_count {
+                                class_blunder()
+                            } else {
+                                hydra_accent()
+                            };
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(hydra_heading(*label, 12.0));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{count} errors"))
+                                            .size(11.0).color(hydra_subtle_text()),
+                                    );
+                                });
+                            });
+                            ui.label(egui::RichText::new(*sub).size(10.0).color(hydra_subtle_text()));
+                            let bar_w = ui.available_width();
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(bar_w, 10.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 5.0, hydra_panel_alt_fill());
+                            let fill_w = bar_w * pct as f32;
+                            if fill_w > 0.0 {
+                                let fill_rect = egui::Rect::from_min_size(
+                                    rect.min,
+                                    egui::vec2(fill_w, 10.0),
+                                );
+                                ui.painter().rect_filled(fill_rect, 5.0, color);
+                            }
+                        }
+                    } else {
+                        ui.add_space(80.0);
+                        ui.label(
+                            egui::RichText::new("Analyze games to see phase weaknesses.")
+                                .color(hydra_subtle_text()),
+                        );
+                    }
+                });
+            });
+        });
+        ui.add_space(SECTION_GAP);
 
         // ── Row 4: Puzzle theme heatmap (naked section) ────────────────
         if !theme_stats.is_empty() {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Puzzle Themes").size(14.0).strong());
+                ui.label(hydra_heading("Puzzle Themes", 14.0));
                 ui.label(
                     egui::RichText::new("(sorted weakest first)")
                         .size(10.0).color(hydra_subtle_text()),
@@ -5742,6 +5707,50 @@ fn draw_result_bar(ui: &mut egui::Ui, label: &str, w: u32, l: u32, d: u32) {
             .size(10.0)
             .color(hydra_subtle_text()),
     );
+}
+
+// ── Layout tokens ────────────────────────────────────────────────────────
+/// Gap between cards laid out in a row or column grid.
+const CARD_GAP: f32 = 16.0;
+/// Vertical rhythm between page sections.
+const SECTION_GAP: f32 = 16.0;
+/// Minimum height of a KPI tile so a row of tiles lines up regardless of
+/// which ones carry a delta.
+const STAT_TILE_H: f32 = 84.0;
+/// Minimum height of a chart/list card so both cards in a row share a
+/// bottom edge regardless of content.
+const ROW_CARD_H: f32 = 250.0;
+
+/// One KPI tile: muted caps label, big value, optional colored delta
+/// (`(is_up, text)`), muted sub-line. Fills its column width.
+fn hydra_stat_tile(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    delta: Option<(bool, String)>,
+    sub: &str,
+) {
+    hydra_card_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_min_height(STAT_TILE_H);
+        ui.label(hydra_heading(label, 10.0).color(hydra_subtle_text()));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(hydra_heading(value, 26.0));
+            if let Some((up, text)) = delta {
+                let color = if up { hydra_success() } else { hydra_danger() };
+                let arrow = if up { "▲" } else { "▼" };
+                ui.label(
+                    egui::RichText::new(format!("{arrow} {text}"))
+                        .size(11.0)
+                        .color(color)
+                        .strong(),
+                );
+            }
+        });
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new(sub).size(11.0).color(hydra_subtle_text()));
+    });
 }
 
 fn hydra_card_frame() -> egui::Frame {
