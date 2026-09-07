@@ -1683,9 +1683,9 @@ impl FocalorsApp {
                 let pawns = *value as f64 / 100.0;
                 let sign = if pawns >= 0.0 { "+" } else { "" };
                 let color = if *value > 30 {
-                    egui::Color32::from_rgb(100, 200, 100)
+                    hydra_success()
                 } else if *value < -30 {
-                    egui::Color32::from_rgb(220, 100, 80)
+                    hydra_danger()
                 } else {
                     hydra_subtle_text()
                 };
@@ -5182,56 +5182,8 @@ impl FocalorsApp {
 
     fn draw_play_status_bar(&self, ui: &mut egui::Ui) {
         let state = self.state.lock().unwrap();
-        let active_side = if state.local_game.active && state.local_game.outcome.is_none() {
-            Some(state.board.side_to_move)
-        } else {
-            None
-        };
-
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if state.local_game.active {
-                let white_ms = state
-                    .local_game
-                    .time_control
-                    .displayed_remaining_ms(Color::White, active_side);
-                let black_ms = state
-                    .local_game
-                    .time_control
-                    .displayed_remaining_ms(Color::Black, active_side);
-
-                ui.label(
-                    egui::RichText::new("White")
-                        .size(10.0)
-                        .strong()
-                        .color(hydra_subtle_text()),
-                );
-                ui.label(
-                    egui::RichText::new(format_clock_ms(white_ms))
-                        .size(15.0)
-                        .strong()
-                        .monospace()
-                        .color(clock_color(white_ms, active_side == Some(Color::White))),
-                );
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new("Black")
-                        .size(10.0)
-                        .strong()
-                        .color(hydra_subtle_text()),
-                );
-                ui.label(
-                    egui::RichText::new(format_clock_ms(black_ms))
-                        .size(15.0)
-                        .strong()
-                        .monospace()
-                        .color(clock_color(black_ms, active_side == Some(Color::Black))),
-                );
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(8.0);
-            }
-
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(&state.status_message)
@@ -5307,24 +5259,16 @@ impl FocalorsApp {
 
     fn draw_controls(&mut self, ui: &mut egui::Ui) {
         let local_active = self.state.lock().unwrap().local_game.active;
-
         if local_active {
             self.draw_local_game_controls(ui);
         }
-
-        // Eval explanation panel toggle + display
-        ui.add_space(8.0);
-        let label = if self.show_eval_panel { "Hide Eval" } else { "Show Eval" };
-        if ui.add_sized([ui.available_width(), 28.0], secondary_button(label)).clicked() {
-            self.show_eval_panel = !self.show_eval_panel;
-        }
-        if self.show_eval_panel {
-            self.draw_eval_panel(ui);
-        }
     }
 
+    /// Right-hand panel of the live game: a clocks card mirroring the board
+    /// orientation, the Game Session card (summary, quick actions, history,
+    /// status or outcome) and the optional eval breakdown card.
     fn draw_local_game_controls(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("local_controls").show(ui, |ui| {
             let (
                 searching,
                 local_game,
@@ -5333,6 +5277,8 @@ impl FocalorsApp {
                 history_len,
                 history_choices,
                 history_paused,
+                white_ms,
+                black_ms,
             ) = {
                 let state = self.state.lock().unwrap();
                 let history_choices = state
@@ -5343,6 +5289,12 @@ impl FocalorsApp {
                         (index, local_history_label(index, snapshot.move_uci.as_deref()))
                     })
                     .collect::<Vec<_>>();
+                let running_side = if state.local_game.outcome.is_none() {
+                    Some(state.board.side_to_move)
+                } else {
+                    None
+                };
+                let tc = &state.local_game.time_control;
                 (
                     state.search_info.searching,
                     state.local_game.clone(),
@@ -5351,6 +5303,8 @@ impl FocalorsApp {
                     state.local_history.len(),
                     history_choices,
                     is_reviewing_history(&state) || state.local_game.time_control.active_since.is_none(),
+                    tc.displayed_remaining_ms(Color::White, running_side),
+                    tc.displayed_remaining_ms(Color::Black, running_side),
                 )
             };
 
@@ -5360,40 +5314,69 @@ impl FocalorsApp {
             let mut want_review = false;
             // Index 0 is the start-position seed; anything past it is a move.
             let has_moves = history_len > 1;
+            let human = local_game.human_color;
+            let game_over = local_game.outcome.is_some();
 
+            // ── Clocks ─────────────────────────────────────────────────
+            // The side shown at the top of the board comes first, so the
+            // card mirrors the board orientation (and follows Flip Board).
+            let player_name = self
+                .profile
+                .as_ref()
+                .map(|p| p.name.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "You".to_string());
+            let engine_sub = format!(
+                "{} · {}",
+                color_name(human.flip()),
+                local_game.difficulty.label()
+            );
+            let human_sub = color_name(human).to_string();
+            let (human_ms, engine_ms) = match human {
+                Color::White => (white_ms, black_ms),
+                Color::Black => (black_ms, white_ms),
+            };
+            let human_active = !game_over && side_to_move == human;
+            let engine_active = !game_over && side_to_move != human;
+            let human_row = (player_name.as_str(), human_sub.as_str(), human_ms, human_active);
+            let engine_row = ("Focalors", engine_sub.as_str(), engine_ms, engine_active);
+            let bottom_color = if self.flipped { Color::Black } else { Color::White };
+            let (top, bottom) = if human == bottom_color {
+                (engine_row, human_row)
+            } else {
+                (human_row, engine_row)
+            };
             hydra_card_frame().show(ui, |ui| {
-                ui.label(
-                    hydra_heading("Game Session", 16.0)
-                        .color(hydra_accent()),
-                );
-                ui.add_space(10.0);
+                ui.set_min_width(ui.available_width());
+                draw_clock_row(ui, top.0, top.1, top.2, top.3);
+                ui.add_space(4.0);
+                draw_clock_row(ui, bottom.0, bottom.1, bottom.2, bottom.3);
+            });
+
+            ui.add_space(CARD_GAP);
+
+            // ── Game Session ───────────────────────────────────────────
+            hydra_card_frame().show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(hydra_heading("Game Session", 15.0));
+                ui.add_space(8.0);
 
                 egui::Grid::new("local_session_summary")
                     .num_columns(2)
                     .spacing([10.0, 6.0])
                     .show(ui, |ui| {
+                        ui.label(hydra_heading("You", 10.0).color(hydra_subtle_text()));
                         ui.label(
-                            egui::RichText::new("You")
-                                .size(11.0)
-                                .strong()
-                                .color(hydra_subtle_text()),
-                        );
-                        ui.label(
-                            egui::RichText::new(color_name(local_game.human_color))
+                            egui::RichText::new(color_name(human))
                                 .size(12.0)
                                 .color(hydra_text()),
                         );
                         ui.end_row();
 
-                        ui.label(
-                            egui::RichText::new("Profile")
-                                .size(11.0)
-                                .strong()
-                                .color(hydra_subtle_text()),
-                        );
+                        ui.label(hydra_heading("Profile", 10.0).color(hydra_subtle_text()));
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} / {}",
+                                "{} · {}",
                                 local_game.time_control.label,
                                 local_game.difficulty.label()
                             ))
@@ -5401,22 +5384,9 @@ impl FocalorsApp {
                             .color(hydra_text()),
                         );
                         ui.end_row();
-
-                        ui.label(
-                            egui::RichText::new("To move")
-                                .size(11.0)
-                                .strong()
-                                .color(hydra_subtle_text()),
-                        );
-                        ui.label(
-                            egui::RichText::new(color_name(side_to_move))
-                                .size(12.0)
-                                .color(hydra_text()),
-                        );
-                        ui.end_row();
                     });
 
-                if history_paused && local_game.outcome.is_none() {
+                if history_paused && !game_over {
                     ui.add_space(8.0);
                     hydra_callout_frame().show(ui, |ui| {
                         ui.label(
@@ -5427,27 +5397,29 @@ impl FocalorsApp {
                     });
                 }
 
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("Quick Actions").strong().color(hydra_accent()));
+                // Quick actions: a two-column button grid so the buttons
+                // always fill the card instead of wrapping unevenly.
+                ui.add_space(SECTION_GAP);
+                ui.label(hydra_heading("QUICK ACTIONS", 10.0).color(hydra_subtle_text()));
                 ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_sized([138.0, 34.0], secondary_button("Flip Board")).clicked() {
+                let eval_label = if self.show_eval_panel { "Hide Eval" } else { "Show Eval" };
+                ui.columns(2, |cols| {
+                    let w = cols[0].available_width();
+                    if cols[0].add_sized([w, 32.0], secondary_button("Flip Board")).clicked() {
                         self.flipped = !self.flipped;
                     }
-
-                    if local_game.outcome.is_some() {
-                        // The game is over: nothing left to resign or end,
-                        // so the danger buttons give way to a plain exit.
-                        if ui.add_sized([138.0, 34.0], secondary_button("Back to Home")).clicked() {
-                            abort = true;
-                        }
-                    } else {
-                        let resign_clicked = ui
+                    let w = cols[1].available_width();
+                    if cols[1].add_sized([w, 32.0], secondary_button(eval_label)).clicked() {
+                        self.show_eval_panel = !self.show_eval_panel;
+                    }
+                });
+                if !game_over {
+                    ui.add_space(6.0);
+                    ui.columns(2, |cols| {
+                        let resign_clicked = cols[0]
                             .add_enabled_ui(!searching, |ui| {
-                                ui.add_sized([138.0, 34.0], danger_button("Resign"))
-                                    .clicked()
+                                let w = ui.available_width();
+                                ui.add_sized([w, 32.0], danger_button("Resign")).clicked()
                             })
                             .inner;
                         if resign_clicked {
@@ -5457,35 +5429,45 @@ impl FocalorsApp {
                             self.drag_state = None;
                             set_local_game_outcome(
                                 &mut s,
-                                GameOutcome::Resignation(local_game.human_color.flip()),
+                                GameOutcome::Resignation(human.flip()),
                             );
                         }
-
-                        if ui.add_sized([138.0, 34.0], danger_button("End Game")).clicked() {
+                        let w = cols[1].available_width();
+                        if cols[1].add_sized([w, 32.0], danger_button("End Game")).clicked() {
                             abort = true;
                         }
-                    }
-                });
+                    });
+                }
 
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("History").strong().color(hydra_accent()));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(history_cursor > 0, secondary_button("< Prev"))
+                ui.add_space(SECTION_GAP);
+                ui.label(hydra_heading("HISTORY", 10.0).color(hydra_subtle_text()));
+                ui.add_space(6.0);
+                ui.columns(3, |cols| {
+                    let w = cols[0].available_width();
+                    if cols[0]
+                        .add_enabled(
+                            history_cursor > 0,
+                            secondary_button("< Prev").min_size(egui::vec2(w, 30.0)),
+                        )
                         .clicked()
                     {
                         navigate_to = Some(history_cursor - 1);
                     }
-                    if ui
-                        .add_enabled(history_cursor + 1 < history_len, secondary_button("Next >"))
+                    let w = cols[1].available_width();
+                    if cols[1]
+                        .add_enabled(
+                            history_cursor + 1 < history_len,
+                            secondary_button("Next >").min_size(egui::vec2(w, 30.0)),
+                        )
                         .clicked()
                     {
                         navigate_to = Some(history_cursor + 1);
                     }
-                    ui.menu_button("Jump", |ui| {
+                    let w = cols[2].available_width();
+                    egui::containers::menu::MenuButton::from_button(
+                        secondary_button("Jump").min_size(egui::vec2(w, 30.0)),
+                    )
+                    .ui(&mut cols[2], |ui| {
                         for (index, label) in &history_choices {
                             let selected = *index == history_cursor;
                             if ui.selectable_label(selected, label).clicked() {
@@ -5496,15 +5478,18 @@ impl FocalorsApp {
                     });
                 });
 
-                let resume_enabled = local_game.outcome.is_none() && !searching && history_paused;
-                let resume_clicked = ui
-                    .add_enabled_ui(resume_enabled, |ui| {
-                        ui.add_sized([ui.available_width(), 34.0], primary_button("Resume from Here"))
-                            .clicked()
-                    })
-                    .inner;
-                if resume_clicked {
-                    resume = true;
+                if !game_over {
+                    ui.add_space(6.0);
+                    let resume_enabled = !searching && history_paused;
+                    let resume_clicked = ui
+                        .add_enabled_ui(resume_enabled, |ui| {
+                            let w = ui.available_width();
+                            ui.add_sized([w, 32.0], primary_button("Resume from Here")).clicked()
+                        })
+                        .inner;
+                    if resume_clicked {
+                        resume = true;
+                    }
                 }
 
                 if let Some((_, current_label)) = history_choices.get(history_cursor) {
@@ -5516,28 +5501,10 @@ impl FocalorsApp {
                     );
                 }
 
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                let (status_text, status_color) = if let Some(outcome) = local_game.outcome {
-                    local_outcome_banner(outcome, local_game.human_color)
-                } else if searching {
-                    ("Focalors is thinking...".to_string(), hydra_warning())
-                } else if history_paused {
-                    ("Reviewing the game history.".to_string(), hydra_subtle_text())
-                } else if side_to_move == local_game.human_color {
-                    ("Your turn.".to_string(), hydra_text())
-                } else {
-                    ("Focalors to move.".to_string(), hydra_subtle_text())
-                };
-                ui.label(
-                    egui::RichText::new(status_text)
-                        .color(status_color)
-                        .strong()
-                        .size(15.0),
-                );
-
-                if local_game.outcome.is_some() {
+                ui.add_space(SECTION_GAP);
+                if let Some(outcome) = local_game.outcome {
+                    let (banner, color) = local_outcome_banner(outcome, human);
+                    ui.label(hydra_heading(banner, 14.0).color(color));
                     if let Some((old, new)) = self.last_rating_change {
                         let delta = new - old;
                         let sign = if delta >= 0 { "+" } else { "" };
@@ -5548,23 +5515,44 @@ impl FocalorsApp {
                                 .color(hydra_subtle_text()),
                         );
                     }
+                    ui.add_space(10.0);
                     if has_moves {
-                        ui.add_space(10.0);
-                        if ui
-                            .add_sized([ui.available_width(), 34.0], primary_button("Review this game"))
-                            .clicked()
-                        {
+                        let w = ui.available_width();
+                        if ui.add_sized([w, 34.0], primary_button("Review this game")).clicked() {
                             want_review = true;
                         }
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
+                    }
+                    let w = ui.available_width();
+                    if ui.add_sized([w, 32.0], secondary_button("Back to Home")).clicked() {
+                        abort = true;
+                    }
+                    if has_moves {
+                        ui.add_space(6.0);
                         ui.label(
-                            egui::RichText::new("Opens Game Review and runs the analysis.")
+                            egui::RichText::new("Review opens Game Review and runs the analysis.")
                                 .size(11.0)
                                 .color(hydra_subtle_text()),
                         );
                     }
+                } else {
+                    let (status_text, status_color) = if searching {
+                        ("Focalors is thinking...", hydra_warning())
+                    } else if history_paused {
+                        ("Reviewing the game history.", hydra_subtle_text())
+                    } else if side_to_move == human {
+                        ("Your turn.", hydra_text())
+                    } else {
+                        ("Focalors to move.", hydra_subtle_text())
+                    };
+                    ui.label(hydra_heading(status_text, 13.0).color(status_color));
                 }
             });
+
+            if self.show_eval_panel {
+                ui.add_space(CARD_GAP);
+                self.draw_eval_panel(ui);
+            }
 
             if want_review {
                 self.review_finished_game();
@@ -6453,6 +6441,32 @@ fn clock_color(remaining_ms: u64, is_active: bool) -> egui::Color32 {
     } else {
         hydra_text()
     }
+}
+
+/// One clock row: name and color on the left, the remaining time on the
+/// right. The side to move gets a soft accent fill so the running clock
+/// reads at a glance.
+fn draw_clock_row(ui: &mut egui::Ui, name: &str, sub: &str, remaining_ms: u64, active: bool) {
+    let fill = if active { hydra_accent_soft() } else { egui::Color32::TRANSPARENT };
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(hydra_heading(name, 13.0));
+                    ui.label(egui::RichText::new(sub).size(11.0).color(hydra_subtle_text()));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        hydra_heading(format_clock_ms(remaining_ms), 24.0)
+                            .color(clock_color(remaining_ms, active)),
+                    );
+                });
+            });
+        });
 }
 
 fn color_name(color: Color) -> &'static str {
