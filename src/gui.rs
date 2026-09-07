@@ -6431,15 +6431,15 @@ fn format_clock_ms(ms: u64) -> String {
     }
 }
 
+/// The running clock sits on the accent fill of its row, so it reads in
+/// plain text; the waiting side recedes. Low time turns red either way.
 fn clock_color(remaining_ms: u64, is_active: bool) -> egui::Color32 {
-    if remaining_ms == 0 {
-        egui::Color32::RED
-    } else if remaining_ms < 10_000 {
-        egui::Color32::from_rgb(255, 120, 120)
+    if remaining_ms < 10_000 {
+        hydra_danger()
     } else if is_active {
-        hydra_accent()
-    } else {
         hydra_text()
+    } else {
+        hydra_subtle_text()
     }
 }
 
