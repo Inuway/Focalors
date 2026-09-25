@@ -1298,9 +1298,9 @@ impl FocalorsApp {
                         let floor = lo as f64 - pad;
                         let line = egui_plot::Line::new("rating", egui_plot::PlotPoints::new(points))
                             .color(hydra_accent())
-                            .width(2.0)
+                            .width(2.0_f32)
                             .fill(floor as f32)
-                            .fill_alpha(0.14);
+                            .fill_alpha(0.14_f32);
                         egui_plot::Plot::new("rating_chart")
                             .height(230.0)
                             .include_y(floor)
@@ -1406,15 +1406,15 @@ impl FocalorsApp {
                         let floor = ((lowest / 10.0).floor() * 10.0 - 10.0).max(0.0);
                         let line_acc = egui_plot::Line::new("accuracy", egui_plot::PlotPoints::new(acc_points))
                             .color(hydra_subtle_text())
-                            .width(1.0);
+                            .width(1.0_f32);
                         let line_avg = egui_plot::Line::new("rolling_avg", egui_plot::PlotPoints::new(rolling))
                             .color(hydra_accent())
-                            .width(2.0)
+                            .width(2.0_f32)
                             .fill(floor as f32)
-                            .fill_alpha(0.14);
+                            .fill_alpha(0.14_f32);
                         let best_line = egui_plot::HLine::new("best", best)
                             .color(class_best())
-                            .width(1.0)
+                            .width(1.0_f32)
                             .style(egui_plot::LineStyle::Dashed { length: 6.0 });
                         egui_plot::Plot::new("accuracy_chart")
                             .height(210.0)
@@ -3434,12 +3434,12 @@ impl FocalorsApp {
                             .collect();
                         let line = egui_plot::Line::new("eval", egui_plot::PlotPoints::new(points))
                             .color(hydra_accent())
-                            .width(2.0)
-                            .fill(0.0)
-                            .fill_alpha(0.14);
+                            .width(2.0_f32)
+                            .fill(0.0_f32)
+                            .fill_alpha(0.14_f32);
                         let zero = egui_plot::HLine::new("zero", 0.0)
                             .color(hydra_border())
-                            .width(1.0);
+                            .width(1.0_f32);
                         egui_plot::Plot::new("analyze_eval_graph")
                             .height(110.0)
                             .include_y(-3.0)
@@ -3461,7 +3461,7 @@ impl FocalorsApp {
                                         new_cursor as f64,
                                     )
                                     .color(hydra_warning())
-                                    .width(1.5);
+                                    .width(1.5_f32);
                                     plot_ui.vline(vline);
                                 }
                             });
