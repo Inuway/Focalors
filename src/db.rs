@@ -284,6 +284,11 @@ impl Database {
             "ALTER TABLE user_profile ADD COLUMN ui_theme TEXT NOT NULL DEFAULT 'light'",
             [],
         );
+        // Board color preset picked in Settings.
+        let _ = self.conn.execute(
+            "ALTER TABLE user_profile ADD COLUMN board_theme TEXT NOT NULL DEFAULT 'walnut'",
+            [],
+        );
         Ok(())
     }
 
@@ -302,6 +307,26 @@ impl Database {
     pub fn set_ui_theme(&self, theme: &str) -> SqlResult<()> {
         self.conn.execute(
             "UPDATE user_profile SET ui_theme = ?1, updated_at = datetime('now') WHERE id = 1",
+            params![theme],
+        )?;
+        Ok(())
+    }
+
+    /// Read the persisted board theme preset (the GUI's `BoardTheme` in its
+    /// database string form). Callers fall back to the default board on any
+    /// error, so a stale DB without the column still starts.
+    pub fn get_board_theme(&self) -> SqlResult<String> {
+        self.conn.query_row(
+            "SELECT board_theme FROM user_profile WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// Persist the board theme preset.
+    pub fn set_board_theme(&self, theme: &str) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE user_profile SET board_theme = ?1, updated_at = datetime('now') WHERE id = 1",
             params![theme],
         )?;
         Ok(())
@@ -967,6 +992,27 @@ pub fn uci_to_san(board: &Board, uci: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_theme_defaults_to_walnut_and_round_trips() {
+        let db = Database {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.init_schema().unwrap();
+        db.migrate_phase4().unwrap();
+        db.get_or_create_profile().unwrap();
+
+        // Existing profiles get the board they always had.
+        assert_eq!(db.get_board_theme().unwrap(), "walnut");
+        db.set_board_theme("glacier").unwrap();
+        assert_eq!(db.get_board_theme().unwrap(), "glacier");
+        // The UI theme shares the row and must be left alone.
+        assert_eq!(db.get_ui_theme().unwrap(), "light");
+
+        // Running the migration again (every app start does) keeps the choice.
+        db.migrate_phase4().unwrap();
+        assert_eq!(db.get_board_theme().unwrap(), "glacier");
+    }
 
     #[test]
     fn db_opens_and_creates_profile() {

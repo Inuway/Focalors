@@ -214,6 +214,157 @@ impl UiTheme {
 
 static ACTIVE_THEME: AtomicU8 = AtomicU8::new(0);
 
+/// Board color preset, picked in Settings. Only the two square colors differ
+/// between presets: the selection and last-move highlights are the same gold
+/// on every board, and the legal-move tint is derived from the squares.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BoardTheme {
+    Walnut,
+    Maple,
+    Forest,
+    Glacier,
+    Hydro,
+    Indigo,
+    Slate,
+    Rosewood,
+}
+
+impl BoardTheme {
+    /// Display order of the Settings swatch grid. Must follow the
+    /// declaration order, since `index` is the discriminant.
+    const ALL: [BoardTheme; 8] = [
+        BoardTheme::Walnut,
+        BoardTheme::Maple,
+        BoardTheme::Forest,
+        BoardTheme::Glacier,
+        BoardTheme::Hydro,
+        BoardTheme::Indigo,
+        BoardTheme::Slate,
+        BoardTheme::Rosewood,
+    ];
+
+    fn index(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of `index`. Out-of-range values fall back to Walnut.
+    fn from_index(index: u8) -> Self {
+        Self::ALL
+            .get(index as usize)
+            .copied()
+            .unwrap_or(BoardTheme::Walnut)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            BoardTheme::Walnut => "Walnut",
+            BoardTheme::Maple => "Maple",
+            BoardTheme::Forest => "Forest",
+            BoardTheme::Glacier => "Glacier",
+            BoardTheme::Hydro => "Hydro",
+            BoardTheme::Indigo => "Indigo",
+            BoardTheme::Slate => "Slate",
+            BoardTheme::Rosewood => "Rosewood",
+        }
+    }
+
+    /// String form persisted to the SQLite user_profile.board_theme column.
+    fn as_db_str(self) -> &'static str {
+        match self {
+            BoardTheme::Walnut => "walnut",
+            BoardTheme::Maple => "maple",
+            BoardTheme::Forest => "forest",
+            BoardTheme::Glacier => "glacier",
+            BoardTheme::Hydro => "hydro",
+            BoardTheme::Indigo => "indigo",
+            BoardTheme::Slate => "slate",
+            BoardTheme::Rosewood => "rosewood",
+        }
+    }
+
+    /// Inverse of `as_db_str`. Unknown values fall back to Walnut so a
+    /// corrupted row, or a preset written by a newer version, doesn't
+    /// break startup.
+    fn from_db_str(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|theme| theme.as_db_str() == s)
+            .unwrap_or(BoardTheme::Walnut)
+    }
+
+    /// (light square, dark square).
+    fn squares(self) -> (egui::Color32, egui::Color32) {
+        let rgb = egui::Color32::from_rgb;
+        match self {
+            BoardTheme::Walnut => (rgb(227, 218, 201), rgb(120, 99, 81)),
+            BoardTheme::Maple => (rgb(240, 217, 181), rgb(181, 136, 99)),
+            BoardTheme::Forest => (rgb(235, 236, 208), rgb(115, 149, 82)),
+            BoardTheme::Glacier => (rgb(222, 227, 230), rgb(140, 162, 173)),
+            BoardTheme::Hydro => (rgb(221, 238, 236), rgb(72, 138, 152)),
+            BoardTheme::Indigo => (rgb(226, 230, 246), rgb(108, 124, 192)),
+            BoardTheme::Slate => (rgb(216, 219, 224), rgb(118, 126, 138)),
+            BoardTheme::Rosewood => (rgb(236, 216, 200), rgb(152, 88, 74)),
+        }
+    }
+
+    fn palette(self) -> BoardPalette {
+        let (light, dark) = self.squares();
+        // Squares the selected piece can move to get one flat tone between
+        // the two square colors, a little nearer the dark one. Walnut keeps
+        // the exact taupe it always had rather than the computed value.
+        let legal = match self {
+            BoardTheme::Walnut => egui::Color32::from_rgb(168, 149, 126),
+            _ => mix_rgb(light, dark, 0.55),
+        };
+        BoardPalette { light, dark, legal }
+    }
+}
+
+/// The colors a board theme contributes to `draw_board`, the History
+/// thumbnails and the Settings preview.
+#[derive(Clone, Copy)]
+struct BoardPalette {
+    light: egui::Color32,
+    dark: egui::Color32,
+    /// Fill for squares the selected piece can move to.
+    legal: egui::Color32,
+}
+
+// Highlight colors shared by every board theme. They are the exact colors
+// the walnut board showed in dark mode back when the highlights were
+// translucent tints painted over the panel behind the board. Spelled out as
+// opaque colors they no longer depend on the UI theme (the tints washed out
+// to pale yellow and white in light mode), and one flat gold reads cleanly on
+// every preset, where a tint blended into blue or teal squares turns muddy.
+const BOARD_SELECTED: egui::Color32 = egui::Color32::from_rgb(227, 191, 107);
+const BOARD_DRAG_HOVER: egui::Color32 = egui::Color32::from_rgb(218, 169, 98);
+const BOARD_LAST_MOVE: egui::Color32 = egui::Color32::from_rgb(230, 201, 121);
+const BOARD_LEGAL_DOT: egui::Color32 = egui::Color32::from_rgb(255, 255, 253);
+
+static ACTIVE_BOARD_THEME: AtomicU8 = AtomicU8::new(0);
+
+fn active_board_theme() -> BoardTheme {
+    BoardTheme::from_index(ACTIVE_BOARD_THEME.load(Ordering::Relaxed))
+}
+
+/// Linear blend of two opaque colors: `t` = 0 gives `a`, `t` = 1 gives `b`.
+fn mix_rgb(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let channel = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    egui::Color32::from_rgb(
+        channel(a.r(), b.r()),
+        channel(a.g(), b.g()),
+        channel(a.b(), b.b()),
+    )
+}
+
+/// Position shown in the Settings window's board preview: a Ruy Lopez after
+/// 3...Nf6, so both colors have pieces off their home squares.
+const SETTINGS_PREVIEW_FEN: &str =
+    "r1bqkb1r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
+/// Squares of the move that led to the preview position (g8 and f6), drawn
+/// with the last-move highlight.
+const SETTINGS_PREVIEW_LAST_MOVE: [u8; 2] = [62, 45];
+
 impl TimePreset {
     const ALL: [TimePreset; 8] = [
         TimePreset::Bullet1_0,
@@ -635,6 +786,10 @@ pub struct FocalorsApp {
     welcome_rating_choice: i32,
     home_page: HomePage,
     ui_theme: UiTheme,
+    board_theme: BoardTheme,
+    show_settings: bool,
+    /// Fixed position drawn in the Settings window's board preview.
+    settings_preview_board: Board,
     replay_game: Option<ReplayState>,
     analysis_state: Arc<Mutex<AnalysisState>>,
     analysis_review_cursor: usize, // which move is selected in review
@@ -678,6 +833,8 @@ pub struct FocalorsApp {
     show_advanced_engine_settings: bool,
     pending_promotion: Option<PendingPromotion>,
     piece_textures: HashMap<(Color, Piece), egui::TextureHandle>,
+    /// Downscaled copies of `piece_textures` for small boards.
+    piece_textures_small: HashMap<(Color, Piece), egui::TextureHandle>,
     pgn_import_text: String,
     pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
     pgn_import_error: Option<String>,
@@ -721,6 +878,27 @@ fn build_replay_state(game: crate::db::SavedGame) -> ReplayState {
     }
 }
 
+/// The twelve embedded piece images: (side, piece, texture name, PNG bytes).
+const PIECE_IMAGES: [(Color, Piece, &str, &[u8]); 12] = [
+    (Color::White, Piece::King, "wK", include_bytes!("../assets/pieces/wK.png")),
+    (Color::White, Piece::Queen, "wQ", include_bytes!("../assets/pieces/wQ.png")),
+    (Color::White, Piece::Rook, "wR", include_bytes!("../assets/pieces/wR.png")),
+    (Color::White, Piece::Bishop, "wB", include_bytes!("../assets/pieces/wB.png")),
+    (Color::White, Piece::Knight, "wN", include_bytes!("../assets/pieces/wN.png")),
+    (Color::White, Piece::Pawn, "wP", include_bytes!("../assets/pieces/wP.png")),
+    (Color::Black, Piece::King, "bK", include_bytes!("../assets/pieces/bK.png")),
+    (Color::Black, Piece::Queen, "bQ", include_bytes!("../assets/pieces/bQ.png")),
+    (Color::Black, Piece::Rook, "bR", include_bytes!("../assets/pieces/bR.png")),
+    (Color::Black, Piece::Bishop, "bB", include_bytes!("../assets/pieces/bB.png")),
+    (Color::Black, Piece::Knight, "bN", include_bytes!("../assets/pieces/bN.png")),
+    (Color::Black, Piece::Pawn, "bP", include_bytes!("../assets/pieces/bP.png")),
+];
+
+/// Edge length of the downscaled piece textures used on small boards (the
+/// Settings preview). The full-size textures alias badly once the GPU has
+/// to shrink them more than about 2x with plain linear filtering.
+const PIECE_SMALL_PX: u32 = 48;
+
 fn load_piece_texture(
     ctx: &egui::Context,
     name: &str,
@@ -732,6 +910,42 @@ fn load_piece_texture(
     let size = [img.width() as _, img.height() as _];
     let pixels = img.into_raw();
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+    ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR)
+}
+
+/// Same image as `load_piece_texture`, pre-shrunk to `PIECE_SMALL_PX` with a
+/// proper resampling filter.
+fn load_small_piece_texture(
+    ctx: &egui::Context,
+    name: &str,
+    data: &[u8],
+) -> egui::TextureHandle {
+    let mut img = image::load_from_memory(data)
+        .expect("Failed to load piece image")
+        .into_rgba8();
+    // Resize in premultiplied alpha so the color stored in fully transparent
+    // pixels can't bleed into the piece outline.
+    for px in img.pixels_mut() {
+        let alpha = px[3] as u32;
+        for c in 0..3 {
+            px[c] = ((px[c] as u32 * alpha + 127) / 255) as u8;
+        }
+    }
+    let mut small = image::imageops::resize(
+        &img,
+        PIECE_SMALL_PX,
+        PIECE_SMALL_PX,
+        image::imageops::FilterType::Lanczos3,
+    );
+    // Lanczos can overshoot slightly; keep the result valid premultiplied.
+    for px in small.pixels_mut() {
+        let alpha = px[3];
+        for c in 0..3 {
+            px[c] = px[c].min(alpha);
+        }
+    }
+    let size = [PIECE_SMALL_PX as usize, PIECE_SMALL_PX as usize];
+    let color_image = egui::ColorImage::from_rgba_premultiplied(size, small.as_raw());
     ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR)
 }
 
@@ -747,54 +961,14 @@ impl FocalorsApp {
         let ctx = &cc.egui_ctx;
         install_fonts(ctx);
         let mut piece_textures = HashMap::new();
-        piece_textures.insert(
-            (Color::White, Piece::King),
-            load_piece_texture(ctx, "wK", include_bytes!("../assets/pieces/wK.png")),
-        );
-        piece_textures.insert(
-            (Color::White, Piece::Queen),
-            load_piece_texture(ctx, "wQ", include_bytes!("../assets/pieces/wQ.png")),
-        );
-        piece_textures.insert(
-            (Color::White, Piece::Rook),
-            load_piece_texture(ctx, "wR", include_bytes!("../assets/pieces/wR.png")),
-        );
-        piece_textures.insert(
-            (Color::White, Piece::Bishop),
-            load_piece_texture(ctx, "wB", include_bytes!("../assets/pieces/wB.png")),
-        );
-        piece_textures.insert(
-            (Color::White, Piece::Knight),
-            load_piece_texture(ctx, "wN", include_bytes!("../assets/pieces/wN.png")),
-        );
-        piece_textures.insert(
-            (Color::White, Piece::Pawn),
-            load_piece_texture(ctx, "wP", include_bytes!("../assets/pieces/wP.png")),
-        );
-        piece_textures.insert(
-            (Color::Black, Piece::King),
-            load_piece_texture(ctx, "bK", include_bytes!("../assets/pieces/bK.png")),
-        );
-        piece_textures.insert(
-            (Color::Black, Piece::Queen),
-            load_piece_texture(ctx, "bQ", include_bytes!("../assets/pieces/bQ.png")),
-        );
-        piece_textures.insert(
-            (Color::Black, Piece::Rook),
-            load_piece_texture(ctx, "bR", include_bytes!("../assets/pieces/bR.png")),
-        );
-        piece_textures.insert(
-            (Color::Black, Piece::Bishop),
-            load_piece_texture(ctx, "bB", include_bytes!("../assets/pieces/bB.png")),
-        );
-        piece_textures.insert(
-            (Color::Black, Piece::Knight),
-            load_piece_texture(ctx, "bN", include_bytes!("../assets/pieces/bN.png")),
-        );
-        piece_textures.insert(
-            (Color::Black, Piece::Pawn),
-            load_piece_texture(ctx, "bP", include_bytes!("../assets/pieces/bP.png")),
-        );
+        let mut piece_textures_small = HashMap::new();
+        for (color, piece, name, data) in PIECE_IMAGES {
+            piece_textures.insert((color, piece), load_piece_texture(ctx, name, data));
+            piece_textures_small.insert(
+                (color, piece),
+                load_small_piece_texture(ctx, &format!("{name}_small"), data),
+            );
+        }
 
         // Initialize database
         let db = match crate::db::Database::open() {
@@ -841,6 +1015,15 @@ impl FocalorsApp {
             .unwrap_or(UiTheme::Light);
         configure_theme(&cc.egui_ctx, ui_theme);
 
+        // Same for the board preset: stored in the profile row and applied
+        // through a process-wide atomic, like the UI theme.
+        let board_theme = db
+            .as_ref()
+            .and_then(|db| db.get_board_theme().ok())
+            .map(|s| BoardTheme::from_db_str(&s))
+            .unwrap_or(BoardTheme::Walnut);
+        ACTIVE_BOARD_THEME.store(board_theme.index(), Ordering::Relaxed);
+
         let session_start_rating = profile.as_ref().map_or(1200, |p| p.rating);
         let session_start_games = profile.as_ref().map_or(0, |p| p.games_played);
 
@@ -855,6 +1038,10 @@ impl FocalorsApp {
             welcome_rating_choice: 1200,
             home_page: HomePage::Overview,
             ui_theme,
+            board_theme,
+            show_settings: false,
+            settings_preview_board: Board::from_fen(SETTINGS_PREVIEW_FEN)
+                .unwrap_or_else(|_| Board::startpos()),
             replay_game: None,
             analysis_state: Arc::new(Mutex::new(AnalysisState::Idle)),
             analysis_review_cursor: 0,
@@ -883,6 +1070,7 @@ impl FocalorsApp {
             show_advanced_engine_settings: false,
             pending_promotion: None,
             piece_textures,
+            piece_textures_small,
             pgn_import_text: String::new(),
             pgn_import_parsed: None,
             pgn_import_error: None,
@@ -898,6 +1086,15 @@ impl FocalorsApp {
         // write errors so a transient I/O hiccup never breaks the toggle.
         if let Some(ref db) = self.db {
             let _ = db.set_ui_theme(theme.as_db_str());
+        }
+    }
+
+    fn set_board_theme(&mut self, theme: BoardTheme) {
+        self.board_theme = theme;
+        ACTIVE_BOARD_THEME.store(theme.index(), Ordering::Relaxed);
+        // Best-effort persistence, same as the UI theme.
+        if let Some(ref db) = self.db {
+            let _ = db.set_board_theme(theme.as_db_str());
         }
     }
 
@@ -4224,6 +4421,123 @@ impl FocalorsApp {
         self.home_page = HomePage::Analyze;
     }
 
+    // ── Settings window ────────────────────────────────────────────────
+
+    /// App-wide preferences. Appearance only for now; piece sets and other
+    /// customization get their own sections here later. Every choice applies
+    /// and saves on click, so there is no confirm step.
+    fn draw_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+
+        let mut open = true;
+        let mut pick_ui_theme: Option<UiTheme> = None;
+        let mut pick_board: Option<BoardTheme> = None;
+
+        egui::Window::new(hydra_heading("Settings", 16.0))
+            .id(egui::Id::new("settings_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            // Opens centered but stays draggable, so it can be moved off the
+            // board while trying themes during a game or a review.
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .show(ctx, |ui| {
+                ui.set_min_width(SETTINGS_CONTENT_W);
+
+                ui.label(hydra_heading("APPEARANCE", 10.0).color(hydra_subtle_text()));
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("App theme").size(12.5));
+                    for (theme, label) in [(UiTheme::Dark, "Dark"), (UiTheme::Light, "Light")] {
+                        let selected = self.ui_theme == theme;
+                        if ui.add(home_nav_button(selected, label)).clicked() && !selected {
+                            pick_ui_theme = Some(theme);
+                        }
+                    }
+                });
+
+                ui.add_space(SECTION_GAP - ui.spacing().item_spacing.y);
+                ui.label(hydra_heading("BOARD", 10.0).color(hydra_subtle_text()));
+                ui.horizontal_top(|ui| {
+                    egui::Grid::new("settings_board_themes")
+                        .num_columns(SETTINGS_SWATCH_COLS)
+                        .spacing([SETTINGS_SWATCH_GAP, SETTINGS_SWATCH_GAP])
+                        .show(ui, |ui| {
+                            for (i, theme) in BoardTheme::ALL.into_iter().enumerate() {
+                                let selected = self.board_theme == theme;
+                                if board_theme_swatch(ui, theme, selected).clicked() && !selected {
+                                    pick_board = Some(theme);
+                                }
+                                if i % SETTINGS_SWATCH_COLS == SETTINGS_SWATCH_COLS - 1 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                    ui.add_space(SETTINGS_PREVIEW_GAP - ui.spacing().item_spacing.x);
+                    self.draw_board_preview(ui, SETTINGS_PREVIEW_SIDE);
+                });
+                ui.label(
+                    egui::RichText::new("Applies to every board: play, review, puzzles and history.")
+                        .size(11.0)
+                        .color(hydra_subtle_text()),
+                );
+            });
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        if let Some(theme) = pick_ui_theme {
+            self.set_ui_theme(ctx, theme);
+        }
+        if let Some(theme) = pick_board {
+            self.set_board_theme(theme);
+        }
+        self.show_settings = open;
+    }
+
+    /// Small static board for the Settings window, so a board theme can be
+    /// judged on pages that show no board. Real piece images (the downscaled
+    /// set) plus the last-move highlight on two squares. White at the bottom.
+    fn draw_board_preview(&self, ui: &mut egui::Ui, side: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let painter = ui.painter();
+        let palette = self.board_theme.palette();
+        let sq = side / 8.0;
+        for visual_rank in 0..8u8 {
+            // visual_rank 0 = top of the board = chess rank 8
+            let chess_rank = 7 - visual_rank;
+            for file in 0..8u8 {
+                let sq_idx = chess_rank * 8 + file;
+                let color = if SETTINGS_PREVIEW_LAST_MOVE.contains(&sq_idx) {
+                    BOARD_LAST_MOVE
+                } else if (file + chess_rank) % 2 == 1 {
+                    palette.light
+                } else {
+                    palette.dark
+                };
+                let cell = egui::Rect::from_min_size(
+                    egui::pos2(
+                        rect.min.x + file as f32 * sq,
+                        rect.min.y + visual_rank as f32 * sq,
+                    ),
+                    egui::vec2(sq, sq),
+                );
+                painter.rect_filled(cell, grid_cell_corner_radius(file, visual_rank, 7, 6), color);
+                if let Some((piece_color, piece)) =
+                    self.settings_preview_board.piece_on(Square(sq_idx))
+                    && let Some(texture) = self.piece_textures_small.get(&(piece_color, piece))
+                {
+                    draw_piece_image(painter, texture, cell.shrink(sq * 0.05));
+                }
+            }
+        }
+    }
+
     fn draw_home_engine_settings_popup(&mut self, ctx: &egui::Context, searching: bool) {
         if !self.show_advanced_engine_settings {
             return;
@@ -4408,9 +4722,16 @@ impl eframe::App for FocalorsApp {
                     if ui.add(theme_toggle_button(toggle_label)).clicked() {
                         self.set_ui_theme(&ctx, self.ui_theme.toggle());
                     }
+                    if ui.add(theme_toggle_button("Settings")).clicked() {
+                        self.show_settings = !self.show_settings;
+                    }
                 });
             });
         });
+
+        // Settings window: opened from the top bar, so it works on every
+        // screen and a board change shows live on the board behind it.
+        self.draw_settings_window(&ctx);
 
         // Right panel: settings and controls (only during play)
         if !show_home_screen {
@@ -4519,11 +4840,14 @@ impl FocalorsApp {
         let sq_size = board_size / 8.0;
         let board_total_height = board_size + 28.0;
 
-        let light = egui::Color32::from_rgb(227, 218, 201);
-        let dark = egui::Color32::from_rgb(120, 99, 81);
-        let selected_color = egui::Color32::from_rgba_premultiplied(216, 179, 92, 180);
-        let legal_color = egui::Color32::from_rgba_premultiplied(148, 126, 98, 110);
-        let last_move_color = egui::Color32::from_rgba_premultiplied(212, 181, 96, 130);
+        // Square colors come from the board theme picked in Settings; the
+        // highlights are the shared opaque set (see BOARD_SELECTED).
+        let palette = active_board_theme().palette();
+        let light = palette.light;
+        let dark = palette.dark;
+        let selected_color = BOARD_SELECTED;
+        let legal_color = palette.legal;
+        let last_move_color = BOARD_LAST_MOVE;
 
         // Compute legal moves from selected square (interactive only)
         let legal_targets: Vec<u8> = if interactive
@@ -4600,7 +4924,7 @@ impl FocalorsApp {
                 let color = if selected_square == Some(sq_idx) {
                     selected_color
                 } else if drag_hover_sq == Some(sq_idx) {
-                    egui::Color32::from_rgba_premultiplied(201, 150, 74, 135)
+                    BOARD_DRAG_HOVER
                 } else if legal_targets.contains(&sq_idx) {
                     legal_color
                 } else if is_last_move {
@@ -4645,7 +4969,7 @@ impl FocalorsApp {
                     painter.circle_filled(
                         rect.center(),
                         sq_size * 0.15,
-                        egui::Color32::from_rgba_premultiplied(244, 233, 210, 168),
+                        BOARD_LEGAL_DOT,
                     );
                 }
             }
@@ -5853,6 +6177,23 @@ const OPENINGS_LIST_MAX_H: f32 = 196.0;
 const ANALYZE_ROW_H: f32 = 560.0;
 /// Narrowest a History game card may get before the grid drops a column.
 const HISTORY_TILE_MIN_W: f32 = 420.0;
+/// Settings window: the board-theme swatches sit in a grid this many wide.
+const SETTINGS_SWATCH_COLS: usize = 4;
+/// Edge of one swatch's 4x4 color sample.
+const SETTINGS_SWATCH: f32 = 76.0;
+/// Room under the sample for the preset's name.
+const SETTINGS_SWATCH_LABEL_H: f32 = 22.0;
+const SETTINGS_SWATCH_GAP: f32 = 12.0;
+/// The preview board is exactly two swatch rows tall, so it lines up with
+/// the grid beside it.
+const SETTINGS_PREVIEW_SIDE: f32 =
+    2.0 * (SETTINGS_SWATCH + SETTINGS_SWATCH_LABEL_H) + SETTINGS_SWATCH_GAP;
+const SETTINGS_PREVIEW_GAP: f32 = 20.0;
+/// Swatch grid + gap + preview: fixes the window width so nothing reflows.
+const SETTINGS_CONTENT_W: f32 = SETTINGS_SWATCH_COLS as f32 * SETTINGS_SWATCH
+    + (SETTINGS_SWATCH_COLS as f32 - 1.0) * SETTINGS_SWATCH_GAP
+    + SETTINGS_PREVIEW_GAP
+    + SETTINGS_PREVIEW_SIDE;
 
 /// One KPI tile: muted caps label, big value, optional colored delta
 /// (`(is_up, text)`), muted sub-line. Fills its column width.
@@ -6342,6 +6683,85 @@ fn draw_piece_image(
     );
 }
 
+/// Corner radius for one cell of a painted grid whose last row and column
+/// index is `last`, so that only the grid's four outer corners are rounded.
+fn grid_cell_corner_radius(col: u8, row: u8, last: u8, radius: u8) -> egui::CornerRadius {
+    egui::CornerRadius {
+        nw: if col == 0 && row == 0 { radius } else { 0 },
+        ne: if col == last && row == 0 { radius } else { 0 },
+        sw: if col == 0 && row == last { radius } else { 0 },
+        se: if col == last && row == last { radius } else { 0 },
+    }
+}
+
+/// One clickable board-theme swatch for the Settings window: a 4x4 sample of
+/// the preset's two square colors with its name underneath. The selected
+/// preset gets an accent ring.
+fn board_theme_swatch(ui: &mut egui::Ui, theme: BoardTheme, selected: bool) -> egui::Response {
+    let side = SETTINGS_SWATCH;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(side, side + SETTINGS_SWATCH_LABEL_H),
+        egui::Sense::click(),
+    );
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let painter = ui.painter();
+    let sample = egui::Rect::from_min_size(rect.min, egui::vec2(side, side));
+    let (light, dark) = theme.squares();
+    let cell = side / 4.0;
+    for row in 0..4u8 {
+        for col in 0..4u8 {
+            // Top-left is a light square, like a8 on a real board.
+            let color = if (row + col) % 2 == 0 { light } else { dark };
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(
+                        sample.min.x + col as f32 * cell,
+                        sample.min.y + row as f32 * cell,
+                    ),
+                    egui::vec2(cell, cell),
+                ),
+                grid_cell_corner_radius(col, row, 3, 5),
+                color,
+            );
+        }
+    }
+
+    if selected {
+        painter.rect_stroke(
+            sample.expand(3.0),
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(2.0_f32, hydra_accent()),
+            egui::StrokeKind::Inside,
+        );
+    } else if response.hovered() {
+        painter.rect_stroke(
+            sample.expand(3.0),
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(1.0_f32, hydra_subtle_text()),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let (font, color) = if selected {
+        (egui::FontId::new(11.5, hydra_heading_family()), hydra_text())
+    } else {
+        (egui::FontId::proportional(11.5), hydra_subtle_text())
+    };
+    painter.text(
+        egui::pos2(sample.center().x, sample.max.y + SETTINGS_SWATCH_LABEL_H * 0.6),
+        egui::Align2::CENTER_CENTER,
+        theme.label(),
+        font,
+        color,
+    );
+
+    response
+}
+
 /// Compact non-interactive board renderer for History thumbnails. Always
 /// shown white-on-bottom. Pieces use Unicode glyphs to avoid loading the
 /// big piece textures at thumbnail scale.
@@ -6352,8 +6772,9 @@ fn draw_board_thumbnail(ui: &mut egui::Ui, board: &Board, size: f32) {
     );
     let rect = response.rect;
     let sq = size / 8.0;
-    let light = egui::Color32::from_rgb(227, 218, 201);
-    let dark = egui::Color32::from_rgb(120, 99, 81);
+    let palette = active_board_theme().palette();
+    let light = palette.light;
+    let dark = palette.dark;
 
     for visual_rank in 0..8u8 {
         // visual_rank 0 = top of board = chess rank 8 = file index 7
@@ -6879,6 +7300,49 @@ pub fn run_gui() {
 mod tests {
     use super::uci_arrow_squares;
     use crate::types::Square;
+
+    #[test]
+    fn board_theme_round_trips_and_walnut_is_the_fallback() {
+        use super::BoardTheme;
+
+        for (i, theme) in BoardTheme::ALL.into_iter().enumerate() {
+            assert_eq!(theme.index() as usize, i, "ALL must follow declaration order");
+            assert_eq!(BoardTheme::from_index(theme.index()), theme);
+            assert_eq!(BoardTheme::from_db_str(theme.as_db_str()), theme);
+        }
+        // A corrupted row, or a preset written by a newer version, falls
+        // back to the default board instead of failing.
+        assert_eq!(BoardTheme::from_db_str("neon"), BoardTheme::Walnut);
+        assert_eq!(BoardTheme::from_index(200), BoardTheme::Walnut);
+
+        // The default board keeps the exact colors it had before themes.
+        let walnut = BoardTheme::Walnut.palette();
+        assert_eq!(walnut.light, egui::Color32::from_rgb(227, 218, 201));
+        assert_eq!(walnut.dark, egui::Color32::from_rgb(120, 99, 81));
+        assert_eq!(walnut.legal, egui::Color32::from_rgb(168, 149, 126));
+
+        // Every preset's legal-move tone must stay distinct from both of its
+        // squares and from the gold highlights, or legal squares vanish.
+        for theme in BoardTheme::ALL {
+            let p = theme.palette();
+            for other in [p.light, p.dark, super::BOARD_SELECTED, super::BOARD_LAST_MOVE] {
+                assert_ne!(p.legal, other, "{theme:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_preview_position_matches_its_last_move_squares() {
+        use crate::types::{Color, Piece};
+
+        let board = crate::board::Board::from_fen(super::SETTINGS_PREVIEW_FEN)
+            .expect("preview FEN must parse");
+        let [from, to] = super::SETTINGS_PREVIEW_LAST_MOVE;
+        assert_eq!(from, Square::from_algebraic("g8").unwrap().0);
+        assert_eq!(to, Square::from_algebraic("f6").unwrap().0);
+        assert_eq!(board.piece_on(Square(from)), None);
+        assert_eq!(board.piece_on(Square(to)), Some((Color::Black, Piece::Knight)));
+    }
 
     #[test]
     fn pending_animation_derives_piece_and_castling_rook() {
