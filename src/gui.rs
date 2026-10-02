@@ -6627,6 +6627,29 @@ fn draw_annotation_arrow(
         color,
         egui::Stroke::NONE,
     ));
+
+    // Thin dark outline around the whole arrow so it reads on every board
+    // theme: a green arrow on the green board, a yellow one on maple. The
+    // arrow colors carry meaning (green is the best move), so they stay the
+    // same on all boards and the outline does the separating.
+    let half_shaft = shaft_width / 2.0;
+    let head_base = to_inset - unit * head_len;
+    let outline = vec![
+        from_inset + perp * half_shaft,
+        head_base + perp * half_shaft,
+        base_left,
+        tip,
+        base_right,
+        head_base - perp * half_shaft,
+        from_inset - perp * half_shaft,
+    ];
+    painter.add(egui::Shape::closed_line(
+        outline,
+        egui::Stroke::new(
+            (sq_size * 0.014).clamp(1.0, 2.0),
+            egui::Color32::from_rgba_unmultiplied(24, 20, 16, 150),
+        ),
+    ));
 }
 
 fn board_square_from_pos(
