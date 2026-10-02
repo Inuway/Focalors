@@ -6586,7 +6586,52 @@ fn board_square_center(
     )
 }
 
-/// Draw a thick colored arrow with a triangular arrowhead, used for annotations.
+/// The outline of a board arrow from one square center to another: seven
+/// corners, clockwise on screen, starting at the tip. `None` when the two
+/// points coincide.
+///
+/// The order matters. An arrow is not convex, but egui fills a closed path
+/// as a triangle fan from its first point, and every corner of an arrow can
+/// be seen from its tip, so the fan covers the arrow exactly as long as the
+/// tip comes first and the winding is clockwise (egui reverses a
+/// counter-clockwise path, which would move the fan to a barb corner).
+fn annotation_arrow_outline(
+    from: egui::Pos2,
+    to: egui::Pos2,
+    sq_size: f32,
+) -> Option<Vec<egui::Pos2>> {
+    let dir = to - from;
+    let len = dir.length();
+    if len < 1.0 {
+        return None;
+    }
+    let unit = dir / len;
+    // Clockwise side of the direction of travel, in screen coordinates.
+    let perp = egui::vec2(-unit.y, unit.x);
+
+    let half_shaft = sq_size * 0.09;
+    let head_len = sq_size * 0.36;
+    let head_half_width = sq_size * 0.26;
+
+    // Pull both endpoints in so the arrow sits inside the squares, not flush
+    // against the edges (looks better visually).
+    let tail = from + unit * (sq_size * 0.18);
+    let tip = to - unit * (sq_size * 0.10);
+    let head_base = tip - unit * head_len;
+
+    Some(vec![
+        tip,
+        head_base + perp * head_half_width,
+        head_base + perp * half_shaft,
+        tail + perp * half_shaft,
+        tail - perp * half_shaft,
+        head_base - perp * half_shaft,
+        head_base - perp * head_half_width,
+    ])
+}
+
+/// Draw a thick colored arrow with a triangular arrowhead, used for the
+/// right-click annotations and the Game Review move arrows.
 fn draw_annotation_arrow(
     painter: &egui::Painter,
     from: egui::Pos2,
@@ -6594,36 +6639,15 @@ fn draw_annotation_arrow(
     color: egui::Color32,
     sq_size: f32,
 ) {
-    let dir = to - from;
-    let len = dir.length();
-    if len < 1.0 {
+    let Some(outline) = annotation_arrow_outline(from, to, sq_size) else {
         return;
-    }
-    let unit = dir / len;
-    let perp = egui::vec2(-unit.y, unit.x);
+    };
 
-    let shaft_width = sq_size * 0.18;
-    let head_len = sq_size * 0.36;
-    let head_half_width = sq_size * 0.26;
-
-    // Pull both endpoints in so the arrow sits inside the squares, not flush
-    // against the edges (looks better visually).
-    let from_inset = from + unit * (sq_size * 0.18);
-    let to_inset   = to   - unit * (sq_size * 0.10);
-
-    // Shaft stops short of the arrowhead tip so the join looks clean.
-    let shaft_end = to_inset - unit * head_len * 0.6;
-
-    painter.line_segment(
-        [from_inset, shaft_end],
-        egui::Stroke::new(shaft_width, color),
-    );
-
-    let tip = to_inset;
-    let base_left  = to_inset - unit * head_len + perp * head_half_width;
-    let base_right = to_inset - unit * head_len - perp * head_half_width;
+    // Shaft and head are filled as one shape, so the translucent color has
+    // the same strength everywhere. As two overlapping shapes they left a
+    // darker patch inside the head.
     painter.add(egui::Shape::convex_polygon(
-        vec![tip, base_left, base_right],
+        outline.clone(),
         color,
         egui::Stroke::NONE,
     ));
@@ -6632,17 +6656,6 @@ fn draw_annotation_arrow(
     // theme: a green arrow on the green board, a yellow one on maple. The
     // arrow colors carry meaning (green is the best move), so they stay the
     // same on all boards and the outline does the separating.
-    let half_shaft = shaft_width / 2.0;
-    let head_base = to_inset - unit * head_len;
-    let outline = vec![
-        from_inset + perp * half_shaft,
-        head_base + perp * half_shaft,
-        base_left,
-        tip,
-        base_right,
-        head_base - perp * half_shaft,
-        from_inset - perp * half_shaft,
-    ];
     painter.add(egui::Shape::closed_line(
         outline,
         egui::Stroke::new(
@@ -7352,6 +7365,136 @@ mod tests {
                 assert_ne!(p.legal, other, "{theme:?}");
             }
         }
+    }
+
+    /// Tessellates the arrow fill the way the GUI does and samples the
+    /// resulting triangles: every point well inside the arrow must be covered
+    /// exactly once at full strength, every point well outside not at all.
+    /// A fan started from the wrong corner, a reversed winding, or shaft and
+    /// head drawn as overlapping pieces would all fail here.
+    #[test]
+    fn arrow_fill_covers_the_arrow_exactly_once() {
+        use egui::epaint::{Mesh, TessellationOptions, Tessellator};
+        use egui::{pos2, Color32, Pos2};
+
+        let sq = 100.0_f32;
+        let center = |file: f32, rank: f32| pos2((file + 0.5) * sq, (rank + 0.5) * sq);
+        // (from, to) as (file, rank) pairs: every direction class an arrow
+        // takes on a board, including the short one-square and knight hops.
+        let arrows = [
+            ((4.0, 6.0), (4.0, 4.0)), // up
+            ((4.0, 1.0), (4.0, 3.0)), // down
+            ((0.0, 0.0), (7.0, 0.0)), // right, full width
+            ((7.0, 7.0), (0.0, 7.0)), // left
+            ((6.0, 6.0), (2.0, 2.0)), // long diagonal
+            ((1.0, 2.0), (5.0, 6.0)), // the other diagonal direction
+            ((6.0, 0.0), (5.0, 2.0)), // knight
+            ((1.0, 7.0), (2.0, 5.0)), // knight, mirrored
+            ((3.0, 3.0), (4.0, 3.0)), // one square
+            ((3.0, 3.0), (2.0, 4.0)), // one square, diagonal
+        ];
+
+        // Signed-area style edge function and helpers for the sampling.
+        let edge = |a: Pos2, b: Pos2, p: Pos2| (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        let dist_to_segment = |a: Pos2, b: Pos2, p: Pos2| {
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0);
+            (p - (a + ab * t)).length()
+        };
+        let inside_polygon = |poly: &[Pos2], p: Pos2| {
+            let mut inside = false;
+            let mut j = poly.len() - 1;
+            for i in 0..poly.len() {
+                let (a, b) = (poly[i], poly[j]);
+                if (a.y > p.y) != (b.y > p.y)
+                    && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x
+                {
+                    inside = !inside;
+                }
+                j = i;
+            }
+            inside
+        };
+
+        for ((ff, fr), (tf, tr)) in arrows {
+            let outline = super::annotation_arrow_outline(center(ff, fr), center(tf, tr), sq)
+                .expect("distinct squares give an arrow");
+            assert_eq!(outline.len(), 7);
+
+            let mut tessellator =
+                Tessellator::new(1.0, TessellationOptions::default(), [1, 1], Vec::new());
+            let mut mesh = Mesh::default();
+            tessellator.tessellate_shape(
+                egui::Shape::convex_polygon(outline.clone(), Color32::WHITE, egui::Stroke::NONE),
+                &mut mesh,
+            );
+            assert!(!mesh.indices.is_empty(), "arrow produced no triangles");
+
+            // Coverage at a point: summed vertex-alpha of every triangle
+            // containing it. 1.0 means painted once at full strength.
+            let coverage = |p: Pos2| -> f32 {
+                let mut total = 0.0;
+                for tri in mesh.indices.chunks_exact(3) {
+                    let [a, b, c] = [
+                        mesh.vertices[tri[0] as usize],
+                        mesh.vertices[tri[1] as usize],
+                        mesh.vertices[tri[2] as usize],
+                    ];
+                    let area = edge(a.pos, b.pos, c.pos);
+                    if area.abs() < 1e-6 {
+                        continue;
+                    }
+                    let (wa, wb, wc) = (
+                        edge(b.pos, c.pos, p) / area,
+                        edge(c.pos, a.pos, p) / area,
+                        edge(a.pos, b.pos, p) / area,
+                    );
+                    if wa >= 0.0 && wb >= 0.0 && wc >= 0.0 {
+                        total += (wa * a.color.a() as f32
+                            + wb * b.color.a() as f32
+                            + wc * c.color.a() as f32)
+                            / 255.0;
+                    }
+                }
+                total
+            };
+
+            let (mut checked_inside, mut checked_outside) = (0, 0);
+            let mut y = 1.3_f32;
+            while y < 8.0 * sq {
+                let mut x = 0.9_f32;
+                while x < 8.0 * sq {
+                    let p = pos2(x, y);
+                    let edge_distance = (0..outline.len())
+                        .map(|i| dist_to_segment(outline[i], outline[(i + 1) % outline.len()], p))
+                        .fold(f32::INFINITY, f32::min);
+                    // Skip the anti-aliasing band along the edges.
+                    if edge_distance > 2.0 {
+                        let c = coverage(p);
+                        if inside_polygon(&outline, p) {
+                            assert!(
+                                (c - 1.0).abs() < 0.02,
+                                "inside point {p:?} has coverage {c} for arrow {ff},{fr} -> {tf},{tr}"
+                            );
+                            checked_inside += 1;
+                        } else {
+                            assert!(
+                                c < 0.02,
+                                "outside point {p:?} has coverage {c} for arrow {ff},{fr} -> {tf},{tr}"
+                            );
+                            checked_outside += 1;
+                        }
+                    }
+                    x += 3.7;
+                }
+                y += 3.7;
+            }
+            assert!(checked_inside > 50, "too few inside samples: {checked_inside}");
+            assert!(checked_outside > 1000);
+        }
+
+        // Same point twice: nothing to draw.
+        assert!(super::annotation_arrow_outline(center(3.0, 3.0), center(3.0, 3.0), sq).is_none());
     }
 
     #[test]
