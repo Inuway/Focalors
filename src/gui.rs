@@ -3818,12 +3818,17 @@ impl FocalorsApp {
                             .unwrap_or("");
                         let label = format!("{san_or_uci}{symbol}");
                         let selected = *new_cursor == ply + 1;
+                        // The selected move sits on the accent fill, where the
+                        // classification color is unreadable in dark mode; it
+                        // takes the plain text color like a selected nav
+                        // button, and the note below still names the class.
+                        let text_color = if selected { hydra_text() } else { class_color };
                         let resp = ui.selectable_label(
                             selected,
                             egui::RichText::new(label)
                                 .size(12.5)
                                 .strong()
-                                .color(class_color),
+                                .color(text_color),
                         );
                         if resp.clicked() {
                             *new_cursor = ply + 1;
@@ -7097,7 +7102,14 @@ fn draw_clock_row(ui: &mut egui::Ui, name: &str, sub: &str, remaining_ms: u64, a
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(hydra_heading(name, 13.0));
-                    ui.label(egui::RichText::new(sub).size(11.0).color(hydra_subtle_text()));
+                    // Grey on the active row's accent fill is too faint in dark
+                    // mode; a softened text color reads on both fills.
+                    let sub_color = if active {
+                        hydra_text().gamma_multiply(0.8)
+                    } else {
+                        hydra_subtle_text()
+                    };
+                    ui.label(egui::RichText::new(sub).size(11.0).color(sub_color));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
