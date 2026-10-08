@@ -4,8 +4,15 @@ Attribution for third-party assets included in this repository.
 
 ## Chess piece graphics
 
-The chess piece images in [`assets/pieces/`](assets/pieces/) (both SVG and PNG)
-are by **Colin M.L. Burnett** (Wikipedia user
+Each piece set lives in its own directory under
+[`assets/pieces/`](assets/pieces/), with the SVG sources and the 128px PNG
+rasterizations the app embeds. The sets keep their own licenses; the rest of
+Focalors is licensed under GPL-3.0-or-later (see [`LICENSE`](LICENSE)).
+
+### Cburnett (default set)
+
+The pieces in [`assets/pieces/cburnett/`](assets/pieces/cburnett/) are by
+**Colin M.L. Burnett** (Wikipedia user
 [Cburnett](https://en.wikipedia.org/wiki/User:Cburnett)). They are the same
 piece set that originated on Wikipedia in 2006 and is now used by lichess and
 many other open-source chess projects.
@@ -17,8 +24,17 @@ The original SVGs are included unmodified. The PNGs alongside them are
 rasterizations of those SVGs and are distributed under the same CC BY-SA 3.0
 license.
 
-These piece images retain their original CC BY-SA 3.0 license; the rest of
-Focalors is licensed under GPL-3.0-or-later (see [`LICENSE`](LICENSE)).
+### RhosGFX
+
+The pieces in [`assets/pieces/rhosgfx/`](assets/pieces/rhosgfx/) are the
+"Outline" variant of the **Vector Chess Pieces Pack** by **RhosGFX**.
+
+- **Source:** <https://rhosgfx.itch.io/vector-chess-pieces>
+- **License:** [CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/) (public domain dedication, as stated in the pack's License.txt)
+
+The SVGs are the pack's files renamed to the `wK` to `bP` scheme shared by
+every set here, otherwise unmodified. The PNGs are rasterizations of those
+SVGs. CC0 asks for no attribution; it is given here with thanks.
 
 ## Typeface
 

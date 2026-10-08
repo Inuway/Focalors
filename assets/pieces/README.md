@@ -1,14 +1,11 @@
-# Chess piece graphics
+# Chess piece sets
 
-These images are by **Colin M.L. Burnett** (Wikipedia user
-[Cburnett](https://en.wikipedia.org/wiki/User:Cburnett)).
+One directory per set. Each holds the twelve SVG sources (`wK` to `bP`) and
+the 128px PNG rasterizations the app embeds. The sets keep their own
+licenses, separate from the GPL-3.0-or-later that covers the rest of
+Focalors; see the README in each directory and [`/CREDITS.md`](../../CREDITS.md).
 
-- **Source:** <https://commons.wikimedia.org/wiki/Category:SVG_chess_pieces>
-- **License:** [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/)
-
-The SVGs are included unmodified. The PNGs are rasterizations of those SVGs
-and inherit the same license.
-
-These files are licensed separately from the rest of Focalors (which is
-GPL-3.0-or-later). See [`/CREDITS.md`](../../CREDITS.md) at the repository
-root for the full attribution.
+| Directory | Set | Author | License |
+| --- | --- | --- | --- |
+| `cburnett/` | Cburnett (default) | Colin M.L. Burnett | CC BY-SA 3.0 |
+| `rhosgfx/` | RhosGFX | RhosGFX | CC0 1.0 |

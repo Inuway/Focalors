@@ -365,6 +365,54 @@ const SETTINGS_PREVIEW_FEN: &str =
 /// with the last-move highlight.
 const SETTINGS_PREVIEW_LAST_MOVE: [u8; 2] = [62, 45];
 
+/// Piece graphics set, picked in Settings. Every set ships the same twelve
+/// 128px PNGs (rasterized from the SVGs beside them in `assets/pieces/`),
+/// so the board code draws any of them the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum PieceSet {
+    Cburnett,
+    Rhosgfx,
+}
+
+impl PieceSet {
+    /// Display order of the Settings swatches.
+    const ALL: [PieceSet; 2] = [PieceSet::Cburnett, PieceSet::Rhosgfx];
+
+    fn label(self) -> &'static str {
+        match self {
+            PieceSet::Cburnett => "Cburnett",
+            PieceSet::Rhosgfx => "RhosGFX",
+        }
+    }
+
+    /// String form persisted to the SQLite user_profile.piece_set column.
+    /// Doubles as the set's directory name under `assets/pieces/`.
+    fn as_db_str(self) -> &'static str {
+        match self {
+            PieceSet::Cburnett => "cburnett",
+            PieceSet::Rhosgfx => "rhosgfx",
+        }
+    }
+
+    /// Inverse of `as_db_str`. Unknown values fall back to Cburnett, the set
+    /// every board showed before sets became a choice.
+    fn from_db_str(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|set| set.as_db_str() == s)
+            .unwrap_or(PieceSet::Cburnett)
+    }
+
+    /// The set's twelve embedded images: (side, piece, texture name, PNG
+    /// bytes), white first, king to pawn.
+    fn images(self) -> &'static [(Color, Piece, &'static str, &'static [u8]); 12] {
+        match self {
+            PieceSet::Cburnett => &CBURNETT_IMAGES,
+            PieceSet::Rhosgfx => &RHOSGFX_IMAGES,
+        }
+    }
+}
+
 impl TimePreset {
     const ALL: [TimePreset; 8] = [
         TimePreset::Bullet1_0,
@@ -787,6 +835,7 @@ pub struct FocalorsApp {
     home_page: HomePage,
     ui_theme: UiTheme,
     board_theme: BoardTheme,
+    piece_set: PieceSet,
     show_settings: bool,
     /// Fixed position drawn in the Settings window's board preview.
     settings_preview_board: Board,
@@ -832,9 +881,9 @@ pub struct FocalorsApp {
     puzzle_message: Option<(String, egui::Color32, std::time::Instant)>,
     show_advanced_engine_settings: bool,
     pending_promotion: Option<PendingPromotion>,
-    piece_textures: HashMap<(Color, Piece), egui::TextureHandle>,
-    /// Downscaled copies of `piece_textures` for small boards.
-    piece_textures_small: HashMap<(Color, Piece), egui::TextureHandle>,
+    /// Textures of every piece set, loaded once at startup so Settings can
+    /// show all of them and switching never stalls a frame.
+    piece_sets: HashMap<PieceSet, PieceTextures>,
     pgn_import_text: String,
     pgn_import_parsed: Option<crate::pgn::ParsedPgn>,
     pgn_import_error: Option<String>,
@@ -878,25 +927,34 @@ fn build_replay_state(game: crate::db::SavedGame) -> ReplayState {
     }
 }
 
-/// The twelve embedded piece images: (side, piece, texture name, PNG bytes).
-const PIECE_IMAGES: [(Color, Piece, &str, &[u8]); 12] = [
-    (Color::White, Piece::King, "wK", include_bytes!("../assets/pieces/wK.png")),
-    (Color::White, Piece::Queen, "wQ", include_bytes!("../assets/pieces/wQ.png")),
-    (Color::White, Piece::Rook, "wR", include_bytes!("../assets/pieces/wR.png")),
-    (Color::White, Piece::Bishop, "wB", include_bytes!("../assets/pieces/wB.png")),
-    (Color::White, Piece::Knight, "wN", include_bytes!("../assets/pieces/wN.png")),
-    (Color::White, Piece::Pawn, "wP", include_bytes!("../assets/pieces/wP.png")),
-    (Color::Black, Piece::King, "bK", include_bytes!("../assets/pieces/bK.png")),
-    (Color::Black, Piece::Queen, "bQ", include_bytes!("../assets/pieces/bQ.png")),
-    (Color::Black, Piece::Rook, "bR", include_bytes!("../assets/pieces/bR.png")),
-    (Color::Black, Piece::Bishop, "bB", include_bytes!("../assets/pieces/bB.png")),
-    (Color::Black, Piece::Knight, "bN", include_bytes!("../assets/pieces/bN.png")),
-    (Color::Black, Piece::Pawn, "bP", include_bytes!("../assets/pieces/bP.png")),
-];
+/// The twelve piece images of one set, embedded from `assets/pieces/<dir>/`:
+/// (side, piece, texture name, PNG bytes).
+macro_rules! piece_set_images {
+    ($dir:literal) => {
+        [
+            (Color::White, Piece::King, "wK", include_bytes!(concat!("../assets/pieces/", $dir, "/wK.png"))),
+            (Color::White, Piece::Queen, "wQ", include_bytes!(concat!("../assets/pieces/", $dir, "/wQ.png"))),
+            (Color::White, Piece::Rook, "wR", include_bytes!(concat!("../assets/pieces/", $dir, "/wR.png"))),
+            (Color::White, Piece::Bishop, "wB", include_bytes!(concat!("../assets/pieces/", $dir, "/wB.png"))),
+            (Color::White, Piece::Knight, "wN", include_bytes!(concat!("../assets/pieces/", $dir, "/wN.png"))),
+            (Color::White, Piece::Pawn, "wP", include_bytes!(concat!("../assets/pieces/", $dir, "/wP.png"))),
+            (Color::Black, Piece::King, "bK", include_bytes!(concat!("../assets/pieces/", $dir, "/bK.png"))),
+            (Color::Black, Piece::Queen, "bQ", include_bytes!(concat!("../assets/pieces/", $dir, "/bQ.png"))),
+            (Color::Black, Piece::Rook, "bR", include_bytes!(concat!("../assets/pieces/", $dir, "/bR.png"))),
+            (Color::Black, Piece::Bishop, "bB", include_bytes!(concat!("../assets/pieces/", $dir, "/bB.png"))),
+            (Color::Black, Piece::Knight, "bN", include_bytes!(concat!("../assets/pieces/", $dir, "/bN.png"))),
+            (Color::Black, Piece::Pawn, "bP", include_bytes!(concat!("../assets/pieces/", $dir, "/bP.png"))),
+        ]
+    };
+}
+
+const CBURNETT_IMAGES: [(Color, Piece, &str, &[u8]); 12] = piece_set_images!("cburnett");
+const RHOSGFX_IMAGES: [(Color, Piece, &str, &[u8]); 12] = piece_set_images!("rhosgfx");
 
 /// Edge length of the downscaled piece textures used on small boards (the
-/// Settings preview). The full-size textures alias badly once the GPU has
-/// to shrink them more than about 2x with plain linear filtering.
+/// Settings preview and piece-set swatches). The full-size textures alias
+/// badly once the GPU has to shrink them more than about 2x with plain
+/// linear filtering.
 const PIECE_SMALL_PX: u32 = 48;
 
 fn load_piece_texture(
@@ -949,6 +1007,30 @@ fn load_small_piece_texture(
     ctx.load_texture(name, color_image, egui::TextureOptions::LINEAR)
 }
 
+/// Full-size and downscaled textures of one piece set, both keyed by
+/// (side, piece).
+struct PieceTextures {
+    full: HashMap<(Color, Piece), egui::TextureHandle>,
+    small: HashMap<(Color, Piece), egui::TextureHandle>,
+}
+
+fn load_piece_set(ctx: &egui::Context, set: PieceSet) -> PieceTextures {
+    let dir = set.as_db_str();
+    let mut full = HashMap::new();
+    let mut small = HashMap::new();
+    for &(color, piece, name, data) in set.images() {
+        full.insert(
+            (color, piece),
+            load_piece_texture(ctx, &format!("{dir}/{name}"), data),
+        );
+        small.insert(
+            (color, piece),
+            load_small_piece_texture(ctx, &format!("{dir}/{name}_small"), data),
+        );
+    }
+    PieceTextures { full, small }
+}
+
 impl FocalorsApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Theme is configured below once the DB has been opened and the
@@ -957,18 +1039,13 @@ impl FocalorsApp {
 
         let state = Arc::new(Mutex::new(SharedState::default()));
 
-        // Load piece textures from embedded PNGs
+        // Load every piece set's textures from the embedded PNGs
         let ctx = &cc.egui_ctx;
         install_fonts(ctx);
-        let mut piece_textures = HashMap::new();
-        let mut piece_textures_small = HashMap::new();
-        for (color, piece, name, data) in PIECE_IMAGES {
-            piece_textures.insert((color, piece), load_piece_texture(ctx, name, data));
-            piece_textures_small.insert(
-                (color, piece),
-                load_small_piece_texture(ctx, &format!("{name}_small"), data),
-            );
-        }
+        let piece_sets: HashMap<PieceSet, PieceTextures> = PieceSet::ALL
+            .into_iter()
+            .map(|set| (set, load_piece_set(ctx, set)))
+            .collect();
 
         // Initialize database
         let db = match crate::db::Database::open() {
@@ -1024,6 +1101,12 @@ impl FocalorsApp {
             .unwrap_or(BoardTheme::Walnut);
         ACTIVE_BOARD_THEME.store(board_theme.index(), Ordering::Relaxed);
 
+        let piece_set = db
+            .as_ref()
+            .and_then(|db| db.get_piece_set().ok())
+            .map(|s| PieceSet::from_db_str(&s))
+            .unwrap_or(PieceSet::Cburnett);
+
         let session_start_rating = profile.as_ref().map_or(1200, |p| p.rating);
         let session_start_games = profile.as_ref().map_or(0, |p| p.games_played);
 
@@ -1039,6 +1122,7 @@ impl FocalorsApp {
             home_page: HomePage::Overview,
             ui_theme,
             board_theme,
+            piece_set,
             show_settings: false,
             settings_preview_board: Board::from_fen(SETTINGS_PREVIEW_FEN)
                 .unwrap_or_else(|_| Board::startpos()),
@@ -1069,8 +1153,7 @@ impl FocalorsApp {
             puzzle_message: None,
             show_advanced_engine_settings: false,
             pending_promotion: None,
-            piece_textures,
-            piece_textures_small,
+            piece_sets,
             pgn_import_text: String::new(),
             pgn_import_parsed: None,
             pgn_import_error: None,
@@ -1096,6 +1179,23 @@ impl FocalorsApp {
         if let Some(ref db) = self.db {
             let _ = db.set_board_theme(theme.as_db_str());
         }
+    }
+
+    fn set_piece_set(&mut self, set: PieceSet) {
+        self.piece_set = set;
+        if let Some(ref db) = self.db {
+            let _ = db.set_piece_set(set.as_db_str());
+        }
+    }
+
+    /// Full-size image of a piece in the active set.
+    fn piece_texture(&self, color: Color, piece: Piece) -> Option<&egui::TextureHandle> {
+        self.piece_sets.get(&self.piece_set)?.full.get(&(color, piece))
+    }
+
+    /// Downscaled image of a piece in the active set, for small boards.
+    fn small_piece_texture(&self, color: Color, piece: Piece) -> Option<&egui::TextureHandle> {
+        self.piece_sets.get(&self.piece_set)?.small.get(&(color, piece))
     }
 
     fn local_input_enabled(&self) -> bool {
@@ -4423,9 +4523,9 @@ impl FocalorsApp {
 
     // ── Settings window ────────────────────────────────────────────────
 
-    /// App-wide preferences. Appearance only for now; piece sets and other
-    /// customization get their own sections here later. Every choice applies
-    /// and saves on click, so there is no confirm step.
+    /// App-wide preferences: app theme, board colors and piece set. Future
+    /// customization gets its own section here. Every choice applies and
+    /// saves on click, so there is no confirm step.
     fn draw_settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
@@ -4434,6 +4534,7 @@ impl FocalorsApp {
         let mut open = true;
         let mut pick_ui_theme: Option<UiTheme> = None;
         let mut pick_board: Option<BoardTheme> = None;
+        let mut pick_pieces: Option<PieceSet> = None;
 
         egui::Window::new(hydra_heading("Settings", 16.0))
             .id(egui::Id::new("settings_window"))
@@ -4483,6 +4584,22 @@ impl FocalorsApp {
                         .size(11.0)
                         .color(hydra_subtle_text()),
                 );
+
+                ui.add_space(SECTION_GAP - ui.spacing().item_spacing.y);
+                ui.label(hydra_heading("PIECES", 10.0).color(hydra_subtle_text()));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = SETTINGS_SWATCH_GAP;
+                    let palette = self.board_theme.palette();
+                    for set in PieceSet::ALL {
+                        let selected = self.piece_set == set;
+                        if let Some(textures) = self.piece_sets.get(&set)
+                            && piece_set_swatch(ui, set, textures, palette, selected).clicked()
+                            && !selected
+                        {
+                            pick_pieces = Some(set);
+                        }
+                    }
+                });
             });
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -4493,6 +4610,9 @@ impl FocalorsApp {
         }
         if let Some(theme) = pick_board {
             self.set_board_theme(theme);
+        }
+        if let Some(set) = pick_pieces {
+            self.set_piece_set(set);
         }
         self.show_settings = open;
     }
@@ -4530,7 +4650,7 @@ impl FocalorsApp {
                 painter.rect_filled(cell, grid_cell_corner_radius(file, visual_rank, 7, 6), color);
                 if let Some((piece_color, piece)) =
                     self.settings_preview_board.piece_on(Square(sq_idx))
-                    && let Some(texture) = self.piece_textures_small.get(&(piece_color, piece))
+                    && let Some(texture) = self.small_piece_texture(piece_color, piece)
                 {
                     draw_piece_image(painter, texture, cell.shrink(sq * 0.05));
                 }
@@ -4954,7 +5074,7 @@ impl FocalorsApp {
                         continue;
                     }
 
-                    if let Some(tex) = self.piece_textures.get(&(piece_color, piece)) {
+                    if let Some(tex) = self.piece_texture(piece_color, piece) {
                         let padding = sq_size * 0.05;
                         let img_rect = egui::Rect::from_min_size(
                             egui::pos2(rect.min.x + padding, rect.min.y + padding),
@@ -4977,7 +5097,7 @@ impl FocalorsApp {
 
         // Pieces gliding between squares, drawn on top of the static board.
         for (from_sq, to_sq, piece, t) in &glides {
-            if let Some(texture) = self.piece_textures.get(piece) {
+            if let Some(texture) = self.piece_texture(piece.0, piece.1) {
                 let from_c =
                     board_square_rect(board_rect, sq_size, self.flipped, *from_sq).center();
                 let to_c = board_square_rect(board_rect, sq_size, self.flipped, *to_sq).center();
@@ -5183,9 +5303,8 @@ impl FocalorsApp {
 
         let pointer_down = ui.ctx().input(|input| input.pointer.primary_down());
         if interactive && let Some(drag_state) = self.drag_state {
-            if let Some(texture) = self
-                .piece_textures
-                .get(&(drag_state.piece_color, drag_state.piece))
+            if let Some(texture) =
+                self.piece_texture(drag_state.piece_color, drag_state.piece)
             {
                 let piece_size = sq_size * 0.94;
                 let piece_rect = egui::Rect::from_center_size(
@@ -6766,6 +6885,72 @@ fn board_theme_swatch(ui: &mut egui::Ui, theme: BoardTheme, selected: bool) -> e
         }
     }
 
+    finish_swatch(painter, sample, response.hovered(), selected, theme.label());
+
+    response
+}
+
+/// One clickable piece-set swatch for the Settings window: four pieces of
+/// the set on a 2x2 corner of the current board, so a set is judged on the
+/// squares it will actually sit on. Same footprint and ring as the board
+/// swatches.
+fn piece_set_swatch(
+    ui: &mut egui::Ui,
+    set: PieceSet,
+    textures: &PieceTextures,
+    palette: BoardPalette,
+    selected: bool,
+) -> egui::Response {
+    let side = SETTINGS_SWATCH;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(side, side + SETTINGS_SWATCH_LABEL_H),
+        egui::Sense::click(),
+    );
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let painter = ui.painter();
+    let sample = egui::Rect::from_min_size(rect.min, egui::vec2(side, side));
+    let cell = side / 2.0;
+    // Both sides on both square colors: king and queen up top, knights below.
+    let pieces = [
+        [(Color::White, Piece::King), (Color::Black, Piece::Queen)],
+        [(Color::White, Piece::Knight), (Color::Black, Piece::Knight)],
+    ];
+    for row in 0..2u8 {
+        for col in 0..2u8 {
+            let square = egui::Rect::from_min_size(
+                egui::pos2(
+                    sample.min.x + col as f32 * cell,
+                    sample.min.y + row as f32 * cell,
+                ),
+                egui::vec2(cell, cell),
+            );
+            let color = if (row + col) % 2 == 0 { palette.light } else { palette.dark };
+            painter.rect_filled(square, grid_cell_corner_radius(col, row, 1, 5), color);
+            let (piece_color, piece) = pieces[row as usize][col as usize];
+            if let Some(texture) = textures.small.get(&(piece_color, piece)) {
+                draw_piece_image(painter, texture, square.shrink(cell * 0.05));
+            }
+        }
+    }
+
+    finish_swatch(painter, sample, response.hovered(), selected, set.label());
+
+    response
+}
+
+/// Accent ring around the selected swatch (a subtle one on hover) and the
+/// name under it. Shared by the board-theme and piece-set swatches.
+fn finish_swatch(
+    painter: &egui::Painter,
+    sample: egui::Rect,
+    hovered: bool,
+    selected: bool,
+    label: &str,
+) {
     if selected {
         painter.rect_stroke(
             sample.expand(3.0),
@@ -6773,7 +6958,7 @@ fn board_theme_swatch(ui: &mut egui::Ui, theme: BoardTheme, selected: bool) -> e
             egui::Stroke::new(2.0_f32, hydra_accent()),
             egui::StrokeKind::Inside,
         );
-    } else if response.hovered() {
+    } else if hovered {
         painter.rect_stroke(
             sample.expand(3.0),
             egui::CornerRadius::same(8),
@@ -6790,12 +6975,10 @@ fn board_theme_swatch(ui: &mut egui::Ui, theme: BoardTheme, selected: bool) -> e
     painter.text(
         egui::pos2(sample.center().x, sample.max.y + SETTINGS_SWATCH_LABEL_H * 0.6),
         egui::Align2::CENTER_CENTER,
-        theme.label(),
+        label,
         font,
         color,
     );
-
-    response
 }
 
 /// Compact non-interactive board renderer for History thumbnails. Always
@@ -7508,6 +7691,52 @@ mod tests {
         assert_eq!(to, Square::from_algebraic("f6").unwrap().0);
         assert_eq!(board.piece_on(Square(from)), None);
         assert_eq!(board.piece_on(Square(to)), Some((Color::Black, Piece::Knight)));
+    }
+
+    #[test]
+    fn piece_set_round_trips_and_cburnett_is_the_fallback() {
+        use super::PieceSet;
+
+        for set in PieceSet::ALL {
+            assert_eq!(PieceSet::from_db_str(set.as_db_str()), set);
+        }
+        assert_eq!(PieceSet::from_db_str("sadsnake"), PieceSet::Cburnett);
+        assert_eq!(PieceSet::from_db_str(""), PieceSet::Cburnett);
+    }
+
+    /// Every set embeds the same twelve pieces in the same order, each a
+    /// 128px square PNG, so the board draws any set identically.
+    #[test]
+    fn every_piece_set_embeds_twelve_square_images() {
+        use crate::types::{Color, Piece};
+
+        let expected: Vec<(Color, Piece)> = [Color::White, Color::Black]
+            .into_iter()
+            .flat_map(|color| {
+                [Piece::King, Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight, Piece::Pawn]
+                    .into_iter()
+                    .map(move |piece| (color, piece))
+            })
+            .collect();
+        for set in super::PieceSet::ALL {
+            let got: Vec<(Color, Piece)> =
+                set.images().iter().map(|&(color, piece, _, _)| (color, piece)).collect();
+            assert_eq!(got, expected, "{set:?}: image table order");
+            for &(color, _, name, data) in set.images() {
+                let prefix = match color {
+                    Color::White => 'w',
+                    Color::Black => 'b',
+                };
+                assert!(name.starts_with(prefix), "{set:?}/{name}: wrong side prefix");
+                let img = image::load_from_memory(data)
+                    .unwrap_or_else(|e| panic!("{set:?}/{name}: {e}"));
+                assert_eq!(
+                    (img.width(), img.height()),
+                    (128, 128),
+                    "{set:?}/{name} must be a 128px square"
+                );
+            }
+        }
     }
 
     #[test]

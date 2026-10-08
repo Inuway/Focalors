@@ -289,6 +289,11 @@ impl Database {
             "ALTER TABLE user_profile ADD COLUMN board_theme TEXT NOT NULL DEFAULT 'walnut'",
             [],
         );
+        // Piece graphics set picked in Settings.
+        let _ = self.conn.execute(
+            "ALTER TABLE user_profile ADD COLUMN piece_set TEXT NOT NULL DEFAULT 'cburnett'",
+            [],
+        );
         Ok(())
     }
 
@@ -328,6 +333,26 @@ impl Database {
         self.conn.execute(
             "UPDATE user_profile SET board_theme = ?1, updated_at = datetime('now') WHERE id = 1",
             params![theme],
+        )?;
+        Ok(())
+    }
+
+    /// Read the persisted piece set (the GUI's `PieceSet` in its database
+    /// string form). Callers fall back to the default set on any error, so
+    /// a stale DB without the column still starts.
+    pub fn get_piece_set(&self) -> SqlResult<String> {
+        self.conn.query_row(
+            "SELECT piece_set FROM user_profile WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// Persist the piece set.
+    pub fn set_piece_set(&self, set: &str) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE user_profile SET piece_set = ?1, updated_at = datetime('now') WHERE id = 1",
+            params![set],
         )?;
         Ok(())
     }
@@ -1012,6 +1037,27 @@ mod tests {
         // Running the migration again (every app start does) keeps the choice.
         db.migrate_phase4().unwrap();
         assert_eq!(db.get_board_theme().unwrap(), "glacier");
+    }
+
+    #[test]
+    fn piece_set_defaults_to_cburnett_and_round_trips() {
+        let db = Database {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.init_schema().unwrap();
+        db.migrate_phase4().unwrap();
+        db.get_or_create_profile().unwrap();
+
+        // Existing profiles keep the pieces they always had.
+        assert_eq!(db.get_piece_set().unwrap(), "cburnett");
+        db.set_piece_set("rhosgfx").unwrap();
+        assert_eq!(db.get_piece_set().unwrap(), "rhosgfx");
+        // The board theme shares the row and must be left alone.
+        assert_eq!(db.get_board_theme().unwrap(), "walnut");
+
+        // Running the migration again (every app start does) keeps the choice.
+        db.migrate_phase4().unwrap();
+        assert_eq!(db.get_piece_set().unwrap(), "rhosgfx");
     }
 
     #[test]
