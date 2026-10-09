@@ -966,6 +966,9 @@ pub struct FocalorsApp {
     /// the profile row. Flushed once the slider is released or the window
     /// closes, so a drag does not write on every frame.
     custom_engine_dirty: bool,
+    /// End Game asks for a second click: set on the first click, and the
+    /// button reads "Confirm end" until this instant passes.
+    end_game_confirm_until: Option<Instant>,
     pending_promotion: Option<PendingPromotion>,
     /// Textures of every piece set, loaded once at startup so Settings can
     /// show all of them and switching never stalls a frame.
@@ -1256,6 +1259,7 @@ impl FocalorsApp {
             puzzle_message: None,
             show_advanced_engine_settings: false,
             custom_engine_dirty: false,
+            end_game_confirm_until: None,
             pending_promotion: None,
             piece_sets,
             pgn_import_text: String::new(),
@@ -3197,7 +3201,13 @@ impl FocalorsApp {
         if let AnalysisState::Running { progress, total } = *analysis {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(hydra_heading(format!("Analyzing {progress}/{total} moves"), 13.0));
+                ui.label(hydra_heading(
+                    format!(
+                        "Analyzing {progress}/{total} moves · {}",
+                        self.analysis_quality.label()
+                    ),
+                    13.0,
+                ));
             });
             ui.add_space(6.0);
             if total > 0 {
@@ -6105,11 +6115,43 @@ impl FocalorsApp {
                                 GameOutcome::Resignation(human.flip()),
                             );
                         }
+                        // End Game discards the game: not saved, not rated.
+                        // One click only arms it; the second click within a
+                        // few seconds goes through, like resigning on lichess.
+                        let confirming = self
+                            .end_game_confirm_until
+                            .is_some_and(|until| Instant::now() < until);
+                        if !confirming {
+                            self.end_game_confirm_until = None;
+                        }
+                        let label = if confirming { "Confirm end" } else { "End Game" };
                         let w = cols[1].available_width();
-                        if cols[1].add_sized([w, 32.0], danger_button("End Game")).clicked() {
-                            abort = true;
+                        if cols[1].add_sized([w, 32.0], danger_button(label)).clicked() {
+                            if confirming {
+                                self.end_game_confirm_until = None;
+                                abort = true;
+                            } else {
+                                self.end_game_confirm_until =
+                                    Some(Instant::now() + END_GAME_CONFIRM_WINDOW);
+                            }
                         }
                     });
+                    if self.end_game_confirm_until.is_some() {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Ends the game without saving or rating it. Click again to confirm.",
+                                )
+                                .size(11.0)
+                                .color(hydra_danger()),
+                            )
+                            .wrap(),
+                        );
+                        // Keep repainting so the button reverts on time even
+                        // while nothing else moves.
+                        ui.ctx().request_repaint_after(Duration::from_millis(250));
+                    }
                 }
 
                 ui.add_space(SECTION_GAP);
@@ -6541,6 +6583,8 @@ const SETTINGS_PREVIEW_GAP: f32 = 20.0;
 /// Custom opponent window: content width, enough for a slider with its
 /// value box beside it.
 const CUSTOM_OPPONENT_W: f32 = 360.0;
+/// How long End Game stays armed after its first click.
+const END_GAME_CONFIRM_WINDOW: Duration = Duration::from_secs(4);
 /// Swatch grid + gap + preview: fixes the window width so nothing reflows.
 const SETTINGS_CONTENT_W: f32 = SETTINGS_SWATCH_COLS as f32 * SETTINGS_SWATCH
     + (SETTINGS_SWATCH_COLS as f32 - 1.0) * SETTINGS_SWATCH_GAP
