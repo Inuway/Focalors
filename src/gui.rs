@@ -18,13 +18,33 @@ use crate::uci;
 // Shared state between GUI and background threads
 // ════════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone)]
+/// How the Custom opponent thinks: a fixed time per move or a fixed depth.
+/// Only the Custom profile reads these; the named profiles carry their own
+/// strength settings. Persisted in the profile row.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct EngineSettings {
     pub max_depth: u32,
     pub think_time_ms: u64,
-    pub tt_size_mb: usize,
     pub use_time_limit: bool, // true = time-based, false = depth-based
-    pub analysis_depth: u32,
+}
+
+impl EngineSettings {
+    /// Slider ranges in the Custom opponent window. Stored values are
+    /// clamped into them, so an edited or corrupted row cannot produce a
+    /// zero-depth or hour-long search.
+    pub const THINK_TIME_MS_RANGE: (u64, u64) = (500, 30_000);
+    pub const MAX_DEPTH_RANGE: (u32, u32) = (1, 30);
+
+    /// Rebuild from the persisted columns, clamping into the slider ranges.
+    pub fn from_stored(use_time_limit: bool, think_time_ms: i64, max_depth: i64) -> Self {
+        let (t_min, t_max) = Self::THINK_TIME_MS_RANGE;
+        let (d_min, d_max) = Self::MAX_DEPTH_RANGE;
+        Self {
+            max_depth: max_depth.clamp(d_min as i64, d_max as i64) as u32,
+            think_time_ms: think_time_ms.clamp(t_min as i64, t_max as i64) as u64,
+            use_time_limit,
+        }
+    }
 }
 
 impl Default for EngineSettings {
@@ -32,9 +52,7 @@ impl Default for EngineSettings {
         Self {
             max_depth: 12,
             think_time_ms: 5000,
-            tt_size_mb: 64,
             use_time_limit: true,
-            analysis_depth: 14,
         }
     }
 }
@@ -152,7 +170,7 @@ impl LocalDifficulty {
                 adaptive_level,
                 crate::strength::estimated_elo(adaptive_level),
             ),
-            LocalDifficulty::Custom => "Uses the values from Advanced engine settings (depth, time, TT).".into(),
+            LocalDifficulty::Custom => "Thinks for a fixed time or to a fixed depth per move. Set it up under Advanced.".into(),
         }
     }
 }
@@ -410,6 +428,69 @@ impl PieceSet {
             PieceSet::Cburnett => &CBURNETT_IMAGES,
             PieceSet::Rhosgfx => &RHOSGFX_IMAGES,
         }
+    }
+}
+
+/// How deep Game Review searches every position of a game. Depth is the only
+/// knob there is: each extra ply costs roughly twice the time of the one
+/// before, so the choice is waiting time against the last few centipawns.
+/// Standard is the depth every review ran at before this was a choice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnalysisQuality {
+    Quick,
+    Standard,
+    Deep,
+}
+
+impl AnalysisQuality {
+    /// Display order of the choice in Game Review.
+    const ALL: [AnalysisQuality; 3] = [
+        AnalysisQuality::Quick,
+        AnalysisQuality::Standard,
+        AnalysisQuality::Deep,
+    ];
+
+    /// Search depth handed to `analysis::analyze_game`.
+    fn depth(self) -> u32 {
+        match self {
+            AnalysisQuality::Quick => 12,
+            AnalysisQuality::Standard => 14,
+            AnalysisQuality::Deep => 18,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AnalysisQuality::Quick => "Quick",
+            AnalysisQuality::Standard => "Standard",
+            AnalysisQuality::Deep => "Deep",
+        }
+    }
+
+    /// One line under the choice: the trade-off in plain words.
+    fn hint(self) -> &'static str {
+        match self {
+            AnalysisQuality::Quick => "A rougher grade in a fraction of the time.",
+            AnalysisQuality::Standard => "Reliable grades that finish while you wait. The usual choice.",
+            AnalysisQuality::Deep => "Finer evaluations on every move, several times slower.",
+        }
+    }
+
+    /// String form persisted to the SQLite user_profile.analysis_quality column.
+    fn as_db_str(self) -> &'static str {
+        match self {
+            AnalysisQuality::Quick => "quick",
+            AnalysisQuality::Standard => "standard",
+            AnalysisQuality::Deep => "deep",
+        }
+    }
+
+    /// Inverse of `as_db_str`. Unknown values fall back to Standard.
+    fn from_db_str(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|quality| quality.as_db_str() == s)
+            .unwrap_or(AnalysisQuality::Standard)
     }
 }
 
@@ -836,6 +917,7 @@ pub struct FocalorsApp {
     ui_theme: UiTheme,
     board_theme: BoardTheme,
     piece_set: PieceSet,
+    analysis_quality: AnalysisQuality,
     show_settings: bool,
     /// Fixed position drawn in the Settings window's board preview.
     settings_preview_board: Board,
@@ -880,6 +962,10 @@ pub struct FocalorsApp {
     puzzle_trainer: Option<PuzzleTrainerState>,
     puzzle_message: Option<(String, egui::Color32, std::time::Instant)>,
     show_advanced_engine_settings: bool,
+    /// Custom opponent values changed in its window but not yet written to
+    /// the profile row. Flushed once the slider is released or the window
+    /// closes, so a drag does not write on every frame.
+    custom_engine_dirty: bool,
     pending_promotion: Option<PendingPromotion>,
     /// Textures of every piece set, loaded once at startup so Settings can
     /// show all of them and switching never stalls a frame.
@@ -1107,6 +1193,22 @@ impl FocalorsApp {
             .map(|s| PieceSet::from_db_str(&s))
             .unwrap_or(PieceSet::Cburnett);
 
+        let analysis_quality = db
+            .as_ref()
+            .and_then(|db| db.get_analysis_quality().ok())
+            .map(|s| AnalysisQuality::from_db_str(&s))
+            .unwrap_or(AnalysisQuality::Standard);
+
+        // The Custom opponent's values live in the profile row too. Loaded
+        // before the first search can start, so a saved Custom setup plays
+        // the same after a restart.
+        if let Some((use_time_limit, think_time_ms, max_depth)) =
+            db.as_ref().and_then(|db| db.get_custom_engine().ok())
+        {
+            state.lock().unwrap().engine_settings =
+                EngineSettings::from_stored(use_time_limit, think_time_ms, max_depth);
+        }
+
         let session_start_rating = profile.as_ref().map_or(1200, |p| p.rating);
         let session_start_games = profile.as_ref().map_or(0, |p| p.games_played);
 
@@ -1123,6 +1225,7 @@ impl FocalorsApp {
             ui_theme,
             board_theme,
             piece_set,
+            analysis_quality,
             show_settings: false,
             settings_preview_board: Board::from_fen(SETTINGS_PREVIEW_FEN)
                 .unwrap_or_else(|_| Board::startpos()),
@@ -1152,6 +1255,7 @@ impl FocalorsApp {
             puzzle_trainer: None,
             puzzle_message: None,
             show_advanced_engine_settings: false,
+            custom_engine_dirty: false,
             pending_promotion: None,
             piece_sets,
             pgn_import_text: String::new(),
@@ -1185,6 +1289,13 @@ impl FocalorsApp {
         self.piece_set = set;
         if let Some(ref db) = self.db {
             let _ = db.set_piece_set(set.as_db_str());
+        }
+    }
+
+    fn set_analysis_quality(&mut self, quality: AnalysisQuality) {
+        self.analysis_quality = quality;
+        if let Some(ref db) = self.db {
+            let _ = db.set_analysis_quality(quality.as_db_str());
         }
     }
 
@@ -2960,7 +3071,7 @@ impl FocalorsApp {
         self.analysis_review_cursor = 0;
 
         let user_rating = self.profile.as_ref().map_or(1200, |p| p.rating);
-        let analysis_depth = self.state.lock().unwrap().engine_settings.analysis_depth;
+        let analysis_depth = self.analysis_quality.depth();
 
         thread::spawn(move || {
             // RAII guard: if this worker exits via panic before the Complete
@@ -3531,6 +3642,7 @@ impl FocalorsApp {
 
         let mut want_close = false;
         let mut want_analyze = false;
+        let mut pick_quality: Option<AnalysisQuality> = None;
 
         // ── Header strip ────────────────────────────────────────────────
         ui.horizontal(|ui| {
@@ -3779,6 +3891,26 @@ impl FocalorsApp {
                         );
                         if !uci_moves.is_empty() {
                             ui.add_space(10.0);
+                            ui.label(hydra_heading("DEPTH", 10.0).color(hydra_subtle_text()));
+                            ui.horizontal(|ui| {
+                                for quality in AnalysisQuality::ALL {
+                                    let selected = self.analysis_quality == quality;
+                                    if ui.add(home_nav_button(selected, quality.label())).clicked()
+                                        && !selected
+                                    {
+                                        pick_quality = Some(quality);
+                                    }
+                                }
+                            });
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(self.analysis_quality.hint())
+                                        .size(11.0)
+                                        .color(hydra_subtle_text()),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(10.0);
                             if ui
                                 .add_sized([ui.available_width(), 34.0], primary_button("Run Analysis"))
                                 .clicked()
@@ -3940,6 +4072,9 @@ impl FocalorsApp {
             if let Some(r) = self.replay_game.as_mut() {
                 r.cursor = new_cursor.min(r.moves.len());
             }
+        }
+        if let Some(quality) = pick_quality {
+            self.set_analysis_quality(quality);
         }
         if want_close {
             self.replay_game = None;
@@ -4201,7 +4336,7 @@ impl FocalorsApp {
             }
         }
 
-        self.draw_home_engine_settings_popup(&ctx, searching);
+        self.draw_custom_opponent_window(&ctx, searching);
     }
 
     /// Render a 4-card KPI strip at the top of the Overview: rating,
@@ -4663,33 +4798,105 @@ impl FocalorsApp {
         }
     }
 
-    fn draw_home_engine_settings_popup(&mut self, ctx: &egui::Context, searching: bool) {
+    /// The Custom opponent's thinking budget: a fixed time per move or a
+    /// fixed depth. Opens from the Advanced button next to the profile
+    /// picker, and on first picking Custom. Changes apply at once and are
+    /// written to the profile row once the slider is released.
+    fn draw_custom_opponent_window(&mut self, ctx: &egui::Context, searching: bool) {
         if !self.show_advanced_engine_settings {
             return;
         }
 
-        let mut settings = self.state.lock().unwrap().engine_settings.clone();
-        let mut open = self.show_advanced_engine_settings;
+        let before = self.state.lock().unwrap().engine_settings.clone();
+        let mut settings = before.clone();
+        let mut open = true;
 
-        egui::Window::new("Advanced Engine Settings")
+        egui::Window::new(hydra_heading("Custom opponent", 16.0))
+            .id(egui::Id::new("custom_opponent_window"))
             .open(&mut open)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
-            .default_width(420.0)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
             .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Active for analysis runs and the Custom local-game profile. Other difficulty profiles ignore these settings.",
+                ui.set_min_width(CUSTOM_OPPONENT_W);
+                ui.set_max_width(CUSTOM_OPPONENT_W);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Only the Custom profile uses these values. The named profiles keep their own strength.",
+                        )
+                        .size(11.0)
+                        .color(hydra_subtle_text()),
                     )
-                    .size(11.0)
-                    .color(hydra_subtle_text()),
+                    .wrap(),
                 );
-                ui.add_space(8.0);
-                draw_engine_settings_controls(ui, &mut settings, searching);
+
+                ui.add_space(SECTION_GAP - ui.spacing().item_spacing.y);
+                ui.label(hydra_heading("THINKING", 10.0).color(hydra_subtle_text()));
+                ui.add_enabled_ui(!searching, |ui| {
+                    ui.horizontal(|ui| {
+                        for (mode, label) in [(true, "Time limit"), (false, "Fixed depth")] {
+                            let selected = settings.use_time_limit == mode;
+                            if ui.add(home_nav_button(selected, label)).clicked() {
+                                settings.use_time_limit = mode;
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.spacing_mut().slider_width = CUSTOM_OPPONENT_W - 90.0;
+                    let (t_min, t_max) = EngineSettings::THINK_TIME_MS_RANGE;
+                    let (d_min, d_max) = EngineSettings::MAX_DEPTH_RANGE;
+                    let hint = if settings.use_time_limit {
+                        ui.label(egui::RichText::new("Think time per move").size(12.5));
+                        let mut secs = settings.think_time_ms as f32 / 1000.0;
+                        ui.add(
+                            egui::Slider::new(
+                                &mut secs,
+                                (t_min as f32 / 1000.0)..=(t_max as f32 / 1000.0),
+                            )
+                            .suffix(" s")
+                            .fixed_decimals(1),
+                        );
+                        settings.think_time_ms = (secs * 1000.0).round() as u64;
+                        "Less time makes a quicker, weaker opponent. A move never takes longer than the clock allows."
+                    } else {
+                        ui.label(egui::RichText::new("Search depth per move").size(12.5));
+                        let mut depth = settings.max_depth as i32;
+                        ui.add(egui::Slider::new(&mut depth, (d_min as i32)..=(d_max as i32)));
+                        settings.max_depth = depth as u32;
+                        "Low depths play like a beginner. Above 20, a single move can take minutes."
+                    };
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(hint).size(11.0).color(hydra_subtle_text()),
+                        )
+                        .wrap(),
+                    );
+                });
             });
 
-        self.state.lock().unwrap().engine_settings = settings;
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        if settings != before {
+            self.state.lock().unwrap().engine_settings = settings.clone();
+            self.custom_engine_dirty = true;
+        }
+        // One write per adjustment, not per frame: flush when no pointer
+        // button is held (the slider was released) or the window goes away.
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
+        if self.custom_engine_dirty && (!open || !pointer_down) {
+            if let Some(ref db) = self.db {
+                let _ = db.set_custom_engine(
+                    settings.use_time_limit,
+                    settings.think_time_ms,
+                    settings.max_depth,
+                );
+            }
+            self.custom_engine_dirty = false;
+        }
         self.show_advanced_engine_settings = open;
     }
 
@@ -4749,33 +4956,51 @@ impl FocalorsApp {
         self.state.lock().unwrap().status_message = "Promotion cancelled.".to_string();
     }
 
+    /// Promotion picker: the four candidate pieces from the active set, in
+    /// the mover's color, as tiles on a square of the current board. Esc or
+    /// Cancel keeps the pawn where it was.
     fn draw_promotion_window(&mut self, ctx: &egui::Context) {
         if self.pending_promotion.is_none() {
             return;
         }
 
+        // The mover's color follows from the move itself: White promotes on
+        // the eighth rank, Black on the first. True on any board, live or
+        // puzzle, without consulting engine state.
+        let Some(first) = self.pending_promotion.as_ref().and_then(|p| p.moves.first()) else {
+            return;
+        };
+        let color = if first.to_sq().0 / 8 == 7 { Color::White } else { Color::Black };
+        let square_color = self.board_theme.palette().light;
         let mut chosen_piece = None;
         let mut cancel = false;
 
-        egui::Window::new("Choose Promotion")
+        egui::Window::new(hydra_heading("Promote to", 16.0))
+            .id(egui::Id::new("promotion_window"))
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("Promote pawn to:");
                 ui.horizontal(|ui| {
-                    for piece in [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight] {
-                        if ui.button(piece_name(piece)).clicked() {
+                    ui.spacing_mut().item_spacing.x = SETTINGS_SWATCH_GAP;
+                    // Queen first, then the knight: the one underpromotion
+                    // anyone picks on purpose.
+                    for piece in [Piece::Queen, Piece::Knight, Piece::Rook, Piece::Bishop] {
+                        let texture = self.piece_texture(color, piece);
+                        if promotion_tile(ui, texture, square_color, piece_name(piece)).clicked() {
                             chosen_piece = Some(piece);
                         }
                     }
                 });
-                ui.add_space(4.0);
-                if ui.button("Cancel").clicked() {
+                ui.add_space(6.0);
+                if ui.add(secondary_button("Cancel")).clicked() {
                     cancel = true;
                 }
             });
 
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
         if let Some(piece) = chosen_piece {
             self.complete_promotion(piece);
         } else if cancel {
@@ -6313,6 +6538,9 @@ const SETTINGS_SWATCH_GAP: f32 = 12.0;
 const SETTINGS_PREVIEW_SIDE: f32 =
     2.0 * (SETTINGS_SWATCH + SETTINGS_SWATCH_LABEL_H) + SETTINGS_SWATCH_GAP;
 const SETTINGS_PREVIEW_GAP: f32 = 20.0;
+/// Custom opponent window: content width, enough for a slider with its
+/// value box beside it.
+const CUSTOM_OPPONENT_W: f32 = 360.0;
 /// Swatch grid + gap + preview: fixes the window width so nothing reflows.
 const SETTINGS_CONTENT_W: f32 = SETTINGS_SWATCH_COLS as f32 * SETTINGS_SWATCH
     + (SETTINGS_SWATCH_COLS as f32 - 1.0) * SETTINGS_SWATCH_GAP
@@ -6498,61 +6726,6 @@ fn theme_toggle_button(label: &str) -> egui::Button<'_> {
     .fill(egui::Color32::TRANSPARENT)
     .stroke(egui::Stroke::new(1.0_f32, hydra_border()))
     .corner_radius(2)
-}
-
-fn draw_engine_settings_controls(
-    ui: &mut egui::Ui,
-    settings: &mut EngineSettings,
-    searching: bool,
-) {
-    ui.add_enabled_ui(!searching, |ui| {
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut settings.use_time_limit, true, "Time limit");
-            ui.radio_value(&mut settings.use_time_limit, false, "Fixed depth");
-        });
-
-        ui.add_space(8.0);
-        if settings.use_time_limit {
-            ui.label(
-                egui::RichText::new("Think time per move")
-                    .size(11.0)
-                    .color(hydra_subtle_text()),
-            );
-            let secs = settings.think_time_ms as f32 / 1000.0;
-            let mut secs_val = secs;
-            ui.add(egui::Slider::new(&mut secs_val, 0.5..=30.0).suffix(" s"));
-            settings.think_time_ms = (secs_val * 1000.0) as u64;
-        } else {
-            ui.label(
-                egui::RichText::new("Search depth ceiling")
-                    .size(11.0)
-                    .color(hydra_subtle_text()),
-            );
-            let mut depth = settings.max_depth as i32;
-            ui.add(egui::Slider::new(&mut depth, 1..=30));
-            settings.max_depth = depth as u32;
-        }
-
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Transposition table")
-                .size(11.0)
-                .color(hydra_subtle_text()),
-        );
-        let mut mb = settings.tt_size_mb as i32;
-        ui.add(egui::Slider::new(&mut mb, 1..=256).suffix(" MB"));
-        settings.tt_size_mb = mb as usize;
-
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Analysis depth (game review)")
-                .size(11.0)
-                .color(hydra_subtle_text()),
-        );
-        let mut analysis_depth = settings.analysis_depth as i32;
-        ui.add(egui::Slider::new(&mut analysis_depth, 1..=30));
-        settings.analysis_depth = analysis_depth as u32;
-    });
 }
 
 /// Embedded UI typeface: Inter (OFL, see assets/fonts/LICENSE-Inter.txt).
@@ -6984,6 +7157,35 @@ fn finish_swatch(
         font,
         color,
     );
+}
+
+/// One promotion candidate: the piece image on a board square with its name
+/// underneath and a ring on hover. Same footprint as the Settings swatches.
+fn promotion_tile(
+    ui: &mut egui::Ui,
+    texture: Option<&egui::TextureHandle>,
+    square_color: egui::Color32,
+    label: &str,
+) -> egui::Response {
+    let side = SETTINGS_SWATCH;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(side, side + SETTINGS_SWATCH_LABEL_H),
+        egui::Sense::click(),
+    );
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    let painter = ui.painter();
+    let sample = egui::Rect::from_min_size(rect.min, egui::vec2(side, side));
+    painter.rect_filled(sample, egui::CornerRadius::same(5), square_color);
+    if let Some(texture) = texture {
+        draw_piece_image(painter, texture, sample.shrink(side * 0.06));
+    }
+    finish_swatch(painter, sample, response.hovered(), false, label);
+
+    response
 }
 
 /// Compact non-interactive board renderer for History thumbnails. Always
@@ -7749,6 +7951,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn analysis_quality_round_trips_and_standard_is_the_old_default() {
+        use super::AnalysisQuality;
+
+        for quality in AnalysisQuality::ALL {
+            assert_eq!(AnalysisQuality::from_db_str(quality.as_db_str()), quality);
+        }
+        assert_eq!(AnalysisQuality::from_db_str("ultra"), AnalysisQuality::Standard);
+        assert_eq!(AnalysisQuality::from_db_str(""), AnalysisQuality::Standard);
+        // Every review before the choice existed ran at depth 14.
+        assert_eq!(AnalysisQuality::Standard.depth(), 14);
+        assert!(AnalysisQuality::Quick.depth() < AnalysisQuality::Standard.depth());
+        assert!(AnalysisQuality::Standard.depth() < AnalysisQuality::Deep.depth());
+    }
+
+    #[test]
+    fn stored_custom_opponent_values_are_clamped_into_the_slider_ranges() {
+        use super::EngineSettings;
+
+        let s = EngineSettings::from_stored(false, 5000, 12);
+        assert_eq!(
+            s,
+            EngineSettings { max_depth: 12, think_time_ms: 5000, use_time_limit: false }
+        );
+        // A hand-edited or corrupted row cannot yield a zero-depth or an
+        // hour-long search.
+        let s = EngineSettings::from_stored(true, -1, 0);
+        assert_eq!((s.think_time_ms, s.max_depth), (500, 1));
+        let s = EngineSettings::from_stored(true, 3_600_000, 99);
+        assert_eq!((s.think_time_ms, s.max_depth), (30_000, 30));
+        // The defaults sit inside the ranges, so a fresh row round-trips.
+        let d = EngineSettings::default();
+        assert_eq!(
+            EngineSettings::from_stored(d.use_time_limit, d.think_time_ms as i64, d.max_depth as i64),
+            d
+        );
     }
 
     #[test]

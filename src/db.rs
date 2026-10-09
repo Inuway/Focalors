@@ -294,6 +294,25 @@ impl Database {
             "ALTER TABLE user_profile ADD COLUMN piece_set TEXT NOT NULL DEFAULT 'cburnett'",
             [],
         );
+        // Game Review depth preset and the Custom opponent's thinking budget.
+        // The defaults are exactly what every profile used before these
+        // columns existed, so existing installs change nothing.
+        let _ = self.conn.execute(
+            "ALTER TABLE user_profile ADD COLUMN analysis_quality TEXT NOT NULL DEFAULT 'standard'",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE user_profile ADD COLUMN custom_use_time_limit INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE user_profile ADD COLUMN custom_think_time_ms INTEGER NOT NULL DEFAULT 5000",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE user_profile ADD COLUMN custom_max_depth INTEGER NOT NULL DEFAULT 12",
+            [],
+        );
         Ok(())
     }
 
@@ -353,6 +372,51 @@ impl Database {
         self.conn.execute(
             "UPDATE user_profile SET piece_set = ?1, updated_at = datetime('now') WHERE id = 1",
             params![set],
+        )?;
+        Ok(())
+    }
+
+    /// Read the persisted Game Review depth preset (the GUI's
+    /// `AnalysisQuality` in its database string form).
+    pub fn get_analysis_quality(&self) -> SqlResult<String> {
+        self.conn.query_row(
+            "SELECT analysis_quality FROM user_profile WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// Persist the Game Review depth preset.
+    pub fn set_analysis_quality(&self, quality: &str) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE user_profile SET analysis_quality = ?1, updated_at = datetime('now') WHERE id = 1",
+            params![quality],
+        )?;
+        Ok(())
+    }
+
+    /// Read the Custom opponent's thinking budget: (time limit rather than
+    /// depth, think time in ms, depth). Raw integers; the GUI clamps them.
+    pub fn get_custom_engine(&self) -> SqlResult<(bool, i64, i64)> {
+        self.conn.query_row(
+            "SELECT custom_use_time_limit, custom_think_time_ms, custom_max_depth \
+             FROM user_profile WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?, row.get(2)?)),
+        )
+    }
+
+    /// Persist the Custom opponent's thinking budget.
+    pub fn set_custom_engine(
+        &self,
+        use_time_limit: bool,
+        think_time_ms: u64,
+        max_depth: u32,
+    ) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE user_profile SET custom_use_time_limit = ?1, custom_think_time_ms = ?2, \
+             custom_max_depth = ?3, updated_at = datetime('now') WHERE id = 1",
+            params![use_time_limit as i64, think_time_ms as i64, max_depth as i64],
         )?;
         Ok(())
     }
@@ -1058,6 +1122,35 @@ mod tests {
         // Running the migration again (every app start does) keeps the choice.
         db.migrate_phase4().unwrap();
         assert_eq!(db.get_piece_set().unwrap(), "rhosgfx");
+    }
+
+    #[test]
+    fn analysis_quality_and_custom_opponent_default_and_round_trip() {
+        let db = Database {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        // Profile row first, migration second: the order an existing
+        // install upgrades in, so the new columns must backfill that row.
+        db.init_schema().unwrap();
+        db.get_or_create_profile().unwrap();
+        db.migrate_phase4().unwrap();
+
+        // Defaults are what every profile used before these columns.
+        assert_eq!(db.get_analysis_quality().unwrap(), "standard");
+        assert_eq!(db.get_custom_engine().unwrap(), (true, 5000, 12));
+
+        db.set_analysis_quality("deep").unwrap();
+        db.set_custom_engine(false, 2500, 9).unwrap();
+        assert_eq!(db.get_analysis_quality().unwrap(), "deep");
+        assert_eq!(db.get_custom_engine().unwrap(), (false, 2500, 9));
+        // Neighbouring columns are left alone.
+        assert_eq!(db.get_piece_set().unwrap(), "cburnett");
+        assert_eq!(db.get_board_theme().unwrap(), "walnut");
+
+        // Running the migration again (every app start does) keeps it all.
+        db.migrate_phase4().unwrap();
+        assert_eq!(db.get_analysis_quality().unwrap(), "deep");
+        assert_eq!(db.get_custom_engine().unwrap(), (false, 2500, 9));
     }
 
     #[test]
