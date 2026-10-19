@@ -3960,11 +3960,12 @@ impl FocalorsApp {
                             .unwrap_or("");
                         let label = format!("{san_or_uci}{symbol}");
                         let selected = *new_cursor == ply + 1;
-                        // The selected move sits on the accent fill, where the
-                        // classification color is unreadable in dark mode; it
-                        // takes the plain text color like a selected nav
-                        // button, and the note below still names the class.
-                        let text_color = if selected { hydra_text() } else { class_color };
+                        // The selected move sits on the accent fill (the
+                        // theme's selection color in both modes), where the
+                        // classification color is unreadable; it takes the
+                        // text-on-accent white like a primary button, and
+                        // the note below still names the class.
+                        let text_color = if selected { hydra_text_on_accent() } else { class_color };
                         let resp = ui.selectable_label(
                             selected,
                             egui::RichText::new(label)
