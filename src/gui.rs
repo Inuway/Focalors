@@ -7755,11 +7755,19 @@ pub fn run_gui() {
     // Initialize NNUE (will use embedded net or fall back to HCE)
     let _ = crate::nnue::init(None);
 
+    // Window and taskbar icon (Windows, X11). Wayland ignores it and takes
+    // the icon from a desktop entry matched by the app id instead.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([950.0, 680.0])
+        .with_min_inner_size([800.0, 600.0])
+        .with_title("Focalors Chess Engine")
+        .with_app_id("focalors");
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([950.0, 680.0])
-            .with_min_inner_size([800.0, 600.0])
-            .with_title("Focalors Chess Engine"),
+        viewport,
         // Explicit OpenGL backend — avoids wgpu/Vulkan compatibility issues
         // on some Linux setups while being plenty fast for our chess GUI.
         renderer: eframe::Renderer::Glow,
@@ -7774,10 +7782,37 @@ pub fn run_gui() {
     .expect("Failed to launch GUI");
 }
 
+/// The app icon for the window frame and taskbar, decoded from the embedded
+/// 256px PNG. None if it ever fails to decode: the app then starts with
+/// the default icon instead of refusing to start.
+fn window_icon() -> Option<egui::IconData> {
+    const PNG: &[u8] = include_bytes!("../assets/icon/focalors-256.png");
+    match image::load_from_memory(PNG) {
+        Ok(img) => {
+            let img = img.into_rgba8();
+            let (width, height) = img.dimensions();
+            Some(egui::IconData { rgba: img.into_raw(), width, height })
+        }
+        Err(e) => {
+            eprintln!("focalors: window icon failed to decode: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::uci_arrow_squares;
     use crate::types::Square;
+
+    #[test]
+    fn window_icon_is_a_square_rgba_image() {
+        let icon = super::window_icon().expect("embedded icon must decode");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        // Not a blank canvas: some pixel is opaque.
+        assert!(icon.rgba.chunks(4).any(|px| px[3] == 255));
+    }
 
     #[test]
     fn board_theme_round_trips_and_walnut_is_the_fallback() {
