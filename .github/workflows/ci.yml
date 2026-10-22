@@ -99,9 +99,6 @@ jobs:
           cp ${{ matrix.binary_path }} dist/${{ matrix.artifact_name }}/
           cp packaging/README.txt dist/${{ matrix.artifact_name }}/
           cp LICENSE dist/${{ matrix.artifact_name }}/
-          # App-menu launcher helper and its icon (see README.txt, Linux).
-          cp packaging/linux/install-desktop-entry.sh dist/${{ matrix.artifact_name }}/
-          cp assets/icon/focalors-256.png dist/${{ matrix.artifact_name }}/focalors.png
           tar -czf ${{ matrix.archive_name }} -C dist ${{ matrix.artifact_name }}
 
       - name: Assemble Focalors.app bundle (macOS)

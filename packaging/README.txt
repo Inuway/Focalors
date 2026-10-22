@@ -33,10 +33,6 @@ Linux
   Double-click "focalors" in your file manager (it may ask whether to
   run it), or start it from a terminal in this folder:
     ./focalors
-  To add Focalors to your app menu with its icon, run once:
-    ./install-desktop-entry.sh
-  It only writes a launcher into your home folder; nothing needs root.
-  Run it with --remove to take the launcher out again.
 
 
 YOUR DATA
