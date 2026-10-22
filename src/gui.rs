@@ -966,8 +966,9 @@ pub struct FocalorsApp {
     /// the profile row. Flushed once the slider is released or the window
     /// closes, so a drag does not write on every frame.
     custom_engine_dirty: bool,
-    /// End Game asks for a second click: set on the first click, and the
-    /// button reads "Confirm end" until this instant passes.
+    /// Resign and End Game each ask for a second click: set on the first
+    /// click, and the button reads "Confirm ..." until this instant passes.
+    resign_confirm_until: Option<Instant>,
     end_game_confirm_until: Option<Instant>,
     pending_promotion: Option<PendingPromotion>,
     /// Textures of every piece set, loaded once at startup so Settings can
@@ -1259,6 +1260,7 @@ impl FocalorsApp {
             puzzle_message: None,
             show_advanced_engine_settings: false,
             custom_engine_dirty: false,
+            resign_confirm_until: None,
             end_game_confirm_until: None,
             pending_promotion: None,
             piece_sets,
@@ -5147,8 +5149,8 @@ impl FocalorsApp {
 
     fn draw_board(&mut self, ui: &mut egui::Ui, override_pos: Option<&BoardView<'_>>) {
         let interactive = override_pos.map(|v| v.interactive).unwrap_or(true);
-        let board = match override_pos {
-            Some(v) => v.board.clone(),
+        let (board, live_last_move) = match override_pos {
+            Some(v) => (v.board.clone(), None),
             None => {
                 let mut s = self.state.lock().unwrap();
                 for pending in s.pending_animations.drain(..) {
@@ -5157,7 +5159,7 @@ impl FocalorsApp {
                         start: Instant::now(),
                     });
                 }
-                s.board.clone()
+                (s.board.clone(), live_last_move_squares(&s))
             }
         };
         self.move_animations
@@ -5191,10 +5193,13 @@ impl FocalorsApp {
                 self.last_annotation_board_hash = Some(board.hash);
             }
         }
-        let last_move_squares: Option<(u8, u8)> = override_pos
-            .and_then(|v| v.last_move)
-            .filter(|m| !m.is_null())
-            .map(|m| (m.from_sq().0, m.to_sq().0));
+        let last_move_squares: Option<(u8, u8)> = match override_pos {
+            Some(v) => v
+                .last_move
+                .filter(|m| !m.is_null())
+                .map(|m| (m.from_sq().0, m.to_sq().0)),
+            None => live_last_move,
+        };
         let available = ui.available_size();
         let max_height = (available.y - 18.0).max(180.0);
         let board_size = available.x.min(max_height);
@@ -6100,56 +6105,72 @@ impl FocalorsApp {
                 if !game_over {
                     ui.add_space(6.0);
                     ui.columns(2, |cols| {
+                        // Resign and End Game both take two clicks: the first
+                        // arms the button for a few seconds and relabels it,
+                        // the second goes through. Like resigning on lichess.
+                        let now = Instant::now();
+                        let resign_armed = self
+                            .resign_confirm_until
+                            .is_some_and(|until| now < until);
+                        if !resign_armed {
+                            self.resign_confirm_until = None;
+                        }
+                        let resign_label = if resign_armed { "Confirm resign" } else { "Resign" };
                         let resign_clicked = cols[0]
                             .add_enabled_ui(!searching, |ui| {
                                 let w = ui.available_width();
-                                ui.add_sized([w, 32.0], danger_button("Resign")).clicked()
+                                ui.add_sized([w, 32.0], danger_button(resign_label)).clicked()
                             })
                             .inner;
                         if resign_clicked {
-                            let mut s = self.state.lock().unwrap();
-                            self.pending_promotion = None;
-                            self.selected_square = None;
-                            self.drag_state = None;
-                            set_local_game_outcome(
-                                &mut s,
-                                GameOutcome::Resignation(human.flip()),
-                            );
+                            if resign_armed {
+                                self.resign_confirm_until = None;
+                                let mut s = self.state.lock().unwrap();
+                                self.pending_promotion = None;
+                                self.selected_square = None;
+                                self.drag_state = None;
+                                set_local_game_outcome(
+                                    &mut s,
+                                    GameOutcome::Resignation(human.flip()),
+                                );
+                            } else {
+                                self.resign_confirm_until = Some(now + DANGER_CONFIRM_WINDOW);
+                            }
                         }
                         // End Game discards the game: not saved, not rated.
-                        // One click only arms it; the second click within a
-                        // few seconds goes through, like resigning on lichess.
-                        let confirming = self
+                        let end_armed = self
                             .end_game_confirm_until
-                            .is_some_and(|until| Instant::now() < until);
-                        if !confirming {
+                            .is_some_and(|until| now < until);
+                        if !end_armed {
                             self.end_game_confirm_until = None;
                         }
-                        let label = if confirming { "Confirm end" } else { "End Game" };
+                        let end_label = if end_armed { "Confirm end" } else { "End Game" };
                         let w = cols[1].available_width();
-                        if cols[1].add_sized([w, 32.0], danger_button(label)).clicked() {
-                            if confirming {
+                        if cols[1].add_sized([w, 32.0], danger_button(end_label)).clicked() {
+                            if end_armed {
                                 self.end_game_confirm_until = None;
                                 abort = true;
                             } else {
-                                self.end_game_confirm_until =
-                                    Some(Instant::now() + END_GAME_CONFIRM_WINDOW);
+                                self.end_game_confirm_until = Some(now + DANGER_CONFIRM_WINDOW);
                             }
                         }
                     });
-                    if self.end_game_confirm_until.is_some() {
+                    let hint = if self.resign_confirm_until.is_some() {
+                        Some("Counts as a loss and is rated. Click again to confirm.")
+                    } else if self.end_game_confirm_until.is_some() {
+                        Some("Ends the game without saving or rating it. Click again to confirm.")
+                    } else {
+                        None
+                    };
+                    if let Some(hint) = hint {
                         ui.add_space(4.0);
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(
-                                    "Ends the game without saving or rating it. Click again to confirm.",
-                                )
-                                .size(11.0)
-                                .color(hydra_danger()),
+                                egui::RichText::new(hint).size(11.0).color(hydra_danger()),
                             )
                             .wrap(),
                         );
-                        // Keep repainting so the button reverts on time even
+                        // Keep repainting so the buttons revert on time even
                         // while nothing else moves.
                         ui.ctx().request_repaint_after(Duration::from_millis(250));
                     }
@@ -6584,8 +6605,8 @@ const SETTINGS_PREVIEW_GAP: f32 = 20.0;
 /// Custom opponent window: content width, enough for a slider with its
 /// value box beside it.
 const CUSTOM_OPPONENT_W: f32 = 360.0;
-/// How long End Game stays armed after its first click.
-const END_GAME_CONFIRM_WINDOW: Duration = Duration::from_secs(4);
+/// How long Resign and End Game stay armed after their first click.
+const DANGER_CONFIRM_WINDOW: Duration = Duration::from_secs(4);
 /// Swatch grid + gap + preview: fixes the window width so nothing reflows.
 const SETTINGS_CONTENT_W: f32 = SETTINGS_SWATCH_COLS as f32 * SETTINGS_SWATCH
     + (SETTINGS_SWATCH_COLS as f32 - 1.0) * SETTINGS_SWATCH_GAP
@@ -6902,6 +6923,22 @@ fn configure_theme(ctx: &egui::Context, theme: UiTheme) {
 /// Parse the from/to squares of a UCI move ("e2e4", "e7e8q") into square
 /// indices for drawing a Game Review arrow. Returns `None` for malformed or
 /// empty UCI (UCI is always ASCII, so byte slicing is safe).
+/// Squares of the move that produced the displayed live position, so the
+/// live board tints them the way Game Review does. Follows the history
+/// cursor: stepping back shows the move that led to that snapshot. None
+/// outside a local game (a puzzle starts from a position whose previous
+/// move is unknown) and at the start position.
+fn live_last_move_squares(state: &SharedState) -> Option<(u8, u8)> {
+    if !state.local_game.active {
+        return None;
+    }
+    state
+        .local_history
+        .get(state.local_history_cursor)
+        .and_then(|snapshot| snapshot.move_uci.as_deref())
+        .and_then(uci_arrow_squares)
+}
+
 fn uci_arrow_squares(uci: &str) -> Option<(u8, u8)> {
     if uci.len() < 4 {
         return None;
@@ -8102,6 +8139,25 @@ mod tests {
 
         // Null move never animates.
         assert!(super::pending_animation(&board, crate::moves::Move::NULL).is_none());
+    }
+
+    #[test]
+    fn live_board_highlights_the_move_behind_the_shown_snapshot() {
+        let mut state = super::SharedState::default();
+        // No local game: nothing to highlight, whatever the history says.
+        assert_eq!(super::live_last_move_squares(&state), None);
+        state.local_game.active = true;
+        assert_eq!(super::live_last_move_squares(&state), None, "start position");
+
+        super::record_local_snapshot(&mut state, "e2e4".to_string());
+        super::record_local_snapshot(&mut state, "e7e5".to_string());
+        let sq = |name: &str| Square::from_algebraic(name).unwrap().0;
+        assert_eq!(super::live_last_move_squares(&state), Some((sq("e7"), sq("e5"))));
+        // Stepping back through the history shows the move that led there.
+        state.local_history_cursor = 1;
+        assert_eq!(super::live_last_move_squares(&state), Some((sq("e2"), sq("e4"))));
+        state.local_history_cursor = 0;
+        assert_eq!(super::live_last_move_squares(&state), None);
     }
 
     #[test]
