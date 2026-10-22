@@ -172,7 +172,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact_name }} | Out-Null
           Copy-Item ${{ matrix.binary_path }} dist/${{ matrix.artifact_name }}/
           Copy-Item packaging/README.txt dist/${{ matrix.artifact_name }}/
-          Copy-Item LICENSE dist/${{ matrix.artifact_name }}/
+          Copy-Item LICENSE dist/${{ matrix.artifact_name }}/LICENSE.txt
           Compress-Archive -Path dist/${{ matrix.artifact_name }} -DestinationPath ${{ matrix.archive_name }}
 
       - name: Upload workflow artifact
