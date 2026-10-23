@@ -1384,6 +1384,8 @@ impl FocalorsApp {
     }
 
     fn begin_local_game(&mut self, human_color: Color) {
+        // A puzzle left open must not judge this game's moves.
+        self.exit_puzzle_trainer();
         let time_label = self.local_time_preset.label();
         let difficulty_label = self.local_difficulty.label();
         let level = self.local_difficulty.numeric_level(self.adaptive_level);
@@ -2424,6 +2426,17 @@ impl FocalorsApp {
 
     // ── Puzzle trainer ───────────────────────────────────────────────
 
+    /// Ends the puzzle session, if any. Called by the Exit button, by
+    /// leaving the Puzzles page through the navigation, and by every new
+    /// game, so a puzzle left open can never judge a game's moves.
+    fn exit_puzzle_trainer(&mut self) {
+        if self.puzzle_trainer.is_none() {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        end_puzzle_session(&mut self.puzzle_trainer, &mut self.puzzle_message, &mut state);
+    }
+
     fn start_puzzle_trainer(&mut self) {
         let db = match &self.db {
             Some(d) => d,
@@ -2602,9 +2615,7 @@ impl FocalorsApp {
 
         // Process deferred actions
         if exit_clicked {
-            self.puzzle_trainer = None;
-            self.puzzle_message = None;
-            self.state.lock().unwrap().board = Board::startpos();
+            self.exit_puzzle_trainer();
         }
         if hint_clicked {
             if let Some(ref ts) = theme_str {
@@ -4198,6 +4209,14 @@ impl FocalorsApp {
         ui.add_space(6.0);
         ui.separator();
         ui.add_space(14.0);
+
+        // A puzzle session belongs to the Puzzles page. Leaving it by any
+        // route ends the session exactly like the Exit button; otherwise the
+        // trainer kept judging the moves of a game started afterwards and
+        // reset the live board to the puzzle position.
+        if self.home_page != HomePage::Puzzles {
+            self.exit_puzzle_trainer();
+        }
 
         match self.home_page {
             HomePage::Overview => {
@@ -6950,6 +6969,23 @@ fn configure_theme(ctx: &egui::Context, theme: UiTheme) {
 /// Parse the from/to squares of a UCI move ("e2e4", "e7e8q") into square
 /// indices for drawing a Game Review arrow. Returns `None` for malformed or
 /// empty UCI (UCI is always ASCII, so byte slicing is safe).
+/// Drops a puzzle session and gives the shared board back to the start
+/// position, unless a game owns it. Returns whether there was a session.
+fn end_puzzle_session(
+    trainer: &mut Option<PuzzleTrainerState>,
+    message: &mut Option<(String, egui::Color32, std::time::Instant)>,
+    state: &mut SharedState,
+) -> bool {
+    if trainer.take().is_none() {
+        return false;
+    }
+    *message = None;
+    if !state.local_game.active {
+        state.board = Board::startpos();
+    }
+    true
+}
+
 /// Squares of the move that produced the displayed live position, so the
 /// live board tints them the way Game Review does. Follows the history
 /// cursor: stepping back shows the move that led to that snapshot. None
@@ -7891,6 +7927,53 @@ mod tests {
             "tests assume the startup theme (dark)"
         );
         assert_eq!(super::hydra_clock_active_fill(), super::hydra_accent_soft());
+    }
+
+    #[test]
+    fn ending_a_puzzle_session_restores_the_start_position() {
+        let fen = "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3";
+        let puzzle_board = crate::board::Board::from_fen(fen).expect("valid fen");
+        let session = || {
+            Some(super::PuzzleTrainerState {
+                puzzle: crate::db::SavedPuzzle {
+                    id: 1,
+                    fen: fen.to_string(),
+                    solution: "f1c4".to_string(),
+                    theme: None,
+                    rating: None,
+                },
+                board: puzzle_board.clone(),
+                solution_move: crate::moves::Move::NULL,
+                user_attempted: false,
+                user_solved: false,
+                show_hint: false,
+                show_answer: false,
+                wrong_attempts: 0,
+            })
+        };
+        let start_fen = crate::board::Board::startpos().to_fen();
+
+        // No game running: the board goes back to the start position.
+        let mut state = super::SharedState::default();
+        state.board = puzzle_board.clone();
+        let mut trainer = session();
+        let mut message = Some(("hint".to_string(), egui::Color32::WHITE, std::time::Instant::now()));
+        assert!(super::end_puzzle_session(&mut trainer, &mut message, &mut state));
+        assert!(trainer.is_none());
+        assert!(message.is_none());
+        assert_eq!(state.board.to_fen(), start_fen);
+        // Nothing left to end.
+        assert!(!super::end_puzzle_session(&mut trainer, &mut message, &mut state));
+
+        // A game owns the board: the session ends, the board stays.
+        let mut state = super::SharedState::default();
+        state.local_game.active = true;
+        state.board = puzzle_board.clone();
+        let mut trainer = session();
+        let mut message = None;
+        assert!(super::end_puzzle_session(&mut trainer, &mut message, &mut state));
+        assert!(trainer.is_none());
+        assert_eq!(state.board.to_fen(), fen);
     }
 
     #[test]
