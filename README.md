@@ -1,6 +1,6 @@
 # Focalors
 
-Focalors is a chess engine and learning app I built in Rust. It runs entirely offline - local play against the engine, post-game review with explanations, puzzles drawn from your own mistakes, and a stats view that lives in a small SQLite file on your machine. No accounts, no cloud, no telemetry.
+Focalors is a chess engine and learning app I built in Rust. It runs entirely offline - local play against the engine, post-game review with explanations, puzzles drawn from your own mistakes, and a stats view that lives in a small SQLite file on your machine. No accounts, no cloud, no telemetry. There's also a website at [focalors-chess.com](https://focalors-chess.com).
 
 ![Focalors desktop GUI showing a live local game](assets/screenshots/hero.png)
 
@@ -8,8 +8,18 @@ The thing I wanted to figure out is whether you can have both a strong engine *a
 
 ![Focalors showcase with the redesigned local play and statistics views](assets/screenshots/showcase.png)
 
-## Elo 2200-2400~? (And why it's not (very) important)
-My goal is a full chess learning experience without a permanent internet connection or a subscription - your games, data and progress live on your machine, always accessible. Focalors does not aim to compete with state-of-the-art engines like Stockfish. It just needs to be strong enough to teach human understandable positions and help average players, advanced ones, and possibly even masters improve. (With the sole exception of Satoru Gojo aka Magnus Carlsen) I love chess and wanna do a small contribution to people trying to get further into the game.
+## What you get
+
+- Play against the engine with clocks, at several strengths, or set up a custom opponent by thinking time or depth.
+- One-click review of every game, with plain-language explanations of what went wrong, at the depth you pick.
+- Puzzles built from your own mistakes.
+- Stats on your games, openings and progress.
+- Eight board themes, two piece sets, light and dark mode.
+- Everything lives in one small SQLite file on your machine. No account, no internet needed.
+
+## Why Elo is not the point
+
+My goal is a full chess learning experience without a permanent internet connection or a subscription - your games, data and progress live on your machine, always accessible. Focalors does not aim to compete with state-of-the-art engines like Stockfish. It just needs to be strong enough to play and explain positions a human can learn from, and to help average players, advanced ones, and possibly even masters improve. (With the sole exception of Satoru Gojo aka Magnus Carlsen.) I love chess and want to make a small contribution to people trying to get further into the game.
 
 ## The net trains itself
 
@@ -17,16 +27,22 @@ The part I'm quietly proud of: the entire NNUE training pipeline lives in this r
 
 ## Running it
 
-The simplest path is to grab a prebuilt binary from the [Releases page](https://github.com/Inuway/Focalors/releases) - Linux, macOS, and Windows builds are attached to each tagged release. Run the binary and the GUI opens.
+The simplest path is to grab a prebuilt build from the [Releases page](https://github.com/Inuway/Focalors/releases) - Windows, macOS and Linux builds are attached to each tagged release. Unzip it, then:
+
+- **Windows**: double-click `focalors.exe`. The first time, Windows shows a blue "Windows protected your PC" box, only because the app comes from an independent developer rather than a big company. Click "More info", then "Run anyway".
+- **macOS**: drag `Focalors` into Applications and open it. The first time, right-click it and choose Open (macOS 13 and 14), or allow it under System Settings > Privacy & Security (macOS 15 and newer).
+- **Linux**: double-click `focalors`, or run `./focalors` from the folder. No chmod needed.
+
+Each download also has a README.txt with these steps.
 
 If you'd rather build from source you'll need a Rust toolchain, then:
 
 ```bash
 cargo build --release
-./target/release/focalors gui
+./target/release/focalors
 ```
 
-If you want to plug Focalors into another chess GUI, `focalors uci` runs the standard UCI protocol on stdio.
+The binary opens the GUI by default. If you want to plug Focalors into another chess GUI, `focalors uci` runs the standard UCI protocol on stdio.
 
 ## Where to dig in
 
