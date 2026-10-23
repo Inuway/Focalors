@@ -6332,8 +6332,25 @@ fn hydra_accent() -> egui::Color32 {
     theme_rgb([118, 147, 255], [69, 102, 214])
 }
 
+/// "Soft" accent behind selected nav buttons and the running clock row.
+/// The values are unmultiplied but the constructor is premultiplied, so it
+/// renders as a near-solid accent in dark mode and as white in light mode.
+/// That look shipped and those widgets are tuned for it; do not switch the
+/// constructor without re-checking every user. Callouts use
+/// `hydra_callout_fill()`, which is a real tint.
 fn hydra_accent_soft() -> egui::Color32 {
     theme_rgba([118, 147, 255, 34], [69, 102, 214, 24])
+}
+
+/// Fill of the callout boxes (the paused-history notice, the auto-adjust
+/// message). Dark mode gets a faint accent tint so warning or success text
+/// keeps its contrast; light mode keeps the plain card fill, where the
+/// accent stroke alone marks the box.
+fn hydra_callout_fill() -> egui::Color32 {
+    match current_theme() {
+        UiTheme::Dark => egui::Color32::from_rgba_unmultiplied(118, 147, 255, 34),
+        UiTheme::Light => hydra_panel_fill(),
+    }
 }
 
 fn hydra_text() -> egui::Color32 {
@@ -6707,7 +6724,7 @@ fn hydra_card_frame() -> egui::Frame {
 
 fn hydra_callout_frame() -> egui::Frame {
     egui::Frame::new()
-        .fill(hydra_accent_soft())
+        .fill(hydra_callout_fill())
         .stroke(egui::Stroke::new(1.0_f32, hydra_accent()))
         .corner_radius(6)
         .inner_margin(egui::Margin::same(10))
@@ -7841,6 +7858,21 @@ fn window_icon() -> Option<egui::IconData> {
 mod tests {
     use super::uci_arrow_squares;
     use crate::types::Square;
+
+    #[test]
+    fn dark_mode_callout_fill_is_a_translucent_tint() {
+        // Tests run on the startup theme (dark); make that assumption loud.
+        assert!(
+            matches!(super::current_theme(), super::UiTheme::Dark),
+            "tests assume the startup theme (dark)"
+        );
+        let fill = super::hydra_callout_fill();
+        // A valid premultiplied tint: translucent, no channel above alpha.
+        // The additive accent that washed out the warning text had all
+        // three channels far above its alpha.
+        assert!(fill.a() > 0 && fill.a() < 255);
+        assert!(fill.r() <= fill.a() && fill.g() <= fill.a() && fill.b() <= fill.a());
+    }
 
     #[test]
     fn window_icon_is_a_square_rgba_image() {
