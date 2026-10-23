@@ -6342,6 +6342,16 @@ fn hydra_accent_soft() -> egui::Color32 {
     theme_rgba([118, 147, 255, 34], [69, 102, 214, 24])
 }
 
+/// Fill behind the running clock row. Dark mode keeps the solid accent it
+/// shipped with; light mode gets a faint tint, because the same color clamps
+/// to white there and the running side was only told apart by text shade.
+fn hydra_clock_active_fill() -> egui::Color32 {
+    match current_theme() {
+        UiTheme::Dark => hydra_accent_soft(),
+        UiTheme::Light => egui::Color32::from_rgba_unmultiplied(69, 102, 214, 28),
+    }
+}
+
 /// Fill of the callout boxes (the paused-history notice, the auto-adjust
 /// message). Dark mode gets a faint accent tint so warning or success text
 /// keeps its contrast; light mode keeps the plain card fill, where the
@@ -7393,7 +7403,7 @@ fn clock_color(remaining_ms: u64, is_active: bool) -> egui::Color32 {
 /// right. The side to move gets a soft accent fill so the running clock
 /// reads at a glance.
 fn draw_clock_row(ui: &mut egui::Ui, name: &str, sub: &str, remaining_ms: u64, active: bool) {
-    let fill = if active { hydra_accent_soft() } else { egui::Color32::TRANSPARENT };
+    let fill = if active { hydra_clock_active_fill() } else { egui::Color32::TRANSPARENT };
     egui::Frame::new()
         .fill(fill)
         .corner_radius(6)
@@ -7872,6 +7882,15 @@ mod tests {
         // three channels far above its alpha.
         assert!(fill.a() > 0 && fill.a() < 255);
         assert!(fill.r() <= fill.a() && fill.g() <= fill.a() && fill.b() <= fill.a());
+    }
+
+    #[test]
+    fn dark_mode_clock_row_keeps_the_shipped_fill() {
+        assert!(
+            matches!(super::current_theme(), super::UiTheme::Dark),
+            "tests assume the startup theme (dark)"
+        );
+        assert_eq!(super::hydra_clock_active_fill(), super::hydra_accent_soft());
     }
 
     #[test]
